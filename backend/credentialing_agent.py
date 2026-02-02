@@ -21,7 +21,7 @@ from langchain_core.runnables import RunnablePassthrough
 
 # LangGraph imports for state management
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.checkpoint.memory import MemorySaver
 from operator import add
 
 # LangSmith for tracing
@@ -32,7 +32,7 @@ from langsmith.run_helpers import trace
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from deepgram import DeepgramClient
-import elevenlabs
+from elevenlabs.client import ElevenLabs
 
 # Database
 import psycopg2
@@ -142,7 +142,7 @@ class DatabaseManager:
         self.conn = psycopg2.connect(
             host=os.getenv("SUPABASE_HOST"),
             database="postgres",
-            user="postgres",
+            user=os.getenv("SUPABASE_USER", "postgres"),
             password=os.getenv("SUPABASE_PASSWORD"),
             port=5432
         )
@@ -284,8 +284,8 @@ class SpeechProcessor:
     """Handles speech-to-text and text-to-speech"""
 
     def __init__(self):
-        self.deepgram = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"))
-        elevenlabs.set_api_key(os.getenv("ELEVENLABS_API_KEY"))
+        self.deepgram = DeepgramClient()  # Auto-detects DEEPGRAM_API_KEY from environment
+        self.elevenlabs = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
         self.voice_id = os.getenv("ELEVENLABS_VOICE_ID")
 
     async def transcribe_stream(self, audio_stream):
@@ -301,7 +301,7 @@ class SpeechProcessor:
     
     def generate_speech(self, text: str) -> bytes:
         """Generate speech using ElevenLabs"""
-        audio = elevenlabs.generate(
+        audio = self.elevenlabs.generate(
             text=text,
             voice=self.voice_id,
             model="eleven_turbo_v2"
@@ -581,11 +581,9 @@ class CredentialingAgent:
         workflow.add_edge("extract_results", "finalize")
         workflow.add_edge("finalize", END)
         
-        # Compile with checkpointer for persistence
-        checkpointer = PostgresSaver.from_conn_string(
-            f"postgresql://postgres:{os.getenv('SUPABASE_PASSWORD')}@{os.getenv('SUPABASE_HOST')}:5432/postgres"
-        )
-        
+        # Compile with checkpointer for persistence (using in-memory for development)
+        checkpointer = MemorySaver()
+
         return workflow.compile(checkpointer=checkpointer)
     
     @traceable(name="initialize_call")
@@ -694,6 +692,11 @@ class CredentialingAgent:
         """Have natural conversation with human"""
         state['call_state'] = CallState.SPEAKING_WITH_HUMAN
         
+        # Check if transcript is empty
+        if not state.get('transcript') or len(state['transcript']) == 0:
+            # No transcript yet, return state without processing
+            return state
+        
         latest_transcript = state['transcript'][-1]['text']
         
         response = self.conversation_agent.generate_response(state, latest_transcript)
@@ -760,7 +763,7 @@ class CredentialingAgent:
     def _route_by_audio_type(self, state: CredentialingState) -> str:
         """Route based on audio classification"""
         audio_type = state.get('current_audio_type', AudioType.UNKNOWN)
-        
+
         if audio_type == AudioType.IVR_MENU:
             return "ivr"
         elif audio_type == AudioType.HOLD_MUSIC:
@@ -768,7 +771,8 @@ class CredentialingAgent:
         elif audio_type == AudioType.HUMAN_SPEECH:
             return "human"
         else:
-            return "classify"
+            # Default to human to prevent infinite loop when audio type is unknown
+            return "human"
     
     def _check_continue(self, state: CredentialingState) -> str:
         """Check if should continue or complete"""

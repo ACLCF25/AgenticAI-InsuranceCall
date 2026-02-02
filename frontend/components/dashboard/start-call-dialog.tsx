@@ -32,10 +32,13 @@ import { Loader2 } from 'lucide-react'
 const callFormSchema = z.object({
   insurance_name: z.string().min(1, 'Insurance name is required'),
   provider_name: z.string().min(1, 'Provider name is required'),
-  npi: z.string().regex(/^\d{10}$/, 'NPI must be 10 digits'),
+  npi: z.string().trim().regex(/^\d{10}$/, 'NPI must be 10 digits'),
   tax_id: z.string().min(1, 'Tax ID is required'),
   address: z.string().min(1, 'Address is required'),
-  insurance_phone: z.string().regex(/^\+?1?\d{10,11}$/, 'Valid phone number required'),
+  // Strip spaces, dashes, parentheses, dots before validating phone
+  insurance_phone: z.string()
+    .transform(val => val.replace(/[\s\-\(\)\.]/g, ''))
+    .pipe(z.string().regex(/^\+?1?\d{10,11}$/, 'Valid phone number required (10-11 digits)')),
   questions: z.string().min(1, 'At least one question is required'),
 })
 
@@ -52,6 +55,7 @@ export function StartCallDialog({ open, onOpenChange }: StartCallDialogProps) {
   
   const form = useForm<CallFormValues>({
     resolver: zodResolver(callFormSchema),
+    mode: 'onChange', // Show validation errors as user types
     defaultValues: {
       insurance_name: '',
       provider_name: '',
@@ -65,19 +69,23 @@ export function StartCallDialog({ open, onOpenChange }: StartCallDialogProps) {
 
   const mutation = useMutation({
     mutationFn: (values: CallFormValues) => {
+      console.log('📞 Starting call with values:', values)
       // Convert questions string to array
       const questionsArray = values.questions
         .split('\n')
         .filter(q => q.trim().length > 0)
-      
-      return api.startCall({
+
+      const payload = {
         ...values,
         questions: questionsArray,
-      })
+      }
+      console.log('📤 Sending API request:', payload)
+      return api.startCall(payload)
     },
-    onSuccess: () => {
+    onSuccess: (response) => {
+      console.log('✅ Call started successfully:', response)
       toast.success('Call started successfully!', {
-        description: 'The credentialing call has been initiated.',
+        description: `Call ID: ${response.call_id || 'N/A'} - The credentialing call has been initiated.`,
       })
       queryClient.invalidateQueries({ queryKey: ['calls'] })
       queryClient.invalidateQueries({ queryKey: ['metrics'] })
@@ -85,6 +93,8 @@ export function StartCallDialog({ open, onOpenChange }: StartCallDialogProps) {
       form.reset()
     },
     onError: (error: any) => {
+      console.error('❌ Call failed:', error)
+      console.error('Error details:', error.response?.data)
       toast.error('Failed to start call', {
         description: error.response?.data?.error || error.message,
       })
@@ -92,7 +102,14 @@ export function StartCallDialog({ open, onOpenChange }: StartCallDialogProps) {
   })
 
   function onSubmit(values: CallFormValues) {
+    console.log('🔄 Form submitted, values:', values)
     mutation.mutate(values)
+  }
+
+  // Log validation errors whenever they change
+  const errors = form.formState.errors
+  if (Object.keys(errors).length > 0) {
+    console.log('⚠️ Form validation errors:', errors)
   }
 
   return (
