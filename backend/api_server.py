@@ -30,6 +30,9 @@ from credentialing_agent import (
     CallState,
     AudioType
 )
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -45,6 +48,143 @@ twilio_client = TwilioClient(
     os.getenv("TWILIO_ACCOUNT_SID"),
     os.getenv("TWILIO_AUTH_TOKEN")
 )
+
+# Helper function to format NPI for speech (digit by digit)
+def format_npi_for_speech(npi: str) -> str:
+    """Format NPI to be read digit by digit: 1234567890 -> 1. 2. 3. 4. 5. 6. 7. 8. 9. 0."""
+    return '. '.join(list(npi)) + '.'
+
+def format_tax_id_for_speech(tax_id: str) -> str:
+    """Format Tax ID for speech: 12-3456789 -> 1 2, 3 4 5 6 7 8 9"""
+    # Remove dashes and format
+    clean = tax_id.replace('-', '')
+    return '. '.join(list(clean)) + '.'
+
+
+# GPT-4 Conversation Agent for intelligent responses
+class SmartConversationAgent:
+    """GPT-4 powered conversation agent for handling calls intelligently"""
+
+    def __init__(self):
+        self.llm = ChatOpenAI(
+            model="gpt-4",
+            temperature=0.4,
+            api_key=os.getenv("OPENAI_API_KEY")
+        )
+
+        self.response_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a professional AI assistant making a phone call on behalf of a healthcare provider to check on insurance credentialing status.
+
+CRITICAL RULES:
+1. You ARE an automated AI assistant - if asked "are you human?", "are you a robot?", "are you real?", "say yes", respond honestly: "I'm an automated assistant calling on behalf of {provider_name}. I can still help with your credentialing inquiry."
+2. Be professional, concise, and courteous
+3. If asked verification questions (NPI, Tax ID, address), answer accurately using the provider information below
+4. Stay focused on the credentialing inquiry
+5. Keep responses SHORT (1-2 sentences max) - this is a phone call
+6. If you don't understand, politely ask for clarification
+7. If they need to transfer you, say "Yes, please transfer me to the credentialing department"
+8. When providing NPI, say it DIGIT BY DIGIT with clear pauses: "{npi_spoken}"
+9. When providing Tax ID, say it DIGIT BY DIGIT with clear pauses: "{tax_id_spoken}"
+
+Provider Information (USE THIS FOR VERIFICATION):
+- Provider Name: {provider_name}
+- NPI: When asked, say: "{npi_spoken}"
+- Tax ID: When asked, say: "{tax_id_spoken}"
+- Address: {address}
+
+=== YOUR PRIMARY TASK ===
+You MUST ask these credentialing questions one at a time. Current progress: Question {current_question_index} of {total_questions}.
+
+Questions list:
+{questions}
+
+=== QUESTION ASKING LOGIC ===
+- If current_question_index is 0 and they confirmed they can help, ASK QUESTION #1
+- If you just got an answer to a question, ASK THE NEXT QUESTION
+- ONLY use action="end_call" when ALL questions have been asked AND answered (stage="wrapping_up")
+- If stage is "asking_question_X", you MUST include question X in your response
+
+Current stage: {stage}
+(If stage says "asking_question", you MUST ask the next question!)
+
+Previous conversation context:
+{context}
+
+=== RESPONSE FORMAT ===
+Respond ONLY with this JSON (no other text):
+{{
+    "response": "your spoken response - INCLUDE THE QUESTION if it's time to ask one",
+    "action": "continue|end_call|request_transfer",
+    "extracted_info": {{"status": "...", "reference": "...", "turnaround": "..."}},
+    "question_asked": true/false
+}}
+
+=== ACTION RULES ===
+- action="continue" - Use this for most responses (answering verification, asking questions, etc.)
+- action="end_call" - ONLY use when stage="wrapping_up" AND you've thanked them and said goodbye
+- action="request_transfer" - Use when they say they need to transfer you
+- question_asked=true - Set to true ONLY when your response includes one of the credentialing questions from the list
+
+Example when asking a question:
+{{"response": "Thank you for verifying. Now, can you tell me the current credentialing status for this provider?", "action": "continue", "extracted_info": {{}}, "question_asked": true}}
+
+Example when providing NPI (NOT asking a question):
+{{"response": "The NPI is {npi_spoken}", "action": "continue", "extracted_info": {{}}, "question_asked": false}}"""),
+            ("user", "The person on the phone said: \"{speech}\"")
+        ])
+
+    def generate_response(self, speech: str, state: dict, stage: str = "initial", current_question_index: int = 0) -> dict:
+        """Generate intelligent response using GPT-4"""
+        try:
+            chain = self.response_prompt | self.llm | JsonOutputParser()
+
+            # Get conversation context
+            context = ""
+            if state.get('transcript'):
+                recent = state['transcript'][-5:]  # Last 5 exchanges
+                context = "\n".join([f"{t.get('speaker', 'unknown')}: {t.get('text', '')}" for t in recent])
+
+            # Format NPI and Tax ID for speech
+            npi = state.get('npi', 'N/A')
+            tax_id = state.get('tax_id', 'N/A')
+            npi_spoken = format_npi_for_speech(npi) if npi != 'N/A' else 'N/A'
+            tax_id_spoken = format_tax_id_for_speech(tax_id) if tax_id != 'N/A' else 'N/A'
+
+            # Get questions info
+            questions = state.get('questions', [])
+            total_questions = len(questions)
+
+            # Format questions with numbers
+            questions_formatted = "\n".join([f"  {i+1}. {q}" for i, q in enumerate(questions)])
+
+            result = chain.invoke({
+                "provider_name": state.get('provider_name', 'the provider'),
+                "npi_spoken": npi_spoken,
+                "tax_id_spoken": tax_id_spoken,
+                "address": state.get('address', 'N/A'),
+                "questions": questions_formatted,
+                "total_questions": total_questions,
+                "current_question_index": current_question_index,
+                "stage": stage,
+                "context": context,
+                "speech": speech
+            })
+
+            return result
+        except Exception as e:
+            print(f"GPT-4 Error: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback response
+            return {
+                "response": "I apologize, could you please repeat that?",
+                "action": "continue",
+                "extracted_info": {},
+                "question_asked": False
+            }
+
+# Initialize the smart agent
+smart_agent = SmartConversationAgent()
 
 
 @app.route('/api/start-call', methods=['POST'])
@@ -113,6 +253,7 @@ def start_credentialing_call():
             'address': data['address'],
             'insurance_phone': data['insurance_phone'],
             'questions': data['questions'],
+            'questions_asked_count': 0,  # Track how many questions have been asked
             'call_id': call_id,
             'call_sid': None,
             'call_state': CallState.INITIATING,
@@ -213,32 +354,75 @@ def voice_webhook():
                 # Update call_sid if not set
                 if state.get('call_sid') is None:
                     state['call_sid'] = call_sid
-                    state['call_state'] = CallState.SPEAKING_WITH_HUMAN
+                    state['call_state'] = CallState.IVR_NAVIGATION
                     print(f"✅ Linked CallSID {call_sid} to call_id {call_id}")
                 call_info = {'call_id': call_id, 'state': state}
                 break
+
+        # Check if insurance has IVR patterns configured
+        ivr_patterns = []
+        insurance_name = None
+        if call_info:
+            insurance_name = call_info['state'].get('insurance_name')
+            if insurance_name:
+                try:
+                    from credentialing_agent import DatabaseManager
+                    db = DatabaseManager()
+                    ivr_patterns = db.get_ivr_knowledge(insurance_name)
+                    db.close()
+                    print(f"🎯 Found {len(ivr_patterns)} IVR patterns for {insurance_name}")
+                except Exception as e:
+                    print(f"⚠️ Could not load IVR patterns: {e}")
 
         # Get provider name for the disclosure message
         provider_name = "a healthcare provider"
         if call_info:
             provider_name = call_info['state'].get('provider_name', provider_name)
 
-        # AI Disclosure message (required for automated calls)
-        disclosure = f"Hello, this is an automated AI assistant calling on behalf of {provider_name} regarding provider credentialing. Is this the credentialing department?"
+        # If IVR patterns exist, we need to navigate through them first
+        if ivr_patterns and len(ivr_patterns) > 0:
+            print(f"🤖 IVR Navigation Mode - Will navigate through {len(ivr_patterns)} menu levels")
 
-        # Use Gather to capture the response
-        gather = Gather(
-            input='speech',
-            action=f'{callback_base}/webhook/speech',
-            method='POST',
-            speech_timeout='auto',
-            language='en-US'
-        )
-        gather.say(disclosure, voice='Polly.Joanna')
-        response.append(gather)
+            # Store IVR patterns in state for tracking
+            call_info['state']['ivr_knowledge'] = ivr_patterns
+            call_info['state']['current_menu_level'] = 0
 
-        # If no input, say goodbye
-        response.say("I didn't hear a response. I'll try again later. Goodbye.", voice='Polly.Joanna')
+            # Wait briefly then start IVR navigation
+            # First, gather input (speech + dtmf) to detect IVR prompts
+            gather = Gather(
+                input='speech dtmf',
+                action=f'{callback_base}/webhook/ivr-navigate',
+                method='POST',
+                speech_timeout='3',
+                timeout=10,
+                language='en-US'
+            )
+            # Don't say anything - just listen to IVR prompts
+            response.append(gather)
+
+            # If no IVR detected, proceed with regular conversation
+            response.redirect(f'{callback_base}/webhook/voice/human')
+        else:
+            # No IVR patterns - go straight to human conversation
+            print(f"📞 Direct Human Mode - No IVR patterns configured")
+            call_info['state']['call_state'] = CallState.SPEAKING_WITH_HUMAN
+
+            # AI Disclosure message (required for automated calls)
+            disclosure = f"Hello, this is an automated AI assistant calling on behalf of {provider_name} regarding provider credentialing. Is this the credentialing department?"
+
+            # Use Gather to capture the response
+            gather = Gather(
+                input='speech',
+                action=f'{callback_base}/webhook/speech',
+                method='POST',
+                speech_timeout='auto',
+                language='en-US'
+            )
+            gather.say(disclosure, voice='Polly.Joanna')
+            response.append(gather)
+
+            # If no input, say goodbye
+            response.say("I didn't hear a response. I'll try again later. Goodbye.", voice='Polly.Joanna')
 
         print(f"📤 Returning TwiML: {str(response)[:200]}...")
         return Response(str(response), mimetype='text/xml')
@@ -253,10 +437,189 @@ def voice_webhook():
         return Response(str(response), mimetype='text/xml')
 
 
+@app.route('/webhook/voice/human', methods=['POST'])
+def voice_human_webhook():
+    """
+    Voice webhook for when we've passed IVR and reached a human
+    """
+    try:
+        from twilio.twiml.voice_response import Gather
+
+        response = VoiceResponse()
+
+        call_sid = request.values.get('CallSid')
+
+        # Get the base URL
+        callback_base = os.getenv('CALLBACK_URL', '').replace('/webhook/voice', '')
+        if not callback_base:
+            callback_base = f"https://{request.host}"
+
+        # Find the call state
+        call_info = None
+        for call_id, state in list(call_states.items()):
+            if state.get('call_sid') == call_sid:
+                call_info = {'call_id': call_id, 'state': state}
+                state['call_state'] = CallState.SPEAKING_WITH_HUMAN
+                break
+
+        provider_name = "a healthcare provider"
+        if call_info:
+            provider_name = call_info['state'].get('provider_name', provider_name)
+
+        # AI Disclosure message
+        disclosure = f"Hello, this is an automated AI assistant calling on behalf of {provider_name} regarding provider credentialing. Is this the credentialing department?"
+
+        gather = Gather(
+            input='speech',
+            action=f'{callback_base}/webhook/speech',
+            method='POST',
+            speech_timeout='auto',
+            language='en-US'
+        )
+        gather.say(disclosure, voice='Polly.Joanna')
+        response.append(gather)
+
+        response.say("I didn't hear a response. I'll try again later. Goodbye.", voice='Polly.Joanna')
+
+        return Response(str(response), mimetype='text/xml')
+
+    except Exception as e:
+        print(f"❌ Error in voice_human_webhook: {e}")
+        response = VoiceResponse()
+        response.say("Sorry, there was a technical error. Goodbye.", voice='Polly.Joanna')
+        return Response(str(response), mimetype='text/xml')
+
+
+@app.route('/webhook/ivr-navigate', methods=['POST'])
+def ivr_navigate_webhook():
+    """
+    Handle IVR navigation - detect prompts and send DTMF tones
+    """
+    try:
+        from twilio.twiml.voice_response import Gather, Play
+
+        response = VoiceResponse()
+
+        call_sid = request.values.get('CallSid')
+        speech_result = request.values.get('SpeechResult', '')
+        digits = request.values.get('Digits', '')
+
+        # Get the base URL
+        callback_base = os.getenv('CALLBACK_URL', '').replace('/webhook/voice', '')
+        if not callback_base:
+            callback_base = f"https://{request.host}"
+
+        print(f"🎯 IVR Navigate - CallSID: {call_sid}")
+        print(f"📝 Speech: {speech_result}")
+        print(f"🔢 Digits: {digits}")
+
+        # Find the call state
+        call_info = None
+        for call_id, state in list(call_states.items()):
+            if state.get('call_sid') == call_sid:
+                call_info = {'call_id': call_id, 'state': state}
+                break
+
+        if call_info:
+            state = call_info['state']
+            ivr_patterns = state.get('ivr_knowledge', [])
+            current_level = state.get('current_menu_level', 0)
+
+            # Check if speech matches any IVR pattern
+            matched_pattern = None
+            speech_lower = speech_result.lower()
+
+            for pattern in ivr_patterns:
+                if pattern['menu_level'] > current_level:
+                    detected_phrase = pattern.get('detected_phrase', '').lower()
+                    if detected_phrase and detected_phrase in speech_lower:
+                        matched_pattern = pattern
+                        print(f"✅ Matched IVR pattern: '{detected_phrase}' at level {pattern['menu_level']}")
+                        break
+
+            if matched_pattern:
+                # Execute the matched action
+                action = matched_pattern.get('preferred_action', 'dtmf')
+                action_value = matched_pattern.get('action_value', '')
+
+                print(f"🎮 Executing IVR action: {action} = {action_value}")
+
+                if action == 'dtmf' and action_value:
+                    # Send DTMF tones
+                    response.play(digits=action_value)
+                    print(f"📲 Sending DTMF: {action_value}")
+                elif action == 'speech' and action_value:
+                    # Say a phrase
+                    response.say(action_value, voice='Polly.Joanna')
+                    print(f"🗣️ Saying: {action_value}")
+
+                # Update the current menu level
+                state['current_menu_level'] = matched_pattern['menu_level']
+
+                # Check if we have more IVR levels to navigate
+                remaining_patterns = [p for p in ivr_patterns if p['menu_level'] > state['current_menu_level']]
+
+                if remaining_patterns:
+                    # Continue IVR navigation
+                    response.pause(length=2)
+                    gather = Gather(
+                        input='speech dtmf',
+                        action=f'{callback_base}/webhook/ivr-navigate',
+                        method='POST',
+                        speech_timeout='3',
+                        timeout=10,
+                        language='en-US'
+                    )
+                    response.append(gather)
+                    response.redirect(f'{callback_base}/webhook/voice/human')
+                else:
+                    # All IVR levels done, wait for human
+                    print(f"✅ IVR navigation complete - waiting for human")
+                    response.pause(length=3)
+                    response.redirect(f'{callback_base}/webhook/voice/human')
+            else:
+                # No match - might be human or different IVR prompt
+                # Check if it sounds like a human greeting
+                human_indicators = ['hello', 'hi', 'how can i help', 'speaking', 'this is', 'department', 'thank you for calling']
+                is_human = any(indicator in speech_lower for indicator in human_indicators)
+
+                if is_human or len(ivr_patterns) == 0:
+                    # Probably human - start conversation
+                    print(f"👤 Human detected - starting conversation")
+                    state['call_state'] = CallState.SPEAKING_WITH_HUMAN
+                    response.redirect(f'{callback_base}/webhook/voice/human')
+                else:
+                    # Keep listening for IVR
+                    response.pause(length=1)
+                    gather = Gather(
+                        input='speech dtmf',
+                        action=f'{callback_base}/webhook/ivr-navigate',
+                        method='POST',
+                        speech_timeout='3',
+                        timeout=10,
+                        language='en-US'
+                    )
+                    response.append(gather)
+                    response.redirect(f'{callback_base}/webhook/voice/human')
+        else:
+            # No call state found - go to human mode
+            response.redirect(f'{callback_base}/webhook/voice/human')
+
+        return Response(str(response), mimetype='text/xml')
+
+    except Exception as e:
+        print(f"❌ Error in ivr_navigate_webhook: {e}")
+        import traceback
+        traceback.print_exc()
+        response = VoiceResponse()
+        response.say("Sorry, there was a technical error. Goodbye.", voice='Polly.Joanna')
+        return Response(str(response), mimetype='text/xml')
+
+
 @app.route('/webhook/speech', methods=['POST'])
 def speech_webhook():
     """
-    Handle speech input from Twilio Gather
+    Handle speech input from Twilio Gather - Uses GPT-4 for intelligent responses
     """
     try:
         from twilio.twiml.voice_response import Gather
@@ -287,42 +650,98 @@ def speech_webhook():
                 })
                 break
 
-        # Simple response logic based on what was heard
-        speech_lower = speech_result.lower()
+        # Use GPT-4 to generate intelligent response
+        if call_info:
+            state = call_info['state']
 
-        if any(word in speech_lower for word in ['yes', 'correct', 'right', 'credentialing', 'department']):
-            # They confirmed it's credentialing
-            if call_info:
-                questions = call_info['state'].get('questions', [])
-                provider_name = call_info['state'].get('provider_name', 'the provider')
-                npi = call_info['state'].get('npi', '')
+            # Track questions asked using a dedicated counter (not agent message count)
+            questions = state.get('questions', [])
+            questions_asked_count = state.get('questions_asked_count', 0)
 
-                # Ask the first question
-                message = f"Thank you. I'm calling to check on the credentialing status for {provider_name}, N P I number {' '.join(npi)}. "
-                if questions:
-                    message += questions[0] if isinstance(questions[0], str) else str(questions[0])
-                else:
-                    message += "Can you tell me the current status of the application?"
+            # Determine the stage based on actual questions asked, not total messages
+            if questions_asked_count >= len(questions):
+                stage = "wrapping_up"
+            else:
+                # We're in initial contact until first question is asked
+                stage = f"initial_contact_ask_question_{questions_asked_count + 1}"
 
+            ai_response = smart_agent.generate_response(
+                speech=speech_result,
+                state=state,
+                stage=stage,
+                current_question_index=questions_asked_count
+            )
+
+            print(f"🤖 AI Response: {ai_response}")
+            print(f"📋 Stage: {stage}, Questions Asked: {questions_asked_count}/{len(questions)}")
+
+            # Update questions asked count if a question was asked
+            if ai_response.get('question_asked'):
+                state['questions_asked_count'] = questions_asked_count + 1
+                print(f"✅ Question asked! New count: {state['questions_asked_count']}")
+
+            # Add AI response to transcript
+            state['transcript'].append({
+                'speaker': 'agent',
+                'text': ai_response.get('response', ''),
+                'timestamp': datetime.now().isoformat()
+            })
+
+            # Store any extracted info
+            if ai_response.get('extracted_info'):
+                state['notes'] += f" {json.dumps(ai_response['extracted_info'])}"
+
+            # Determine next action based on AI decision
+            action = ai_response.get('action', 'continue')
+
+            if action == 'end_call':
+                response.say(ai_response.get('response', 'Thank you for your time. Goodbye.'), voice='Polly.Joanna')
+                response.hangup()
+            elif action == 'request_transfer':
+                response.say(ai_response.get('response', 'Could you please transfer me to the credentialing department?'), voice='Polly.Joanna')
+                response.pause(length=30)  # Wait for transfer
+                # After pause, gather again
+                gather = Gather(
+                    input='speech',
+                    action=f'{callback_base}/webhook/speech',
+                    method='POST',
+                    speech_timeout='auto',
+                    language='en-US'
+                )
+                gather.say("Hello? Is anyone there?", voice='Polly.Joanna')
+                response.append(gather)
+                # Fallback if no response after transfer
+                response.redirect(f'{callback_base}/webhook/speech')
+            else:
+                # Continue conversation
                 gather = Gather(
                     input='speech',
                     action=f'{callback_base}/webhook/speech/followup',
                     method='POST',
                     speech_timeout='auto',
+                    timeout=10,  # Wait up to 10 seconds for response
                     language='en-US'
                 )
-                gather.say(message, voice='Polly.Joanna')
+                gather.say(ai_response.get('response', 'Could you please repeat that?'), voice='Polly.Joanna')
                 response.append(gather)
-            else:
-                response.say("Thank you. Can you tell me the status of the credentialing application?", voice='Polly.Joanna')
 
-        elif any(word in speech_lower for word in ['no', 'wrong', 'number', 'transfer', 'hold']):
-            # Wrong department or need transfer
-            response.say("I apologize for the confusion. Could you please transfer me to the credentialing department?", voice='Polly.Joanna')
-            response.pause(length=30)  # Wait for transfer
+                # Fallback: Ask if they're still there, then end if no response
+                response.say("Are you still there?", voice='Polly.Joanna')
+                final_gather = Gather(
+                    input='speech',
+                    action=f'{callback_base}/webhook/speech/followup',
+                    method='POST',
+                    speech_timeout='3',
+                    timeout=8,  # Wait 8 more seconds
+                    language='en-US'
+                )
+                response.append(final_gather)
 
+                # If still no response after 8 seconds, end the call
+                response.say("I haven't heard a response. Thank you for your time. Goodbye.", voice='Polly.Joanna')
+                response.hangup()
         else:
-            # Unclear response, ask for clarification
+            # No call state found, use fallback
             gather = Gather(
                 input='speech',
                 action=f'{callback_base}/webhook/speech',
@@ -330,8 +749,11 @@ def speech_webhook():
                 speech_timeout='auto',
                 language='en-US'
             )
-            gather.say("I'm sorry, I didn't quite catch that. Is this the credentialing department?", voice='Polly.Joanna')
+            gather.say("I apologize, could you please repeat that?", voice='Polly.Joanna')
             response.append(gather)
+
+            # Fallback redirect
+            response.redirect(f'{callback_base}/webhook/speech')
 
         return Response(str(response), mimetype='text/xml')
 
@@ -347,7 +769,7 @@ def speech_webhook():
 @app.route('/webhook/speech/followup', methods=['POST'])
 def speech_followup_webhook():
     """
-    Handle follow-up speech input
+    Handle follow-up speech input - Uses GPT-4 for intelligent responses
     """
     try:
         from twilio.twiml.voice_response import Gather
@@ -378,32 +800,67 @@ def speech_followup_webhook():
                 })
                 break
 
-        # Extract any useful information from the response
-        speech_lower = speech_result.lower()
-
-        # Check for status information
         if call_info:
             state = call_info['state']
 
-            # Look for status keywords
-            if any(word in speech_lower for word in ['approved', 'active', 'completed', 'effective']):
-                state['notes'] += f"Status: Approved/Active. "
-            elif any(word in speech_lower for word in ['pending', 'processing', 'review']):
-                state['notes'] += f"Status: Pending. "
-            elif any(word in speech_lower for word in ['denied', 'rejected']):
-                state['notes'] += f"Status: Denied. "
-
-            # Look for timeline
-            if 'days' in speech_lower or 'weeks' in speech_lower:
-                state['notes'] += f"Timeline mentioned: {speech_result}. "
-
-            # Check if there are more questions
+            # Track questions asked using a dedicated counter
             questions = state.get('questions', [])
-            asked_count = len([t for t in state.get('transcript', []) if t.get('speaker') == 'agent'])
+            questions_asked_count = state.get('questions_asked_count', 0)
 
-            if asked_count < len(questions):
-                # Ask next question
-                next_question = questions[asked_count] if isinstance(questions[asked_count], str) else str(questions[asked_count])
+            # Determine stage - ask questions if we have more to ask
+            if questions_asked_count >= len(questions):
+                stage = "wrapping_up"
+            else:
+                stage = f"asking_question_{questions_asked_count + 1}_of_{len(questions)}"
+
+            print(f"📋 Follow-up stage: {stage}, Questions Asked: {questions_asked_count}/{len(questions)}")
+
+            # Use GPT-4 to generate intelligent response
+            ai_response = smart_agent.generate_response(
+                speech=speech_result,
+                state=state,
+                stage=stage,
+                current_question_index=questions_asked_count
+            )
+
+            print(f"🤖 AI Response: {ai_response}")
+
+            # Update questions asked count if a question was asked
+            if ai_response.get('question_asked'):
+                state['questions_asked_count'] = questions_asked_count + 1
+                print(f"✅ Question asked! New count: {state['questions_asked_count']}")
+
+            # Add AI response to transcript
+            state['transcript'].append({
+                'speaker': 'agent',
+                'text': ai_response.get('response', ''),
+                'timestamp': datetime.now().isoformat()
+            })
+
+            # Store any extracted info
+            if ai_response.get('extracted_info'):
+                for key, value in ai_response['extracted_info'].items():
+                    state['notes'] += f" {key}: {value}."
+
+                # Check for specific fields
+                extracted = ai_response['extracted_info']
+                if 'status' in extracted:
+                    state['credentialing_status'] = extracted['status']
+                if 'reference_number' in extracted:
+                    state['reference_number'] = extracted['reference_number']
+                if 'turnaround_days' in extracted:
+                    state['turnaround_days'] = extracted['turnaround_days']
+
+            # Determine next action - only end when AI explicitly decides to
+            action = ai_response.get('action', 'continue')
+
+            if action == 'end_call':
+                state['call_state'] = CallState.COMPLETING
+                response.say(ai_response.get('response', 'Thank you very much for your help. Have a great day. Goodbye.'), voice='Polly.Joanna')
+                response.hangup()
+            elif action == 'request_transfer':
+                response.say(ai_response.get('response', 'Could you please transfer me?'), voice='Polly.Joanna')
+                response.pause(length=30)
                 gather = Gather(
                     input='speech',
                     action=f'{callback_base}/webhook/speech/followup',
@@ -411,24 +868,37 @@ def speech_followup_webhook():
                     speech_timeout='auto',
                     language='en-US'
                 )
-                gather.say(f"Thank you. {next_question}", voice='Polly.Joanna')
+                gather.say("Hello? Is anyone there?", voice='Polly.Joanna')
+                response.append(gather)
+                # Fallback if no response after transfer
+                response.redirect(f'{callback_base}/webhook/speech/followup')
+            else:
+                # Continue conversation
+                gather = Gather(
+                    input='speech',
+                    action=f'{callback_base}/webhook/speech/followup',
+                    method='POST',
+                    speech_timeout='auto',
+                    language='en-US'
+                )
+                gather.say(ai_response.get('response', 'Thank you. Do you have any other information?'), voice='Polly.Joanna')
                 response.append(gather)
 
-                # Record that we asked
-                state['transcript'].append({
-                    'speaker': 'agent',
-                    'text': next_question,
-                    'timestamp': datetime.now().isoformat()
-                })
-            else:
-                # All questions asked, wrap up
-                state['call_state'] = CallState.COMPLETING
-                state['notes'] += f"Full response: {speech_result}"
-                response.say("Thank you very much for your help. Have a great day. Goodbye.", voice='Polly.Joanna')
-                response.hangup()
+                # IMPORTANT: Fallback if Gather times out - keep the conversation going
+                response.say("Are you still there?", voice='Polly.Joanna')
+                response.redirect(f'{callback_base}/webhook/speech/followup')
         else:
-            response.say("Thank you for the information. Goodbye.", voice='Polly.Joanna')
-            response.hangup()
+            # No call state - try to recover
+            gather = Gather(
+                input='speech',
+                action=f'{callback_base}/webhook/speech/followup',
+                method='POST',
+                speech_timeout='auto',
+                language='en-US'
+            )
+            gather.say("I apologize, could you please repeat that?", voice='Polly.Joanna')
+            response.append(gather)
+            response.redirect(f'{callback_base}/webhook/speech/followup')
 
         return Response(str(response), mimetype='text/xml')
 
@@ -952,6 +1422,317 @@ def get_ivr_knowledge(insurance_name: str):
             'success': True,
             'data': []
         }), 200
+
+
+# ============================================================================
+# Insurance Provider CRUD Endpoints
+# ============================================================================
+
+@app.route('/api/insurance-providers', methods=['GET'])
+def get_insurance_providers():
+    """
+    Get all insurance providers
+    """
+    try:
+        from credentialing_agent import DatabaseManager
+
+        db = DatabaseManager()
+
+        with db.conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, insurance_name, phone_number, department,
+                       best_call_times, average_wait_time_minutes, notes, last_updated
+                FROM insurance_providers
+                ORDER BY insurance_name ASC
+            """)
+
+            providers = []
+            for row in cur.fetchall():
+                providers.append({
+                    'id': str(row[0]),
+                    'insurance_name': row[1],
+                    'phone_number': row[2],
+                    'department': row[3],
+                    'best_call_times': row[4],
+                    'average_wait_time_minutes': row[5],
+                    'notes': row[6],
+                    'last_updated': row[7].isoformat() if row[7] else None
+                })
+
+        db.close()
+
+        return jsonify({
+            'success': True,
+            'data': providers
+        }), 200
+
+    except Exception as e:
+        print(f"Error getting insurance providers: {e}")
+        return jsonify({
+            'success': True,
+            'data': []
+        }), 200
+
+
+@app.route('/api/insurance-providers', methods=['POST'])
+def add_insurance_provider():
+    """
+    Add a new insurance provider
+
+    Request body:
+    {
+        "insurance_name": "Aetna",
+        "phone_number": "+18001234567",
+        "department": "Provider Services",
+        "best_call_times": {"days": ["monday", "tuesday"], "hours": [9, 17]},
+        "average_wait_time_minutes": 15,
+        "notes": "Best to call early morning"
+    }
+    """
+    try:
+        from credentialing_agent import DatabaseManager
+
+        data = request.json
+        db = DatabaseManager()
+
+        with db.conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO insurance_providers
+                (insurance_name, phone_number, department, best_call_times,
+                 average_wait_time_minutes, notes)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                data['insurance_name'],
+                data['phone_number'],
+                data.get('department'),
+                json.dumps(data.get('best_call_times')) if data.get('best_call_times') else None,
+                data.get('average_wait_time_minutes'),
+                data.get('notes')
+            ))
+
+            provider_id = cur.fetchone()[0]
+            db.conn.commit()
+
+        db.close()
+
+        return jsonify({
+            'success': True,
+            'id': str(provider_id),
+            'message': 'Insurance provider added successfully'
+        }), 201
+
+    except Exception as e:
+        print(f"Error adding insurance provider: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/insurance-providers/<provider_id>', methods=['PUT'])
+def update_insurance_provider(provider_id: str):
+    """
+    Update an existing insurance provider
+    """
+    try:
+        from credentialing_agent import DatabaseManager
+
+        data = request.json
+        db = DatabaseManager()
+
+        with db.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE insurance_providers
+                SET insurance_name = %s,
+                    phone_number = %s,
+                    department = %s,
+                    best_call_times = %s,
+                    average_wait_time_minutes = %s,
+                    notes = %s,
+                    last_updated = NOW()
+                WHERE id = %s
+                RETURNING id
+            """, (
+                data['insurance_name'],
+                data['phone_number'],
+                data.get('department'),
+                json.dumps(data.get('best_call_times')) if data.get('best_call_times') else None,
+                data.get('average_wait_time_minutes'),
+                data.get('notes'),
+                provider_id
+            ))
+
+            result = cur.fetchone()
+            if not result:
+                db.close()
+                return jsonify({
+                    'success': False,
+                    'error': 'Insurance provider not found'
+                }), 404
+
+            db.conn.commit()
+
+        db.close()
+
+        return jsonify({
+            'success': True,
+            'message': 'Insurance provider updated successfully'
+        }), 200
+
+    except Exception as e:
+        print(f"Error updating insurance provider: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/insurance-providers/<provider_id>', methods=['DELETE'])
+def delete_insurance_provider(provider_id: str):
+    """
+    Delete an insurance provider
+    """
+    try:
+        from credentialing_agent import DatabaseManager
+
+        db = DatabaseManager()
+
+        with db.conn.cursor() as cur:
+            # First delete associated IVR knowledge
+            cur.execute("""
+                DELETE FROM ivr_knowledge
+                WHERE insurance_name = (
+                    SELECT insurance_name FROM insurance_providers WHERE id = %s
+                )
+            """, (provider_id,))
+
+            # Then delete the provider
+            cur.execute("""
+                DELETE FROM insurance_providers
+                WHERE id = %s
+                RETURNING id
+            """, (provider_id,))
+
+            result = cur.fetchone()
+            if not result:
+                db.close()
+                return jsonify({
+                    'success': False,
+                    'error': 'Insurance provider not found'
+                }), 404
+
+            db.conn.commit()
+
+        db.close()
+
+        return jsonify({
+            'success': True,
+            'message': 'Insurance provider deleted successfully'
+        }), 200
+
+    except Exception as e:
+        print(f"Error deleting insurance provider: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/ivr-knowledge/<ivr_id>', methods=['DELETE'])
+def delete_ivr_knowledge(ivr_id: str):
+    """
+    Delete an IVR knowledge entry
+    """
+    try:
+        from credentialing_agent import DatabaseManager
+
+        db = DatabaseManager()
+
+        with db.conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM ivr_knowledge
+                WHERE id = %s
+                RETURNING id
+            """, (ivr_id,))
+
+            result = cur.fetchone()
+            if not result:
+                db.close()
+                return jsonify({
+                    'success': False,
+                    'error': 'IVR knowledge entry not found'
+                }), 404
+
+            db.conn.commit()
+
+        db.close()
+
+        return jsonify({
+            'success': True,
+            'message': 'IVR knowledge deleted successfully'
+        }), 200
+
+    except Exception as e:
+        print(f"Error deleting IVR knowledge: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/ivr-knowledge/<ivr_id>', methods=['PUT'])
+def update_ivr_knowledge(ivr_id: str):
+    """
+    Update an IVR knowledge entry
+    """
+    try:
+        from credentialing_agent import DatabaseManager
+
+        data = request.json
+        db = DatabaseManager()
+
+        with db.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE ivr_knowledge
+                SET menu_level = %s,
+                    detected_phrase = %s,
+                    preferred_action = %s,
+                    action_value = %s,
+                    last_updated = NOW()
+                WHERE id = %s
+                RETURNING id
+            """, (
+                data['menu_level'],
+                data['detected_phrase'],
+                data['preferred_action'],
+                data.get('action_value'),
+                ivr_id
+            ))
+
+            result = cur.fetchone()
+            if not result:
+                db.close()
+                return jsonify({
+                    'success': False,
+                    'error': 'IVR knowledge entry not found'
+                }), 404
+
+            db.conn.commit()
+
+        db.close()
+
+        return jsonify({
+            'success': True,
+            'message': 'IVR knowledge updated successfully'
+        }), 200
+
+    except Exception as e:
+        print(f"Error updating IVR knowledge: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 
 # ============================================================================

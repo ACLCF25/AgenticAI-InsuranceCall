@@ -87,6 +87,20 @@ export interface IVRKnowledge {
   attempts?: number;
 }
 
+export interface InsuranceProvider {
+  id?: string;
+  insurance_name: string;
+  phone_number: string;
+  department?: string;
+  best_call_times?: {
+    days: string[];
+    hours: number[];
+  };
+  average_wait_time_minutes?: number;
+  notes?: string;
+  last_updated?: string;
+}
+
 export interface ScheduledFollowup {
   id: string;
   request_id: string;

@@ -9,6 +9,7 @@ import { ActiveCallsTable } from '@/components/dashboard/active-calls-table'
 import { RecentCallsTable } from '@/components/dashboard/recent-calls-table'
 import { MetricsChart } from '@/components/dashboard/metrics-chart'
 import { FollowupsPanel } from '@/components/dashboard/followups-panel'
+import { InsuranceManagement } from '@/components/dashboard/insurance-management'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Skeleton } from '@/components/ui/skeleton'
 
@@ -45,9 +46,10 @@ export default function DashboardPage() {
 
         {/* Main Content Tabs */}
         <Tabs defaultValue="overview" className="space-y-6">
-          <TabsList className="grid w-full grid-cols-4 lg:w-auto">
+          <TabsList className="grid w-full grid-cols-5 lg:w-auto">
             <TabsTrigger value="overview">Overview</TabsTrigger>
             <TabsTrigger value="calls">Calls</TabsTrigger>
+            <TabsTrigger value="insurance">Insurance</TabsTrigger>
             <TabsTrigger value="followups">Follow-ups</TabsTrigger>
             <TabsTrigger value="analytics">Analytics</TabsTrigger>
           </TabsList>
@@ -64,6 +66,11 @@ export default function DashboardPage() {
           {/* Calls Tab */}
           <TabsContent value="calls" className="space-y-6">
             <RecentCallsTable showAll />
+          </TabsContent>
+
+          {/* Insurance Tab */}
+          <TabsContent value="insurance" className="space-y-6">
+            <InsuranceManagement />
           </TabsContent>
 
           {/* Follow-ups Tab */}
