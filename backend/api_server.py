@@ -11,15 +11,18 @@ load_dotenv()
 
 import asyncio
 import json
+import uuid
 from datetime import datetime
 from typing import Dict, Optional
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
+from flask_socketio import SocketIO, emit
 from twilio.twiml.voice_response import VoiceResponse, Stream, Connect
 from twilio.rest import Client as TwilioClient
 import threading
 from queue import Queue
 import base64
+import websockets
 
 from credentialing_agent import (
     CredentialingAgent,
@@ -30,6 +33,7 @@ from credentialing_agent import (
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # Global state management
 active_calls: Dict[str, CredentialingAgent] = {}
@@ -61,12 +65,20 @@ def start_credentialing_call():
     """
     try:
         data = request.json
+        print(f"\n{'='*50}")
+        print(f"📞 NEW CALL REQUEST RECEIVED")
+        print(f"{'='*50}")
+        print(f"Provider: {data.get('provider_name')}")
+        print(f"Insurance: {data.get('insurance_name')}")
+        print(f"Phone: {data.get('insurance_phone')}")
+        print(f"NPI: {data.get('npi')}")
 
         # Validate required fields
         required = ['insurance_name', 'provider_name', 'npi', 'tax_id',
                    'address', 'insurance_phone', 'questions']
         for field in required:
             if field not in data:
+                print(f"❌ Missing required field: {field}")
                 return jsonify({
                     'success': False,
                     'error': f'Missing required field: {field}'
@@ -89,6 +101,9 @@ def start_credentialing_call():
                 'error': f'Missing required environment variables: {", ".join(missing_env)}. Please configure your .env file.'
             }), 500
 
+        # Generate call_id upfront so we can track immediately
+        call_id = str(uuid.uuid4())
+
         # Create initial state
         initial_state: CredentialingState = {
             'insurance_name': data['insurance_name'],
@@ -98,7 +113,7 @@ def start_credentialing_call():
             'address': data['address'],
             'insurance_phone': data['insurance_phone'],
             'questions': data['questions'],
-            'call_id': None,
+            'call_id': call_id,
             'call_sid': None,
             'call_state': CallState.INITIATING,
             'transcript': [],
@@ -118,31 +133,52 @@ def start_credentialing_call():
             'error_message': None
         }
 
+        # Store state immediately so frontend can track it
+        call_states[call_id] = initial_state
+        print(f"✅ Call ID generated: {call_id}")
+        print(f"📊 Call state stored, status: {CallState.INITIATING.value}")
+
         # Create agent
         agent = CredentialingAgent()
 
         # Start call in background thread
         def run_call():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            final_state = loop.run_until_complete(agent.process_call(initial_state))
-            loop.close()
+            print(f"🔄 Background thread started for call: {call_id}")
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                print(f"📞 Initiating Twilio call to: {data['insurance_phone']}")
+                final_state = loop.run_until_complete(agent.process_call(initial_state))
+                loop.close()
 
-            # Store final state
-            if final_state.get('call_id'):
-                call_states[final_state['call_id']] = final_state
+                # Update stored state with final state
+                call_states[call_id] = final_state
+                print(f"✅ Call completed: {call_id}")
+                print(f"📊 Final status: {final_state.get('call_state')}")
+            except Exception as thread_error:
+                print(f"❌ Error in call thread: {thread_error}")
+                import traceback
+                traceback.print_exc()
 
         thread = threading.Thread(target=run_call)
         thread.start()
 
+        print(f"{'='*50}")
+        print(f"✅ CALL INITIATED SUCCESSFULLY")
+        print(f"{'='*50}\n")
+
         return jsonify({
             'success': True,
             'message': 'Call initiated',
+            'call_id': call_id,
             'provider': data['provider_name'],
             'insurance': data['insurance_name']
         }), 200
 
     except Exception as e:
+        print(f"❌ Error starting call: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({
             'success': False,
             'error': str(e)
@@ -155,24 +191,254 @@ def voice_webhook():
     Twilio webhook for incoming/outgoing voice calls
     This is called when the call connects
     """
-    response = VoiceResponse()
-    
-    # Get call SID
-    call_sid = request.values.get('CallSid')
-    
-    # Start media stream for real-time audio
-    connect = Connect()
-    stream = Stream(url=f'wss://{request.host}/media-stream')
-    connect.append(stream)
-    response.append(connect)
-    
-    # Say initial message while connecting stream
-    response.say(
-        "Connecting to credentialing department, please wait.",
-        voice='Polly.Joanna'
-    )
-    
-    return Response(str(response), mimetype='text/xml')
+    try:
+        from twilio.twiml.voice_response import Gather
+
+        response = VoiceResponse()
+
+        # Get call SID and find associated call state
+        call_sid = request.values.get('CallSid')
+        print(f"📞 Voice webhook called - CallSID: {call_sid}")
+
+        # Get the base URL from environment or request
+        callback_base = os.getenv('CALLBACK_URL', '').replace('/webhook/voice', '')
+        if not callback_base:
+            callback_base = f"https://{request.host}"
+        print(f"📍 Callback base URL: {callback_base}")
+
+        # Find the call state by call_id that matches this call
+        call_info = None
+        for call_id, state in list(call_states.items()):
+            if state.get('call_sid') == call_sid or state.get('call_sid') is None:
+                # Update call_sid if not set
+                if state.get('call_sid') is None:
+                    state['call_sid'] = call_sid
+                    state['call_state'] = CallState.SPEAKING_WITH_HUMAN
+                    print(f"✅ Linked CallSID {call_sid} to call_id {call_id}")
+                call_info = {'call_id': call_id, 'state': state}
+                break
+
+        # Get provider name for the disclosure message
+        provider_name = "a healthcare provider"
+        if call_info:
+            provider_name = call_info['state'].get('provider_name', provider_name)
+
+        # AI Disclosure message (required for automated calls)
+        disclosure = f"Hello, this is an automated AI assistant calling on behalf of {provider_name} regarding provider credentialing. Is this the credentialing department?"
+
+        # Use Gather to capture the response
+        gather = Gather(
+            input='speech',
+            action=f'{callback_base}/webhook/speech',
+            method='POST',
+            speech_timeout='auto',
+            language='en-US'
+        )
+        gather.say(disclosure, voice='Polly.Joanna')
+        response.append(gather)
+
+        # If no input, say goodbye
+        response.say("I didn't hear a response. I'll try again later. Goodbye.", voice='Polly.Joanna')
+
+        print(f"📤 Returning TwiML: {str(response)[:200]}...")
+        return Response(str(response), mimetype='text/xml')
+
+    except Exception as e:
+        print(f"❌ Error in voice_webhook: {e}")
+        import traceback
+        traceback.print_exc()
+        # Return a simple error response
+        response = VoiceResponse()
+        response.say("Sorry, there was a technical error. Please try again later.", voice='Polly.Joanna')
+        return Response(str(response), mimetype='text/xml')
+
+
+@app.route('/webhook/speech', methods=['POST'])
+def speech_webhook():
+    """
+    Handle speech input from Twilio Gather
+    """
+    try:
+        from twilio.twiml.voice_response import Gather
+
+        response = VoiceResponse()
+
+        call_sid = request.values.get('CallSid')
+        speech_result = request.values.get('SpeechResult', '')
+
+        # Get the base URL
+        callback_base = os.getenv('CALLBACK_URL', '').replace('/webhook/voice', '')
+        if not callback_base:
+            callback_base = f"https://{request.host}"
+
+        print(f"🎤 Speech received - CallSID: {call_sid}")
+        print(f"📝 Transcript: {speech_result}")
+
+        # Find the call state
+        call_info = None
+        for call_id, state in list(call_states.items()):
+            if state.get('call_sid') == call_sid:
+                call_info = {'call_id': call_id, 'state': state}
+                # Add to transcript
+                state['transcript'].append({
+                    'speaker': 'insurance',
+                    'text': speech_result,
+                    'timestamp': datetime.now().isoformat()
+                })
+                break
+
+        # Simple response logic based on what was heard
+        speech_lower = speech_result.lower()
+
+        if any(word in speech_lower for word in ['yes', 'correct', 'right', 'credentialing', 'department']):
+            # They confirmed it's credentialing
+            if call_info:
+                questions = call_info['state'].get('questions', [])
+                provider_name = call_info['state'].get('provider_name', 'the provider')
+                npi = call_info['state'].get('npi', '')
+
+                # Ask the first question
+                message = f"Thank you. I'm calling to check on the credentialing status for {provider_name}, N P I number {' '.join(npi)}. "
+                if questions:
+                    message += questions[0] if isinstance(questions[0], str) else str(questions[0])
+                else:
+                    message += "Can you tell me the current status of the application?"
+
+                gather = Gather(
+                    input='speech',
+                    action=f'{callback_base}/webhook/speech/followup',
+                    method='POST',
+                    speech_timeout='auto',
+                    language='en-US'
+                )
+                gather.say(message, voice='Polly.Joanna')
+                response.append(gather)
+            else:
+                response.say("Thank you. Can you tell me the status of the credentialing application?", voice='Polly.Joanna')
+
+        elif any(word in speech_lower for word in ['no', 'wrong', 'number', 'transfer', 'hold']):
+            # Wrong department or need transfer
+            response.say("I apologize for the confusion. Could you please transfer me to the credentialing department?", voice='Polly.Joanna')
+            response.pause(length=30)  # Wait for transfer
+
+        else:
+            # Unclear response, ask for clarification
+            gather = Gather(
+                input='speech',
+                action=f'{callback_base}/webhook/speech',
+                method='POST',
+                speech_timeout='auto',
+                language='en-US'
+            )
+            gather.say("I'm sorry, I didn't quite catch that. Is this the credentialing department?", voice='Polly.Joanna')
+            response.append(gather)
+
+        return Response(str(response), mimetype='text/xml')
+
+    except Exception as e:
+        print(f"❌ Error in speech_webhook: {e}")
+        import traceback
+        traceback.print_exc()
+        response = VoiceResponse()
+        response.say("Sorry, there was a technical error. Goodbye.", voice='Polly.Joanna')
+        return Response(str(response), mimetype='text/xml')
+
+
+@app.route('/webhook/speech/followup', methods=['POST'])
+def speech_followup_webhook():
+    """
+    Handle follow-up speech input
+    """
+    try:
+        from twilio.twiml.voice_response import Gather
+
+        response = VoiceResponse()
+
+        call_sid = request.values.get('CallSid')
+        speech_result = request.values.get('SpeechResult', '')
+
+        # Get the base URL
+        callback_base = os.getenv('CALLBACK_URL', '').replace('/webhook/voice', '')
+        if not callback_base:
+            callback_base = f"https://{request.host}"
+
+        print(f"🎤 Follow-up speech - CallSID: {call_sid}")
+        print(f"📝 Transcript: {speech_result}")
+
+        # Find the call state
+        call_info = None
+        for call_id, state in list(call_states.items()):
+            if state.get('call_sid') == call_sid:
+                call_info = {'call_id': call_id, 'state': state}
+                # Add to transcript
+                state['transcript'].append({
+                    'speaker': 'insurance',
+                    'text': speech_result,
+                    'timestamp': datetime.now().isoformat()
+                })
+                break
+
+        # Extract any useful information from the response
+        speech_lower = speech_result.lower()
+
+        # Check for status information
+        if call_info:
+            state = call_info['state']
+
+            # Look for status keywords
+            if any(word in speech_lower for word in ['approved', 'active', 'completed', 'effective']):
+                state['notes'] += f"Status: Approved/Active. "
+            elif any(word in speech_lower for word in ['pending', 'processing', 'review']):
+                state['notes'] += f"Status: Pending. "
+            elif any(word in speech_lower for word in ['denied', 'rejected']):
+                state['notes'] += f"Status: Denied. "
+
+            # Look for timeline
+            if 'days' in speech_lower or 'weeks' in speech_lower:
+                state['notes'] += f"Timeline mentioned: {speech_result}. "
+
+            # Check if there are more questions
+            questions = state.get('questions', [])
+            asked_count = len([t for t in state.get('transcript', []) if t.get('speaker') == 'agent'])
+
+            if asked_count < len(questions):
+                # Ask next question
+                next_question = questions[asked_count] if isinstance(questions[asked_count], str) else str(questions[asked_count])
+                gather = Gather(
+                    input='speech',
+                    action=f'{callback_base}/webhook/speech/followup',
+                    method='POST',
+                    speech_timeout='auto',
+                    language='en-US'
+                )
+                gather.say(f"Thank you. {next_question}", voice='Polly.Joanna')
+                response.append(gather)
+
+                # Record that we asked
+                state['transcript'].append({
+                    'speaker': 'agent',
+                    'text': next_question,
+                    'timestamp': datetime.now().isoformat()
+                })
+            else:
+                # All questions asked, wrap up
+                state['call_state'] = CallState.COMPLETING
+                state['notes'] += f"Full response: {speech_result}"
+                response.say("Thank you very much for your help. Have a great day. Goodbye.", voice='Polly.Joanna')
+                response.hangup()
+        else:
+            response.say("Thank you for the information. Goodbye.", voice='Polly.Joanna')
+            response.hangup()
+
+        return Response(str(response), mimetype='text/xml')
+
+    except Exception as e:
+        print(f"❌ Error in speech_followup_webhook: {e}")
+        import traceback
+        traceback.print_exc()
+        response = VoiceResponse()
+        response.say("Sorry, there was a technical error. Goodbye.", voice='Polly.Joanna')
+        return Response(str(response), mimetype='text/xml')
 
 
 @app.route('/webhook/status', methods=['POST'])
@@ -196,6 +462,14 @@ def status_webhook():
             state['error_message'] = request.values.get('ErrorMessage', 'Unknown error')
     
     return jsonify({'success': True}), 200
+
+
+@app.route('/webhook/voice/status', methods=['POST'])
+def voice_status_webhook():
+    """
+    Alias for status webhook - Twilio may call this URL
+    """
+    return status_webhook()
 
 
 @app.route('/webhook/transcription', methods=['POST'])
@@ -680,27 +954,120 @@ def get_ivr_knowledge(insurance_name: str):
         }), 200
 
 
-# WebSocket handler for media streaming (requires flask-socketio)
-# This is a placeholder - you'd need to implement proper WebSocket handling
-# for real-time audio streaming from Twilio
+# ============================================================================
+# WebSocket handlers for Twilio Media Streams
+# ============================================================================
 
-"""
-@socketio.on('media')
-def handle_media(data):
-    # Handle incoming media stream from Twilio
-    call_sid = data.get('streamSid')
-    audio_data = base64.b64decode(data.get('media', {}).get('payload', ''))
-    
-    # Send to Deepgram for transcription
-    # Process through agent
-    pass
-"""
+# Store active media stream connections
+media_streams: Dict[str, dict] = {}
 
+
+@socketio.on('connect', namespace='/media-stream')
+def handle_connect():
+    """Handle WebSocket connection from Twilio"""
+    print(f"🔌 WebSocket connected: {request.sid}")
+
+
+@socketio.on('disconnect', namespace='/media-stream')
+def handle_disconnect():
+    """Handle WebSocket disconnection"""
+    print(f"🔌 WebSocket disconnected: {request.sid}")
+    # Clean up any associated stream data
+    if request.sid in media_streams:
+        del media_streams[request.sid]
+
+
+@socketio.on('message', namespace='/media-stream')
+def handle_message(message):
+    """
+    Handle incoming Twilio Media Stream messages
+
+    Twilio sends JSON messages with event types:
+    - connected: WebSocket connected
+    - start: Stream started (contains streamSid, callSid, etc.)
+    - media: Audio payload (base64 encoded mu-law audio)
+    - stop: Stream stopped
+    """
+    try:
+        if isinstance(message, str):
+            data = json.loads(message)
+        else:
+            data = message
+
+        event_type = data.get('event')
+
+        if event_type == 'connected':
+            print(f"📞 Twilio stream connected: {data.get('protocol')}")
+
+        elif event_type == 'start':
+            stream_sid = data.get('streamSid')
+            call_sid = data.get('start', {}).get('callSid')
+            print(f"🎙️ Stream started - StreamSID: {stream_sid}, CallSID: {call_sid}")
+
+            # Store stream info
+            media_streams[request.sid] = {
+                'stream_sid': stream_sid,
+                'call_sid': call_sid,
+                'audio_buffer': [],
+                'transcript': ''
+            }
+
+            # Update call state if we have it
+            for call_id, state in call_states.items():
+                if state.get('call_sid') == call_sid:
+                    state['current_audio_type'] = AudioType.HUMAN_SPEECH
+                    print(f"📊 Updated call {call_id} audio type to HUMAN_SPEECH")
+                    break
+
+        elif event_type == 'media':
+            # Audio payload - base64 encoded mu-law audio
+            payload = data.get('media', {}).get('payload', '')
+            if payload and request.sid in media_streams:
+                # Decode audio (for future Deepgram integration)
+                # audio_data = base64.b64decode(payload)
+                # For now, just acknowledge receipt
+                pass
+
+        elif event_type == 'stop':
+            stream_sid = data.get('streamSid')
+            print(f"🛑 Stream stopped: {stream_sid}")
+
+            if request.sid in media_streams:
+                del media_streams[request.sid]
+
+    except Exception as e:
+        print(f"❌ Error handling media stream message: {e}")
+
+
+def send_audio_to_twilio(stream_sid: str, audio_base64: str):
+    """
+    Send audio back to Twilio (for TTS responses)
+
+    Args:
+        stream_sid: The Twilio stream SID
+        audio_base64: Base64 encoded mu-law audio
+    """
+    message = {
+        "event": "media",
+        "streamSid": stream_sid,
+        "media": {
+            "payload": audio_base64
+        }
+    }
+    socketio.emit('message', json.dumps(message), namespace='/media-stream')
+
+
+# ============================================================================
+# Main entry point
+# ============================================================================
 
 if __name__ == '__main__':
-    # For development
-    app.run(
+    # For development - use socketio.run for WebSocket support
+    print("🚀 Starting server with WebSocket support...")
+    socketio.run(
+        app,
         host='0.0.0.0',
         port=int(os.getenv('PORT', 5000)),
-        debug=os.getenv('DEBUG', 'False').lower() == 'true'
+        debug=os.getenv('DEBUG', 'False').lower() == 'true',
+        allow_unsafe_werkzeug=True
     )
