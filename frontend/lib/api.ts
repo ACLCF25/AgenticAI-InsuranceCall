@@ -8,6 +8,7 @@ import type {
   CallTranscript,
   SystemMetrics,
   IVRKnowledge,
+  InsuranceProvider,
   ScheduledFollowup,
   APIResponse,
   DashboardStats,
@@ -104,6 +105,42 @@ class APIClient {
   // Execute a scheduled follow-up
   async executeFollowup(followupId: string): Promise<APIResponse> {
     const { data } = await this.client.post(`/followup/${followupId}/execute`);
+    return data;
+  }
+
+  // Get all insurance providers
+  async getInsuranceProviders(): Promise<APIResponse<InsuranceProvider[]>> {
+    const { data } = await this.client.get('/insurance-providers');
+    return data;
+  }
+
+  // Add a new insurance provider
+  async addInsuranceProvider(provider: Omit<InsuranceProvider, 'id' | 'last_updated'>): Promise<APIResponse> {
+    const { data } = await this.client.post('/insurance-providers', provider);
+    return data;
+  }
+
+  // Update an insurance provider
+  async updateInsuranceProvider(id: string, provider: Omit<InsuranceProvider, 'id' | 'last_updated'>): Promise<APIResponse> {
+    const { data } = await this.client.put(`/insurance-providers/${id}`, provider);
+    return data;
+  }
+
+  // Delete an insurance provider
+  async deleteInsuranceProvider(id: string): Promise<APIResponse> {
+    const { data } = await this.client.delete(`/insurance-providers/${id}`);
+    return data;
+  }
+
+  // Delete IVR knowledge entry
+  async deleteIVRKnowledge(id: string): Promise<APIResponse> {
+    const { data } = await this.client.delete(`/ivr-knowledge/${id}`);
+    return data;
+  }
+
+  // Update IVR knowledge entry
+  async updateIVRKnowledge(id: string, knowledge: Omit<IVRKnowledge, 'id' | 'insurance_name'>): Promise<APIResponse> {
+    const { data } = await this.client.put(`/ivr-knowledge/${id}`, knowledge);
     return data;
   }
 }
