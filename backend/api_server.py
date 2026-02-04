@@ -4,6 +4,7 @@ Handles Twilio webhooks and real-time audio streaming
 """
 
 import os
+import re
 from dotenv import load_dotenv
 
 # Load environment variables BEFORE any other imports that use them
@@ -30,9 +31,21 @@ from credentialing_agent import (
     CallState,
     AudioType
 )
+from knowledge_base import KnowledgeBase, redact_text, EmbeddingError, SearchError, KnowledgeBaseError
+from loguru import logger
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
+from flask import send_from_directory
+from elevenlabs.client import ElevenLabs
+import time
+
+# ElevenLabs client for TTS
+elevenlabs_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Default: Rachel
+BASE_URL = os.getenv("BASE_URL", "http://localhost:5000").rstrip("/")
+ENABLE_ELEVENLABS_TTS = os.getenv("ENABLE_ELEVENLABS_TTS", "true").lower() == "true"
+CHECK_CALLBACK_REACHABLE = os.getenv("CHECK_CALLBACK_REACHABLE", "false").lower() == "true"
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -41,6 +54,8 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 # Global state management
 active_calls: Dict[str, CredentialingAgent] = {}
 call_states: Dict[str, CredentialingState] = {}
+call_states_by_sid: Dict[str, CredentialingState] = {}
+call_state_lock = threading.Lock()
 audio_queues: Dict[str, Queue] = {}
 
 # Twilio client
@@ -48,6 +63,233 @@ twilio_client = TwilioClient(
     os.getenv("TWILIO_ACCOUNT_SID"),
     os.getenv("TWILIO_AUTH_TOKEN")
 )
+
+# =============================================================================
+# Helper utilities
+# =============================================================================
+
+def _is_public_url(url: str) -> bool:
+    """Return True when the URL is not obviously localhost/loopback."""
+    return not re.match(r"^https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)(:?|/)", (url or "").lower())
+
+
+def get_callback_base(req) -> str:
+    """
+    Prefer CALLBACK_URL (minus /webhook/voice suffix) if set and usable; otherwise derive from request host.
+    Always returns a scheme+host without trailing slash.
+    """
+    callback_env = (os.getenv("CALLBACK_URL", "") or "").strip()
+    if callback_env.endswith("/webhook/voice"):
+        callback_env = callback_env[: -len("/webhook/voice")]
+    if callback_env and _is_public_url(callback_env):
+        base = callback_env
+    else:
+        # Fallback to request host, force https because Twilio requires it
+        scheme = "https"
+        base = f"{scheme}://{req.host}"
+    return base.rstrip("/")
+
+
+ENV_VALIDATION_OK: bool = False
+ENV_VALIDATION_ERRORS = []
+
+
+def validate_environment() -> bool:
+    """Validate critical environment variables for Twilio + audio; caches result."""
+    global ENV_VALIDATION_OK, ENV_VALIDATION_ERRORS
+
+    errors = []
+    required_keys = [
+        "CALLBACK_URL",
+        "BASE_URL",
+        "TWILIO_ACCOUNT_SID",
+        "TWILIO_AUTH_TOKEN",
+        "SUPABASE_HOST",
+        "SUPABASE_PASSWORD",
+        "ELEVENLABS_API_KEY",
+    ]
+
+    for key in required_keys:
+        if not os.getenv(key):
+            errors.append(f"Missing environment variable: {key}")
+
+    callback_url = os.getenv("CALLBACK_URL", "")
+    base_url = os.getenv("BASE_URL", "")
+
+    if callback_url and not callback_url.endswith("/webhook/voice"):
+        errors.append("CALLBACK_URL must end with /webhook/voice")
+    if callback_url and not _is_public_url(callback_url):
+        errors.append("CALLBACK_URL must be publicly reachable (not localhost)")
+    if base_url and not _is_public_url(base_url):
+        errors.append("BASE_URL must be publicly reachable (not localhost)")
+
+    # Optional reachability probe
+    if CHECK_CALLBACK_REACHABLE and callback_url and _is_public_url(callback_url):
+        try:
+            import requests
+
+            resp = requests.head(callback_url, timeout=3, allow_redirects=True)
+            if resp.status_code >= 400:
+                errors.append(f"CALLBACK_URL HEAD check failed with {resp.status_code}")
+        except Exception as probe_err:
+            errors.append(f"CALLBACK_URL HEAD check error: {probe_err}")
+
+    ENV_VALIDATION_ERRORS = errors
+    ENV_VALIDATION_OK = len(errors) == 0
+
+    if ENV_VALIDATION_OK:
+        logger.info("Environment validation passed")
+    else:
+        logger.error(f"Environment validation failed: {errors}")
+
+    return ENV_VALIDATION_OK
+
+
+def ensure_environment_ready():
+    """Re-run validation if needed and raise to caller for user-facing 500 responses."""
+    if not ENV_VALIDATION_OK:
+        validate_environment()
+    if not ENV_VALIDATION_OK:
+        raise RuntimeError("; ".join(ENV_VALIDATION_ERRORS))
+
+
+def register_call_state(call_id: str, state: CredentialingState):
+    """Store call state by call_id and call_sid (if present) with a light lock."""
+    with call_state_lock:
+        call_states[call_id] = state
+        if state.get('call_sid'):
+            call_states_by_sid[state['call_sid']] = state
+
+
+def bind_call_sid(call_id: str, call_sid: str):
+    """Bind a call_sid to existing state for faster lookups."""
+    with call_state_lock:
+        if call_id in call_states:
+            call_states[call_id]['call_sid'] = call_sid
+            call_states_by_sid[call_sid] = call_states[call_id]
+
+
+def get_state_by_sid(call_sid: str) -> Optional[CredentialingState]:
+    """Fetch state by call_sid, falling back to linear scan."""
+    with call_state_lock:
+        if call_sid and call_sid in call_states_by_sid:
+            return call_states_by_sid[call_sid]
+        for state in call_states.values():
+            if state.get('call_sid') == call_sid:
+                return state
+    return None
+
+
+# Run env validation once at startup to surface issues early
+validate_environment()
+
+
+# =============================================================================
+# ElevenLabs TTS Functions
+# =============================================================================
+
+def generate_elevenlabs_audio_url(text: str) -> Optional[str]:
+    """
+    Generate audio with ElevenLabs and save to temp file.
+    Returns URL accessible by Twilio.
+    """
+    if not ENABLE_ELEVENLABS_TTS:
+        logger.info("ElevenLabs TTS disabled via ENABLE_ELEVENLABS_TTS=false")
+        return None
+
+    if not _is_public_url(BASE_URL):
+        logger.warning("BASE_URL is not public; skipping ElevenLabs playback and using <Say> fallback")
+        return None
+
+    try:
+        # Generate audio stream
+        audio_stream = elevenlabs_client.generate(
+            text=text,
+            voice=ELEVENLABS_VOICE_ID,
+            model="eleven_turbo_v2",
+            stream=True
+        )
+
+        # Save to temp file
+        temp_dir = os.path.join(os.getcwd(), 'temp_audio')
+        os.makedirs(temp_dir, exist_ok=True)
+
+        filename = f"tts_{uuid.uuid4().hex}.mp3"
+        filepath = os.path.join(temp_dir, filename)
+
+        with open(filepath, 'wb') as f:
+            for chunk in audio_stream:
+                f.write(chunk)
+
+        # Return URL (needs to be publicly accessible)
+        audio_url = f"{BASE_URL}/audio/{filename}"
+        logger.info(f"Generated ElevenLabs audio: {audio_url}")
+        return audio_url
+
+    except Exception as e:
+        logger.error(f"ElevenLabs TTS failed: {e}")
+        return None  # Fallback to Polly
+
+
+def speak_with_tts(response, text: str, gather=None):
+    """
+    Speak text using ElevenLabs, with Polly fallback.
+    Works with both VoiceResponse and Gather objects.
+    """
+    target = gather if gather else response
+
+    # Try ElevenLabs first
+    audio_url = generate_elevenlabs_audio_url(text)
+
+    if audio_url:
+        target.play(audio_url)
+        logger.info(f"Using ElevenLabs TTS for: {text[:50]}...")
+    else:
+        # Fallback to Polly
+        target.say(text, voice='Polly.Joanna')
+        logger.warning(f"Falling back to Polly TTS for: {text[:50]}...")
+
+
+def cleanup_old_audio():
+    """Remove audio files older than 5 minutes"""
+    while True:
+        time.sleep(300)  # Run every 5 minutes
+        temp_dir = os.path.join(os.getcwd(), 'temp_audio')
+        if os.path.exists(temp_dir):
+            for f in os.listdir(temp_dir):
+                filepath = os.path.join(temp_dir, f)
+                try:
+                    if time.time() - os.path.getmtime(filepath) > 300:
+                        os.remove(filepath)
+                        logger.debug(f"Cleaned up old audio file: {f}")
+                except Exception as e:
+                    logger.error(f"Failed to clean up audio file {f}: {e}")
+
+
+# Start cleanup thread
+threading.Thread(target=cleanup_old_audio, daemon=True).start()
+
+
+def persist_call_progress(state: CredentialingState, finalize: bool = False):
+    """
+    Persist extracted answers to Supabase so they can be viewed mid-call.
+    If finalize=True, also stamps completed_at.
+    """
+    request_id = state.get('db_request_id') or state.get('call_id')
+    if not request_id:
+        print("WARN: No request_id available to persist progress")
+        return
+    try:
+        from credentialing_agent import DatabaseManager
+        db = DatabaseManager()
+        if finalize:
+            db.save_final_results(request_id, state)
+        else:
+            db.update_call_progress(request_id, state)
+        db.close()
+        print(f"INFO: Persisted call progress for request {request_id}")
+    except Exception as e:
+        print(f"WARN: Could not persist call progress: {e}")
 
 # Helper function to format NPI for speech (digit by digit)
 def format_npi_for_speech(npi: str) -> str:
@@ -67,7 +309,7 @@ class SmartConversationAgent:
 
     def __init__(self):
         self.llm = ChatOpenAI(
-            model="gpt-4",
+            model="gpt-4o-mini",
             temperature=0.4,
             api_key=os.getenv("OPENAI_API_KEY")
         )
@@ -91,6 +333,9 @@ Provider Information (USE THIS FOR VERIFICATION):
 - NPI: When asked, say: "{npi_spoken}"
 - Tax ID: When asked, say: "{tax_id_spoken}"
 - Address: {address}
+
+Relevant prior answers from previous calls (use to speed things up; don't repeat masked info):
+{knowledge}
 
 === YOUR PRIMARY TASK ===
 You MUST ask these credentialing questions one at a time. Current progress: Question {current_question_index} of {total_questions}.
@@ -138,6 +383,41 @@ Example when providing NPI (NOT asking a question):
         try:
             chain = self.response_prompt | self.llm | JsonOutputParser()
 
+            # Fetch relevant knowledge snippets (cached per call after first turn)
+            knowledge_text = ""
+            cached_knowledge = state.get('_cached_knowledge')
+            if cached_knowledge is not None:
+                knowledge_text = cached_knowledge
+            else:
+                try:
+                    kb = get_knowledge_base()
+                    if kb:
+                        snippets = kb.search(
+                            insurance_name=state.get('insurance_name', ''),
+                            provider_name=state.get('provider_name', None),
+                            query=speech,
+                            limit=5
+                        )
+                        if snippets:
+                            formatted = []
+                            for s in snippets:
+                                formatted.append(f"- {s.get('summary','')}")
+                            knowledge_text = "\n".join(formatted)
+                        # Cache for subsequent turns
+                        state['_cached_knowledge'] = knowledge_text
+                except EmbeddingError as e:
+                    logger.error(f"Embedding failed for knowledge query: {e}")
+                    knowledge_text = ""
+                except SearchError as e:
+                    logger.error(f"Knowledge search failed: {e}")
+                    knowledge_text = ""
+                except KnowledgeBaseError as e:
+                    logger.error(f"Knowledge base error: {e}")
+                    knowledge_text = ""
+                except Exception as kb_err:
+                    logger.warning(f"Unexpected knowledge lookup error: {kb_err}")
+                    knowledge_text = ""
+
             # Get conversation context
             context = ""
             if state.get('transcript'):
@@ -167,6 +447,7 @@ Example when providing NPI (NOT asking a question):
                 "current_question_index": current_question_index,
                 "stage": stage,
                 "context": context,
+                "knowledge": knowledge_text or "None available",
                 "speech": speech
             })
 
@@ -185,6 +466,41 @@ Example when providing NPI (NOT asking a question):
 
 # Initialize the smart agent
 smart_agent = SmartConversationAgent()
+
+# Singleton KnowledgeBase to avoid recreating DB connection + OpenAI client on every request
+_kb_instance = None
+
+def get_knowledge_base():
+    """Return a shared KnowledgeBase instance, recreating if connection is lost."""
+    global _kb_instance
+    if _kb_instance is None:
+        try:
+            _kb_instance = KnowledgeBase()
+        except Exception as e:
+            logger.warning(f"Could not initialize KnowledgeBase singleton: {e}")
+            return None
+    else:
+        # Check if connection is still alive
+        try:
+            _kb_instance.conn.cursor().execute("SELECT 1")
+        except Exception:
+            try:
+                _kb_instance = KnowledgeBase()
+            except Exception as e:
+                logger.warning(f"Could not reinitialize KnowledgeBase: {e}")
+                return None
+    return _kb_instance
+
+
+# =============================================================================
+# Audio Serving Endpoint (for ElevenLabs TTS)
+# =============================================================================
+
+@app.route('/audio/<filename>')
+def serve_audio(filename):
+    """Serve generated audio files for Twilio to play"""
+    temp_dir = os.path.join(os.getcwd(), 'temp_audio')
+    return send_from_directory(temp_dir, filename, mimetype='audio/mpeg')
 
 
 @app.route('/api/start-call', methods=['POST'])
@@ -224,21 +540,13 @@ def start_credentialing_call():
                     'error': f'Missing required field: {field}'
                 }), 400
 
-        # Check if required environment variables are set
-        missing_env = []
-        if not os.getenv("SUPABASE_HOST"):
-            missing_env.append("SUPABASE_HOST")
-        if not os.getenv("SUPABASE_PASSWORD"):
-            missing_env.append("SUPABASE_PASSWORD")
-        if not os.getenv("TWILIO_ACCOUNT_SID"):
-            missing_env.append("TWILIO_ACCOUNT_SID")
-        if not os.getenv("TWILIO_AUTH_TOKEN"):
-            missing_env.append("TWILIO_AUTH_TOKEN")
-
-        if missing_env:
+        try:
+            ensure_environment_ready()
+        except Exception as env_err:
+            logger.error(f"Environment validation failed: {env_err}")
             return jsonify({
                 'success': False,
-                'error': f'Missing required environment variables: {", ".join(missing_env)}. Please configure your .env file.'
+                'error': f'Environment validation failed: {env_err}'
             }), 500
 
         # Generate call_id upfront so we can track immediately
@@ -256,6 +564,7 @@ def start_credentialing_call():
             'questions_asked_count': 0,  # Track how many questions have been asked
             'call_id': call_id,
             'call_sid': None,
+            'db_request_id': None,
             'call_state': CallState.INITIATING,
             'transcript': [],
             'conversation_history': [],
@@ -274,8 +583,20 @@ def start_credentialing_call():
             'error_message': None
         }
 
+        # Create DB record up front so answers can be stored during the call
+        try:
+            from credentialing_agent import DatabaseManager
+            db = DatabaseManager()
+            request_id = db.save_credentialing_request(initial_state)
+            db.close()
+            initial_state['db_request_id'] = request_id
+            print(f"INFO: Saved credentialing request to DB with id {request_id}")
+        except Exception as db_error:
+            print(f"WARN: Could not save initial request to DB: {db_error}")
+            request_id = None
+
         # Store state immediately so frontend can track it
-        call_states[call_id] = initial_state
+        register_call_state(call_id, initial_state)
         print(f"✅ Call ID generated: {call_id}")
         print(f"📊 Call state stored, status: {CallState.INITIATING.value}")
 
@@ -293,7 +614,7 @@ def start_credentialing_call():
                 loop.close()
 
                 # Update stored state with final state
-                call_states[call_id] = final_state
+                register_call_state(call_id, final_state)
                 print(f"✅ Call completed: {call_id}")
                 print(f"📊 Final status: {final_state.get('call_state')}")
             except Exception as thread_error:
@@ -312,6 +633,7 @@ def start_credentialing_call():
             'success': True,
             'message': 'Call initiated',
             'call_id': call_id,
+            'request_id': initial_state.get('db_request_id'),
             'provider': data['provider_name'],
             'insurance': data['insurance_name']
         }), 200
@@ -339,25 +661,40 @@ def voice_webhook():
 
         # Get call SID and find associated call state
         call_sid = request.values.get('CallSid')
-        print(f"📞 Voice webhook called - CallSID: {call_sid}")
+        logger.info(f"[voice_webhook] CallSID={call_sid}")
 
         # Get the base URL from environment or request
-        callback_base = os.getenv('CALLBACK_URL', '').replace('/webhook/voice', '')
-        if not callback_base:
-            callback_base = f"https://{request.host}"
-        print(f"📍 Callback base URL: {callback_base}")
+        callback_base = get_callback_base(request)
+        logger.info(f"[voice_webhook] callback_base={callback_base}")
 
-        # Find the call state by call_id that matches this call
+        # Find the call state by call_sid
+        state = get_state_by_sid(call_sid)
         call_info = None
-        for call_id, state in list(call_states.items()):
-            if state.get('call_sid') == call_sid or state.get('call_sid') is None:
-                # Update call_sid if not set
-                if state.get('call_sid') is None:
-                    state['call_sid'] = call_sid
-                    state['call_state'] = CallState.IVR_NAVIGATION
-                    print(f"✅ Linked CallSID {call_sid} to call_id {call_id}")
-                call_info = {'call_id': call_id, 'state': state}
-                break
+        if state:
+            call_info = {'call_id': state.get('call_id') or state.get('db_request_id') or call_sid, 'state': state}
+        else:
+            for call_id, st in list(call_states.items()):
+                if st.get('call_sid') == call_sid or st.get('call_sid') is None:
+                    if st.get('call_sid') is None and call_sid:
+                        bind_call_sid(call_id, call_sid)
+                        st['call_state'] = CallState.IVR_NAVIGATION
+                        logger.info(f"[voice_webhook] Linked CallSID {call_sid} to call_id {call_id}")
+                    call_info = {'call_id': call_id, 'state': st}
+                    break
+
+        if not call_info:
+            logger.warning(f"[voice_webhook] No call state found for CallSID={call_sid}; using minimal disclosure flow")
+            fallback_state = {
+                'insurance_name': None,
+                'provider_name': 'a healthcare provider',
+                'call_state': CallState.SPEAKING_WITH_HUMAN,
+                'ivr_knowledge': [],
+                'current_menu_level': 0,
+                'transcript': [],
+                'questions': [],
+                'questions_asked_count': 0
+            }
+            call_info = {'call_id': call_sid or 'unknown', 'state': fallback_state}
 
         # Check if insurance has IVR patterns configured
         ivr_patterns = []
@@ -418,11 +755,11 @@ def voice_webhook():
                 speech_timeout='auto',
                 language='en-US'
             )
-            gather.say(disclosure, voice='Polly.Joanna')
+            speak_with_tts(response, disclosure, gather=gather)
             response.append(gather)
 
             # If no input, say goodbye
-            response.say("I didn't hear a response. I'll try again later. Goodbye.", voice='Polly.Joanna')
+            speak_with_tts(response, "I didn't hear a response. I'll try again later. Goodbye.")
 
         print(f"📤 Returning TwiML: {str(response)[:200]}...")
         return Response(str(response), mimetype='text/xml')
@@ -433,7 +770,7 @@ def voice_webhook():
         traceback.print_exc()
         # Return a simple error response
         response = VoiceResponse()
-        response.say("Sorry, there was a technical error. Please try again later.", voice='Polly.Joanna')
+        speak_with_tts(response, "Sorry, there was a technical error. Please try again later.")
         return Response(str(response), mimetype='text/xml')
 
 
@@ -450,9 +787,8 @@ def voice_human_webhook():
         call_sid = request.values.get('CallSid')
 
         # Get the base URL
-        callback_base = os.getenv('CALLBACK_URL', '').replace('/webhook/voice', '')
-        if not callback_base:
-            callback_base = f"https://{request.host}"
+        callback_base = get_callback_base(request)
+        logger.info(f"[voice_human_webhook] CallSID={call_sid} callback_base={callback_base}")
 
         # Find the call state
         call_info = None
@@ -476,17 +812,17 @@ def voice_human_webhook():
             speech_timeout='auto',
             language='en-US'
         )
-        gather.say(disclosure, voice='Polly.Joanna')
+        speak_with_tts(response, disclosure, gather=gather)
         response.append(gather)
 
-        response.say("I didn't hear a response. I'll try again later. Goodbye.", voice='Polly.Joanna')
+        speak_with_tts(response, "I didn't hear a response. I'll try again later. Goodbye.")
 
         return Response(str(response), mimetype='text/xml')
 
     except Exception as e:
         print(f"❌ Error in voice_human_webhook: {e}")
         response = VoiceResponse()
-        response.say("Sorry, there was a technical error. Goodbye.", voice='Polly.Joanna')
+        speak_with_tts(response, "Sorry, there was a technical error. Goodbye.")
         return Response(str(response), mimetype='text/xml')
 
 
@@ -550,7 +886,7 @@ def ivr_navigate_webhook():
                     print(f"📲 Sending DTMF: {action_value}")
                 elif action == 'speech' and action_value:
                     # Say a phrase
-                    response.say(action_value, voice='Polly.Joanna')
+                    speak_with_tts(response, action_value)
                     print(f"🗣️ Saying: {action_value}")
 
                 # Update the current menu level
@@ -612,7 +948,7 @@ def ivr_navigate_webhook():
         import traceback
         traceback.print_exc()
         response = VoiceResponse()
-        response.say("Sorry, there was a technical error. Goodbye.", voice='Polly.Joanna')
+        speak_with_tts(response, "Sorry, there was a technical error. Goodbye.")
         return Response(str(response), mimetype='text/xml')
 
 
@@ -689,16 +1025,44 @@ def speech_webhook():
 
             # Store any extracted info
             if ai_response.get('extracted_info'):
-                state['notes'] += f" {json.dumps(ai_response['extracted_info'])}"
+                extracted = ai_response['extracted_info']
+                if 'status' in extracted:
+                    state['credentialing_status'] = extracted['status']
+                if 'reference_number' in extracted:
+                    state['reference_number'] = extracted['reference_number']
+                if 'turnaround_days' in extracted:
+                    state['turnaround_days'] = extracted['turnaround_days']
+                if 'missing_documents' in extracted:
+                    state['missing_documents'] = extracted['missing_documents']
+                state['notes'] += f" {json.dumps(extracted)}"
 
             # Determine next action based on AI decision
             action = ai_response.get('action', 'continue')
+            finalize = action == 'end_call'
+
+            # Persist conversation + progress in a single DB connection
+            try:
+                from credentialing_agent import DatabaseManager
+                db = DatabaseManager()
+                db.save_conversation(call_info['call_id'], 'representative', speech_result)
+                db.save_conversation(call_info['call_id'], 'agent', ai_response.get('response', ''))
+                request_id = state.get('db_request_id') or state.get('call_id')
+                if request_id:
+                    if finalize:
+                        db.save_final_results(request_id, state)
+                    elif ai_response.get('extracted_info'):
+                        db.update_call_progress(request_id, state)
+                db.close()
+            except Exception as db_err:
+                print(f"WARN: Could not persist conversation/progress: {db_err}")
 
             if action == 'end_call':
-                response.say(ai_response.get('response', 'Thank you for your time. Goodbye.'), voice='Polly.Joanna')
+                speak_with_tts(response, ai_response.get('response', 'Thank you for your time. Goodbye.'))
+                # Give the other party a short window (8s) in case they need to interject before we disconnect
+                response.pause(length=8)
                 response.hangup()
             elif action == 'request_transfer':
-                response.say(ai_response.get('response', 'Could you please transfer me to the credentialing department?'), voice='Polly.Joanna')
+                speak_with_tts(response, ai_response.get('response', 'Could you please transfer me to the credentialing department?'))
                 response.pause(length=30)  # Wait for transfer
                 # After pause, gather again
                 gather = Gather(
@@ -708,7 +1072,7 @@ def speech_webhook():
                     speech_timeout='auto',
                     language='en-US'
                 )
-                gather.say("Hello? Is anyone there?", voice='Polly.Joanna')
+                speak_with_tts(response, "Hello? Is anyone there?", gather=gather)
                 response.append(gather)
                 # Fallback if no response after transfer
                 response.redirect(f'{callback_base}/webhook/speech')
@@ -719,27 +1083,14 @@ def speech_webhook():
                     action=f'{callback_base}/webhook/speech/followup',
                     method='POST',
                     speech_timeout='auto',
-                    timeout=10,  # Wait up to 10 seconds for response
+                    timeout=5,  # Wait 5 seconds for response (dead air detection)
                     language='en-US'
                 )
-                gather.say(ai_response.get('response', 'Could you please repeat that?'), voice='Polly.Joanna')
+                speak_with_tts(response, ai_response.get('response', 'Could you please repeat that?'), gather=gather)
                 response.append(gather)
 
-                # Fallback: Ask if they're still there, then end if no response
-                response.say("Are you still there?", voice='Polly.Joanna')
-                final_gather = Gather(
-                    input='speech',
-                    action=f'{callback_base}/webhook/speech/followup',
-                    method='POST',
-                    speech_timeout='3',
-                    timeout=8,  # Wait 8 more seconds
-                    language='en-US'
-                )
-                response.append(final_gather)
-
-                # If still no response after 8 seconds, end the call
-                response.say("I haven't heard a response. Thank you for your time. Goodbye.", voice='Polly.Joanna')
-                response.hangup()
+                # Dead air detected after 5 seconds - redirect to dead air handler
+                response.redirect(f'{callback_base}/webhook/speech/dead-air')
         else:
             # No call state found, use fallback
             gather = Gather(
@@ -749,7 +1100,7 @@ def speech_webhook():
                 speech_timeout='auto',
                 language='en-US'
             )
-            gather.say("I apologize, could you please repeat that?", voice='Polly.Joanna')
+            speak_with_tts(response, "I apologize, could you please repeat that?", gather=gather)
             response.append(gather)
 
             # Fallback redirect
@@ -762,7 +1113,7 @@ def speech_webhook():
         import traceback
         traceback.print_exc()
         response = VoiceResponse()
-        response.say("Sorry, there was a technical error. Goodbye.", voice='Polly.Joanna')
+        speak_with_tts(response, "Sorry, there was a technical error. Goodbye.")
         return Response(str(response), mimetype='text/xml')
 
 
@@ -850,16 +1201,39 @@ def speech_followup_webhook():
                     state['reference_number'] = extracted['reference_number']
                 if 'turnaround_days' in extracted:
                     state['turnaround_days'] = extracted['turnaround_days']
+                if 'missing_documents' in extracted:
+                    state['missing_documents'] = extracted['missing_documents']
 
             # Determine next action - only end when AI explicitly decides to
             action = ai_response.get('action', 'continue')
+            finalize = action == 'end_call'
+
+            if finalize:
+                state['call_state'] = CallState.COMPLETING
+
+            # Persist conversation + progress in a single DB connection
+            try:
+                from credentialing_agent import DatabaseManager
+                db = DatabaseManager()
+                db.save_conversation(call_info['call_id'], 'representative', speech_result)
+                db.save_conversation(call_info['call_id'], 'agent', ai_response.get('response', ''))
+                request_id = state.get('db_request_id') or state.get('call_id')
+                if request_id:
+                    if finalize:
+                        db.save_final_results(request_id, state)
+                    elif ai_response.get('extracted_info'):
+                        db.update_call_progress(request_id, state)
+                db.close()
+            except Exception as db_err:
+                print(f"WARN: Could not persist conversation/progress: {db_err}")
 
             if action == 'end_call':
-                state['call_state'] = CallState.COMPLETING
-                response.say(ai_response.get('response', 'Thank you very much for your help. Have a great day. Goodbye.'), voice='Polly.Joanna')
+                speak_with_tts(response, ai_response.get('response', 'Thank you very much for your help. Have a great day. Goodbye.'))
+                # Wait 8 seconds after the AI stops talking before ending the call
+                response.pause(length=8)
                 response.hangup()
             elif action == 'request_transfer':
-                response.say(ai_response.get('response', 'Could you please transfer me?'), voice='Polly.Joanna')
+                speak_with_tts(response, ai_response.get('response', 'Could you please transfer me?'))
                 response.pause(length=30)
                 gather = Gather(
                     input='speech',
@@ -868,7 +1242,7 @@ def speech_followup_webhook():
                     speech_timeout='auto',
                     language='en-US'
                 )
-                gather.say("Hello? Is anyone there?", voice='Polly.Joanna')
+                speak_with_tts(response, "Hello? Is anyone there?", gather=gather)
                 response.append(gather)
                 # Fallback if no response after transfer
                 response.redirect(f'{callback_base}/webhook/speech/followup')
@@ -879,14 +1253,14 @@ def speech_followup_webhook():
                     action=f'{callback_base}/webhook/speech/followup',
                     method='POST',
                     speech_timeout='auto',
+                    timeout=5,  # Wait 5 seconds for response (dead air detection)
                     language='en-US'
                 )
-                gather.say(ai_response.get('response', 'Thank you. Do you have any other information?'), voice='Polly.Joanna')
+                speak_with_tts(response, ai_response.get('response', 'Thank you. Do you have any other information?'), gather=gather)
                 response.append(gather)
 
-                # IMPORTANT: Fallback if Gather times out - keep the conversation going
-                response.say("Are you still there?", voice='Polly.Joanna')
-                response.redirect(f'{callback_base}/webhook/speech/followup')
+                # Dead air detected after 5 seconds - redirect to dead air handler
+                response.redirect(f'{callback_base}/webhook/speech/dead-air')
         else:
             # No call state - try to recover
             gather = Gather(
@@ -894,11 +1268,12 @@ def speech_followup_webhook():
                 action=f'{callback_base}/webhook/speech/followup',
                 method='POST',
                 speech_timeout='auto',
+                timeout=5,  # 5 second dead air detection
                 language='en-US'
             )
-            gather.say("I apologize, could you please repeat that?", voice='Polly.Joanna')
+            speak_with_tts(response, "I apologize, could you please repeat that?", gather=gather)
             response.append(gather)
-            response.redirect(f'{callback_base}/webhook/speech/followup')
+            response.redirect(f'{callback_base}/webhook/speech/dead-air')
 
         return Response(str(response), mimetype='text/xml')
 
@@ -907,7 +1282,52 @@ def speech_followup_webhook():
         import traceback
         traceback.print_exc()
         response = VoiceResponse()
-        response.say("Sorry, there was a technical error. Goodbye.", voice='Polly.Joanna')
+        speak_with_tts(response, "Sorry, there was a technical error. Goodbye.")
+        return Response(str(response), mimetype='text/xml')
+
+
+@app.route('/webhook/speech/dead-air', methods=['POST'])
+def speech_dead_air_webhook():
+    """
+    Handle dead air detection - triggered after 5 seconds of silence.
+    Asks if there's anything else, then waits 10 more seconds before ending.
+    """
+    try:
+        from twilio.twiml.voice_response import Gather
+
+        response = VoiceResponse()
+        callback_base = os.getenv('CALLBACK_URL', '').replace('/webhook/voice', '')
+        if not callback_base:
+            callback_base = f"https://{request.host}"
+        call_sid = request.values.get('CallSid')
+
+        print(f"🔇 Dead air detected for call {call_sid} - asking if anything else needed")
+
+        # Ask if there's anything else (this is triggered after 5 sec dead air)
+        gather = Gather(
+            input='speech',
+            action=f'{callback_base}/webhook/speech/followup',
+            method='POST',
+            speech_timeout='auto',
+            timeout=10,  # Wait 10 seconds for response before ending call
+            language='en-US'
+        )
+        speak_with_tts(response, "Is there anything else I can help you with?", gather=gather)
+        response.append(gather)
+
+        # If still no response after 10 seconds, end the call
+        speak_with_tts(response, "Thank you for your time. Have a great day. Goodbye.")
+        response.hangup()
+
+        return Response(str(response), mimetype='text/xml')
+
+    except Exception as e:
+        print(f"❌ Error in speech_dead_air_webhook: {e}")
+        import traceback
+        traceback.print_exc()
+        response = VoiceResponse()
+        speak_with_tts(response, "Thank you for your time. Goodbye.")
+        response.hangup()
         return Response(str(response), mimetype='text/xml')
 
 
@@ -1026,6 +1446,106 @@ def get_call_transcript(call_id: str):
         'conversation': state.get('conversation_history', []),
         'transcript': state.get('transcript', [])
     }), 200
+
+
+@app.route('/api/call-detail/<call_id>', methods=['GET'])
+def get_call_detail(call_id: str):
+    """
+    Get full call details from the database (persists across server restarts).
+    Combines credentialing request data with conversation history and call events.
+    """
+    try:
+        from credentialing_agent import DatabaseManager
+        from psycopg2.extras import RealDictCursor
+
+        db = DatabaseManager()
+
+        # Fetch credentialing request
+        with db.conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, insurance_name, provider_name, npi, tax_id,
+                       address, insurance_phone, questions, status, reference_number,
+                       missing_documents, turnaround_days, notes,
+                       created_at, updated_at, completed_at
+                FROM credentialing_requests
+                WHERE id = %s
+            """, (call_id,))
+            row = cur.fetchone()
+
+        if not row:
+            db.close()
+            return jsonify({'success': False, 'error': 'Call not found'}), 404
+
+        call_data = {
+            'id': str(row[0]),
+            'insurance_name': row[1],
+            'provider_name': row[2],
+            'npi': row[3],
+            'tax_id': row[4],
+            'address': row[5],
+            'insurance_phone': row[6],
+            'questions': row[7] or [],
+            'status': row[8],
+            'reference_number': row[9],
+            'missing_documents': row[10] or [],
+            'turnaround_days': row[11],
+            'notes': row[12],
+            'created_at': row[13].isoformat() if row[13] else None,
+            'updated_at': row[14].isoformat() if row[14] else None,
+            'completed_at': row[15].isoformat() if row[15] else None,
+        }
+
+        # Fetch conversation history
+        with db.conn.cursor() as cur:
+            cur.execute("""
+                SELECT speaker, message, timestamp
+                FROM conversation_history
+                WHERE call_id = %s OR request_id = %s
+                ORDER BY timestamp ASC
+            """, (call_id, call_id))
+            conversations = []
+            for r in cur.fetchall():
+                conversations.append({
+                    'speaker': r[0],
+                    'message': r[1],
+                    'timestamp': r[2].isoformat() if r[2] else None,
+                })
+
+        # Fetch call events
+        with db.conn.cursor() as cur:
+            cur.execute("""
+                SELECT event_type, transcript, action_taken, confidence, timestamp, metadata
+                FROM call_events
+                WHERE call_id = %s
+                ORDER BY timestamp ASC
+            """, (call_id,))
+            events = []
+            for r in cur.fetchall():
+                events.append({
+                    'event_type': r[0],
+                    'transcript': r[1],
+                    'action_taken': r[2],
+                    'confidence': r[3],
+                    'timestamp': r[4].isoformat() if r[4] else None,
+                    'metadata': r[5] or {},
+                })
+
+        db.close()
+
+        return jsonify({
+            'success': True,
+            'data': {
+                **call_data,
+                'conversation': conversations,
+                'events': events,
+            }
+        }), 200
+
+    except Exception as e:
+        print(f"Error fetching call detail: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/metrics', methods=['GET'])
@@ -1246,6 +1766,31 @@ def get_dashboard_stats():
                 'pending_followups': 0
             }
         }), 200
+
+
+@app.route('/api/knowledge/search', methods=['GET'])
+def knowledge_search():
+    """Search prior call knowledge stored in pgvector."""
+    insurance = request.args.get('insurance')
+    if not insurance:
+        return jsonify({'success': False, 'error': 'insurance parameter is required'}), 400
+
+    provider = request.args.get('provider')
+    query = request.args.get('q')
+    limit = request.args.get('limit', 5, type=int)
+
+    try:
+        kb = KnowledgeBase()
+        results = kb.search(
+            insurance_name=insurance,
+            provider_name=provider,
+            query=query,
+            limit=limit
+        )
+        kb.close()
+        return jsonify({'success': True, 'data': results}), 200
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/scheduled-followups', methods=['GET'])
@@ -1733,6 +2278,269 @@ def update_ivr_knowledge(ivr_id: str):
             'success': False,
             'error': str(e)
         }), 500
+
+
+# ============================================================================
+# Call Metrics API Endpoints
+# ============================================================================
+
+@app.route('/api/call-metrics/<call_id>', methods=['GET'])
+def get_call_metrics_endpoint(call_id: str):
+    """Get call metrics for a specific call."""
+    try:
+        from credentialing_agent import DatabaseManager
+        db = DatabaseManager()
+        metrics = db.get_call_metrics(call_id)
+        db.close()
+
+        if not metrics:
+            return jsonify({'success': False, 'error': 'Metrics not found'}), 404
+
+        # Convert UUID and datetime for JSON serialization
+        metrics['id'] = str(metrics['id'])
+        if metrics.get('request_id'):
+            metrics['request_id'] = str(metrics['request_id'])
+        if metrics.get('created_at'):
+            metrics['created_at'] = metrics['created_at'].isoformat()
+
+        return jsonify({'success': True, 'data': metrics}), 200
+    except Exception as e:
+        logger.error(f"Error getting call metrics: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/call-metrics', methods=['GET'])
+def get_all_call_metrics():
+    """Get call metrics with optional filtering."""
+    try:
+        from credentialing_agent import DatabaseManager
+
+        limit = request.args.get('limit', 50, type=int)
+        successful_param = request.args.get('successful')
+        successful_only = None
+        if successful_param is not None:
+            successful_only = successful_param.lower() == 'true'
+
+        db = DatabaseManager()
+        metrics_list = db.get_all_call_metrics(limit=limit, successful_only=successful_only)
+        db.close()
+
+        # Serialize for JSON
+        for m in metrics_list:
+            m['id'] = str(m['id'])
+            if m.get('request_id'):
+                m['request_id'] = str(m['request_id'])
+            if m.get('created_at'):
+                m['created_at'] = m['created_at'].isoformat()
+
+        return jsonify({'success': True, 'data': metrics_list}), 200
+    except Exception as e:
+        logger.error(f"Error getting all call metrics: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ============================================================================
+# System Config API Endpoints
+# ============================================================================
+
+@app.route('/api/config', methods=['GET'])
+def get_all_config():
+    """Get all system configuration values."""
+    try:
+        from credentialing_agent import DatabaseManager
+        db = DatabaseManager()
+        configs = db.get_all_configs()
+        db.close()
+
+        # Serialize for JSON
+        for config in configs:
+            config['id'] = str(config['id'])
+            if config.get('last_updated'):
+                config['last_updated'] = config['last_updated'].isoformat()
+
+        return jsonify({'success': True, 'data': configs}), 200
+    except Exception as e:
+        logger.error(f"Error getting all configs: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/config/<config_key>', methods=['GET'])
+def get_config_value(config_key: str):
+    """Get a specific configuration value."""
+    try:
+        from credentialing_agent import DatabaseManager
+        db = DatabaseManager()
+        value = db.get_config(config_key)
+        db.close()
+
+        if value is None:
+            return jsonify({'success': False, 'error': 'Config not found'}), 404
+
+        return jsonify({'success': True, 'key': config_key, 'value': value}), 200
+    except Exception as e:
+        logger.error(f"Error getting config {config_key}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/config/<config_key>', methods=['PUT'])
+def update_config_value(config_key: str):
+    """Update a configuration value."""
+    try:
+        from credentialing_agent import DatabaseManager
+
+        data = request.json
+        if 'value' not in data:
+            return jsonify({'success': False, 'error': 'value is required'}), 400
+
+        db = DatabaseManager()
+        success = db.set_config(
+            config_key,
+            data['value'],
+            data.get('description')
+        )
+        db.close()
+
+        return jsonify({'success': success, 'message': 'Config updated'}), 200
+    except Exception as e:
+        logger.error(f"Error updating config {config_key}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/config/<config_key>', methods=['DELETE'])
+def delete_config_value(config_key: str):
+    """Delete a configuration value."""
+    try:
+        from credentialing_agent import DatabaseManager
+
+        db = DatabaseManager()
+        success = db.delete_config(config_key)
+        db.close()
+
+        if not success:
+            return jsonify({'success': False, 'error': 'Config not found'}), 404
+
+        return jsonify({'success': True, 'message': 'Config deleted'}), 200
+    except Exception as e:
+        logger.error(f"Error deleting config {config_key}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ============================================================================
+# Audit Log API Endpoints
+# ============================================================================
+
+@app.route('/api/audit-logs', methods=['GET'])
+def get_audit_logs_endpoint():
+    """
+    Get audit logs with filtering and pagination.
+
+    Query params:
+    - user_id: Filter by user
+    - action: Filter by action (INSERT, UPDATE, DELETE, etc.)
+    - resource_type: Filter by resource type
+    - resource_id: Filter by resource ID
+    - start_date: Filter from date (ISO format)
+    - end_date: Filter to date (ISO format)
+    - limit: Max results (default 100)
+    - offset: Pagination offset (default 0)
+    """
+    try:
+        from credentialing_agent import DatabaseManager
+
+        # Parse query params
+        user_id = request.args.get('user_id')
+        action = request.args.get('action')
+        resource_type = request.args.get('resource_type')
+        resource_id = request.args.get('resource_id')
+        limit = request.args.get('limit', 100, type=int)
+        offset = request.args.get('offset', 0, type=int)
+
+        start_date = None
+        end_date = None
+        if request.args.get('start_date'):
+            start_date = datetime.fromisoformat(request.args.get('start_date'))
+        if request.args.get('end_date'):
+            end_date = datetime.fromisoformat(request.args.get('end_date'))
+
+        db = DatabaseManager()
+        logs, total_count = db.get_audit_logs(
+            user_id=user_id,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+            offset=offset,
+        )
+        db.close()
+
+        # Serialize for JSON
+        for log in logs:
+            log['id'] = str(log['id'])
+            if log.get('timestamp'):
+                log['timestamp'] = log['timestamp'].isoformat()
+            if log.get('ip_address'):
+                log['ip_address'] = str(log['ip_address'])
+
+        return jsonify({
+            'success': True,
+            'data': logs,
+            'pagination': {
+                'total': total_count,
+                'limit': limit,
+                'offset': offset,
+                'has_more': offset + limit < total_count
+            }
+        }), 200
+    except Exception as e:
+        logger.error(f"Error getting audit logs: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/audit-logs', methods=['POST'])
+def create_audit_log():
+    """
+    Manually create an audit log entry.
+
+    Request body:
+    {
+        "action": "MANUAL_OVERRIDE",
+        "resource_type": "call",
+        "resource_id": "uuid-here",
+        "details": {"reason": "..."},
+        "user_id": "optional-user-id"
+    }
+    """
+    try:
+        from credentialing_agent import DatabaseManager
+
+        data = request.json
+        if not data.get('action'):
+            return jsonify({'success': False, 'error': 'action is required'}), 400
+
+        # Get IP address from request
+        ip_address = request.remote_addr
+
+        db = DatabaseManager()
+        log_id = db.log_audit(
+            action=data['action'],
+            resource_type=data.get('resource_type'),
+            resource_id=data.get('resource_id'),
+            details=data.get('details'),
+            user_id=data.get('user_id'),
+            ip_address=ip_address,
+        )
+        db.close()
+
+        return jsonify({
+            'success': True,
+            'id': log_id,
+            'message': 'Audit log created'
+        }), 201
+    except Exception as e:
+        logger.error(f"Error creating audit log: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 # ============================================================================

@@ -3,6 +3,8 @@
 
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+-- Enable pgvector for embeddings
+CREATE EXTENSION IF NOT EXISTS "vector";
 
 -- Credentialing Requests Table
 CREATE TABLE credentialing_requests (
@@ -12,6 +14,7 @@ CREATE TABLE credentialing_requests (
     npi VARCHAR(10) NOT NULL,
     tax_id VARCHAR(20) NOT NULL,
     address TEXT NOT NULL,
+    insurance_phone VARCHAR(20),
     questions JSONB NOT NULL,
     status VARCHAR(50) DEFAULT 'initiated',
     reference_number VARCHAR(100),
@@ -19,6 +22,7 @@ CREATE TABLE credentialing_requests (
     turnaround_days INTEGER,
     notes TEXT,
     created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
     completed_at TIMESTAMP,
     INDEX idx_status (status),
     INDEX idx_insurance_name (insurance_name),
@@ -198,6 +202,34 @@ GRANT ALL ON conversation_history TO authenticated;
 GRANT ALL ON scheduled_followups TO authenticated;
 GRANT ALL ON call_metrics TO authenticated;
 GRANT ALL ON insurance_providers TO authenticated;
+
+-- Knowledge base table for prior call summaries (pgvector)
+CREATE TABLE call_knowledge (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    insurance_name VARCHAR(255) NOT NULL,
+    provider_name VARCHAR(255),
+    call_id VARCHAR(100),
+    request_id UUID REFERENCES credentialing_requests(id),
+    summary TEXT NOT NULL,
+    qa_text TEXT,
+    embedding vector(1536) NOT NULL,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    chunk_index INTEGER DEFAULT 0,
+    parent_id UUID REFERENCES call_knowledge(id),
+    total_chunks INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Migration: Add chunking columns if table already exists
+-- ALTER TABLE call_knowledge ADD COLUMN IF NOT EXISTS chunk_index INTEGER DEFAULT 0;
+-- ALTER TABLE call_knowledge ADD COLUMN IF NOT EXISTS parent_id UUID REFERENCES call_knowledge(id);
+-- ALTER TABLE call_knowledge ADD COLUMN IF NOT EXISTS total_chunks INTEGER DEFAULT 1;
+
+-- Indexes for fast search
+CREATE INDEX IF NOT EXISTS call_knowledge_insurance_idx ON call_knowledge (insurance_name);
+CREATE INDEX IF NOT EXISTS call_knowledge_provider_idx ON call_knowledge (provider_name);
+-- ivfflat index requires list size configured; adjust lists per data volume
+CREATE INDEX IF NOT EXISTS call_knowledge_embedding_idx ON call_knowledge USING ivfflat (embedding vector_l2_ops) WITH (lists = 100);
 GRANT ALL ON audit_log TO authenticated;
 GRANT SELECT ON credentialing_success_rate TO authenticated;
 GRANT SELECT ON daily_performance_metrics TO authenticated;

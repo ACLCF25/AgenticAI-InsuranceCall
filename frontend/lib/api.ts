@@ -6,6 +6,7 @@ import type {
   CredentialingRequest,
   CallStatus,
   CallTranscript,
+  CallDetail,
   SystemMetrics,
   IVRKnowledge,
   InsuranceProvider,
@@ -57,6 +58,12 @@ class APIClient {
   // Get call transcript
   async getCallTranscript(callId: string): Promise<CallTranscript> {
     const { data } = await this.client.get(`/call-transcript/${callId}`);
+    return data;
+  }
+
+  // Get full call detail from database
+  async getCallDetail(callId: string): Promise<APIResponse<CallDetail>> {
+    const { data } = await this.client.get(`/call-detail/${callId}`);
     return data;
   }
 
