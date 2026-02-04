@@ -2,7 +2,8 @@
 'use client'
 
 import { useQuery } from '@tanstack/react-query'
-import { Phone, Loader2, ExternalLink } from 'lucide-react'
+import { useRouter } from 'next/navigation'
+import { Phone, Loader2, ExternalLink, Eye } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -22,6 +23,7 @@ interface RecentCallsTableProps {
 }
 
 export function RecentCallsTable({ showAll = false }: RecentCallsTableProps) {
+  const router = useRouter()
   const limit = showAll ? 100 : 10
 
   const { data: calls, isLoading } = useQuery({
@@ -68,11 +70,16 @@ export function RecentCallsTable({ showAll = false }: RecentCallsTableProps) {
                 <TableHead>Status</TableHead>
                 <TableHead>Reference #</TableHead>
                 <TableHead>Date</TableHead>
+                <TableHead></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {calls.data.map((call) => (
-                <TableRow key={call.id}>
+                <TableRow
+                  key={call.id}
+                  className="cursor-pointer hover:bg-muted/50"
+                  onClick={() => router.push(`/calls/${call.id}`)}
+                >
                   <TableCell className="font-medium">
                     {call.provider_name}
                   </TableCell>
@@ -93,6 +100,11 @@ export function RecentCallsTable({ showAll = false }: RecentCallsTableProps) {
                   </TableCell>
                   <TableCell className="text-muted-foreground text-sm">
                     {call.created_at ? formatDate(call.created_at) : '-'}
+                  </TableCell>
+                  <TableCell>
+                    <Button variant="ghost" size="sm">
+                      <Eye className="h-4 w-4" />
+                    </Button>
                   </TableCell>
                 </TableRow>
               ))}

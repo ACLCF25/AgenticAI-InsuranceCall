@@ -31,7 +31,10 @@ export function formatDuration(seconds: number): string {
   }
 }
 
-export function formatPhoneNumber(phone: string): string {
+export function formatPhoneNumber(phone?: string | null): string {
+  // Gracefully handle missing values
+  if (!phone) return '';
+
   // Format: +1 (234) 567-8900
   const cleaned = phone.replace(/\D/g, '');
   const match = cleaned.match(/^1?(\d{3})(\d{3})(\d{4})$/);

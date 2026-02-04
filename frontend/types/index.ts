@@ -137,6 +137,36 @@ export interface CallEvent {
   metadata?: Record<string, any>;
 }
 
+export interface CallDetailEvent {
+  event_type: string;
+  transcript?: string;
+  action_taken?: string;
+  confidence?: number;
+  timestamp?: string;
+  metadata?: Record<string, any>;
+}
+
+export interface CallDetail {
+  id: string;
+  insurance_name: string;
+  provider_name: string;
+  npi: string;
+  tax_id: string;
+  address: string;
+  insurance_phone: string;
+  questions: string[];
+  status?: CredentialingStatus;
+  reference_number?: string;
+  missing_documents?: string[];
+  turnaround_days?: number;
+  notes?: string;
+  created_at?: string;
+  updated_at?: string;
+  completed_at?: string;
+  conversation: ConversationMessage[];
+  events: CallDetailEvent[];
+}
+
 export interface LangSmithTrace {
   run_id: string;
   name: string;
