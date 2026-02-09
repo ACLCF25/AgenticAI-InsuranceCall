@@ -203,11 +203,11 @@ def generate_elevenlabs_audio_url(text: str) -> Optional[str]:
 
     try:
         # Generate audio stream
-        audio_stream = elevenlabs_client.generate(
+        audio_stream = elevenlabs_client.text_to_speech.convert(
+            voice_id=ELEVENLABS_VOICE_ID,
             text=text,
-            voice=ELEVENLABS_VOICE_ID,
-            model="eleven_turbo_v2",
-            stream=True
+            model_id="eleven_turbo_v2",
+            output_format="mp3_44100_128",
         )
 
         # Save to temp file
@@ -345,12 +345,20 @@ Questions list:
 
 === QUESTION ASKING LOGIC ===
 - If current_question_index is 0 and they confirmed they can help, ASK QUESTION #1
-- If you just got an answer to a question, ASK THE NEXT QUESTION
-- ONLY use action="end_call" when ALL questions have been asked AND answered (stage="wrapping_up")
+- If you just got an answer to a question, ASK THE NEXT QUESTION (if there are more)
 - If stage is "asking_question_X", you MUST include question X in your response
+- If stage is "wrapping_up", ALL questions have already been asked. DO NOT ask any more questions. Thank them briefly for their help and use action="end_call" to end the call. Set question_asked=false.
 
 Current stage: {stage}
-(If stage says "asking_question", you MUST ask the next question!)
+
+=== INFORMATION EXTRACTION ===
+When the representative answers a question, extract key details into extracted_info:
+- "status": credentialing status (e.g., "approved", "pending", "on hold", "denied", "in review")
+- "reference": any reference or case number mentioned
+- "turnaround": estimated turnaround time or days mentioned
+- "missing_documents": any missing documents or requirements mentioned
+- "notes": any other important details
+Only include fields that were actually mentioned. Do NOT leave fields empty or as "...".
 
 Previous conversation context:
 {context}
@@ -366,15 +374,18 @@ Respond ONLY with this JSON (no other text):
 
 === ACTION RULES ===
 - action="continue" - Use this for most responses (answering verification, asking questions, etc.)
-- action="end_call" - ONLY use when stage="wrapping_up" AND you've thanked them and said goodbye
+- action="end_call" - Use when stage="wrapping_up". Thank them briefly and say goodbye.
 - action="request_transfer" - Use when they say they need to transfer you
-- question_asked=true - Set to true ONLY when your response includes one of the credentialing questions from the list
+- question_asked=true - Set to true ONLY when your response includes one of the credentialing questions from the list AND there are still questions remaining
 
 Example when asking a question:
 {{"response": "Thank you for verifying. Now, can you tell me the current credentialing status for this provider?", "action": "continue", "extracted_info": {{}}, "question_asked": true}}
 
 Example when providing NPI (NOT asking a question):
-{{"response": "The NPI is {npi_spoken}", "action": "continue", "extracted_info": {{}}, "question_asked": false}}"""),
+{{"response": "The NPI is {npi_spoken}", "action": "continue", "extracted_info": {{}}, "question_asked": false}}
+
+Example when wrapping up (stage="wrapping_up"):
+{{"response": "Thank you so much for your help today. Have a great day. Goodbye.", "action": "end_call", "extracted_info": {{}}, "question_asked": false}}"""),
             ("user", "The person on the phone said: \"{speech}\"")
         ])
 
@@ -421,7 +432,7 @@ Example when providing NPI (NOT asking a question):
             # Get conversation context
             context = ""
             if state.get('transcript'):
-                recent = state['transcript'][-5:]  # Last 5 exchanges
+                recent = state['transcript'][-15:]  # Last 15 exchanges
                 context = "\n".join([f"{t.get('speaker', 'unknown')}: {t.get('text', '')}" for t in recent])
 
             # Format NPI and Tax ID for speech
@@ -570,6 +581,14 @@ def start_credentialing_call():
             'conversation_history': [],
             'ivr_knowledge': [],
             'current_menu_level': 0,
+            'accumulated_ivr_speech': '',
+            'ivr_no_match_count': 0,
+            'ivr_zero_press_count': 0,
+            'ivr_total_navigate_attempts': 0,
+            'pending_ivr_match': None,
+            'wait_for_agent_start_time': None,
+            'wait_for_agent_attempts': 0,
+            'agent_detected': False,
             'current_audio_type': AudioType.UNKNOWN,
             'confidence': 0.0,
             'last_action': None,
@@ -730,15 +749,16 @@ def voice_webhook():
                 input='speech dtmf',
                 action=f'{callback_base}/webhook/ivr-navigate',
                 method='POST',
-                speech_timeout='3',
-                timeout=10,
-                language='en-US'
+                speech_timeout='auto',
+                timeout=15,
+                language='en-US',
+                speech_model='phone_call'
             )
             # Don't say anything - just listen to IVR prompts
             response.append(gather)
 
-            # If no IVR detected, proceed with regular conversation
-            response.redirect(f'{callback_base}/webhook/voice/human')
+            # If no IVR detected, go to wait-for-agent to verify human presence
+            response.redirect(f'{callback_base}/webhook/wait-for-agent')
         else:
             # No IVR patterns - go straight to human conversation
             print(f"📞 Direct Human Mode - No IVR patterns configured")
@@ -861,85 +881,216 @@ def ivr_navigate_webhook():
             ivr_patterns = state.get('ivr_knowledge', [])
             current_level = state.get('current_menu_level', 0)
 
-            # Check if speech matches any IVR pattern
-            matched_pattern = None
+            # Track total IVR navigation attempts to prevent infinite loops
+            total_attempts = state.get('ivr_total_navigate_attempts', 0) + 1
+            state['ivr_total_navigate_attempts'] = total_attempts
+            print(f"🔢 IVR total navigate attempt: {total_attempts}")
+
+            MAX_IVR_TOTAL_ATTEMPTS = 20
+            if total_attempts > MAX_IVR_TOTAL_ATTEMPTS:
+                print(f"🛑 IVR navigation exceeded max attempts ({MAX_IVR_TOTAL_ATTEMPTS}). Transitioning to wait-for-agent.")
+                state['call_state'] = CallState.WAITING_FOR_AGENT
+                state['ivr_no_match_count'] = 0
+                state['accumulated_ivr_speech'] = ''
+                state['pending_ivr_match'] = None
+                response.redirect(f'{callback_base}/webhook/wait-for-agent')
+                return Response(str(response), mimetype='text/xml')
+
+            # Handle pending match: if no speech and we have a pending match,
+            # the Gather timed out (menu is done talking) - NOW execute the DTMF
+            pending_match = state.get('pending_ivr_match')
+            if pending_match and not speech_result and not digits:
+                print(f"⏱️ Menu finished (silence detected). Executing pending match: {pending_match.get('detected_phrase', '')} -> {pending_match.get('action_value', '')}")
+                action = pending_match.get('preferred_action', 'dtmf')
+                action_value = pending_match.get('action_value', '')
+
+                if action == 'dtmf' and action_value:
+                    response.play(digits=action_value)
+                    print(f"📲 Sending DTMF: {action_value}")
+                elif action == 'speech' and action_value:
+                    speak_with_tts(response, action_value)
+                    print(f"🗣️ Saying: {action_value}")
+
+                state['pending_ivr_match'] = None
+                state['current_menu_level'] = pending_match['menu_level']
+                state['accumulated_ivr_speech'] = ''
+                state['ivr_no_match_count'] = 0
+                state['ivr_zero_press_count'] = 0
+
+                # Check if we have more IVR levels to navigate
+                remaining_patterns = [p for p in ivr_patterns if p['menu_level'] > state['current_menu_level']]
+
+                if remaining_patterns:
+                    response.pause(length=4)
+                    gather = Gather(
+                        input='speech dtmf',
+                        action=f'{callback_base}/webhook/ivr-navigate',
+                        method='POST',
+                        speech_timeout='auto',
+                        timeout=15,
+                        language='en-US',
+                        speech_model='phone_call'
+                    )
+                    response.append(gather)
+                    response.redirect(f'{callback_base}/webhook/wait-for-agent')
+                else:
+                    print(f"✅ IVR navigation complete - entering wait-for-agent loop")
+                    response.pause(length=2)
+                    response.redirect(f'{callback_base}/webhook/wait-for-agent')
+
+                return Response(str(response), mimetype='text/xml')
+
+            # If we have a pending match but more speech came in, menu is still talking
+            # Clear pending match and re-evaluate with new accumulated speech
+            if pending_match and speech_result:
+                print(f"📢 Menu still talking (got more speech). Keeping pending match and continuing to listen.")
+
+            # Accumulate speech across gather cycles for full IVR prompt matching
+            accumulated = state.get('accumulated_ivr_speech', '')
+            accumulated = (accumulated + ' ' + speech_result).strip()
+            state['accumulated_ivr_speech'] = accumulated
+            accumulated_lower = accumulated.lower()
             speech_lower = speech_result.lower()
+
+            print(f"📝 Accumulated IVR speech: {accumulated}")
+
+            # Check current speech for IVR pattern match first (fast path),
+            # then fall back to accumulated speech (handles split captures)
+            matched_pattern = None
 
             for pattern in ivr_patterns:
                 if pattern['menu_level'] > current_level:
                     detected_phrase = pattern.get('detected_phrase', '').lower()
                     if detected_phrase and detected_phrase in speech_lower:
                         matched_pattern = pattern
-                        print(f"✅ Matched IVR pattern: '{detected_phrase}' at level {pattern['menu_level']}")
+                        print(f"✅ Matched IVR pattern (current speech): '{detected_phrase}' at level {pattern['menu_level']}")
                         break
 
+            if not matched_pattern:
+                for pattern in ivr_patterns:
+                    if pattern['menu_level'] > current_level:
+                        detected_phrase = pattern.get('detected_phrase', '').lower()
+                        if detected_phrase and detected_phrase in accumulated_lower:
+                            matched_pattern = pattern
+                            print(f"✅ Matched IVR pattern (accumulated): '{detected_phrase}' at level {pattern['menu_level']}")
+                            break
+
             if matched_pattern:
-                # Execute the matched action
-                action = matched_pattern.get('preferred_action', 'dtmf')
-                action_value = matched_pattern.get('action_value', '')
+                # Store match as pending - wait for menu to finish before pressing
+                print(f"🎯 Pattern matched: '{matched_pattern.get('detected_phrase', '')}' -> {matched_pattern.get('preferred_action', 'dtmf')} {matched_pattern.get('action_value', '')}")
+                print(f"⏳ Storing as pending match - waiting for menu to finish before pressing")
+                state['pending_ivr_match'] = matched_pattern
+                state['accumulated_ivr_speech'] = ''
+                state['ivr_no_match_count'] = 0
 
-                print(f"🎮 Executing IVR action: {action} = {action_value}")
-
-                if action == 'dtmf' and action_value:
-                    # Send DTMF tones
-                    response.play(digits=action_value)
-                    print(f"📲 Sending DTMF: {action_value}")
-                elif action == 'speech' and action_value:
-                    # Say a phrase
-                    speak_with_tts(response, action_value)
-                    print(f"🗣️ Saying: {action_value}")
-
-                # Update the current menu level
-                state['current_menu_level'] = matched_pattern['menu_level']
-
-                # Check if we have more IVR levels to navigate
-                remaining_patterns = [p for p in ivr_patterns if p['menu_level'] > state['current_menu_level']]
-
-                if remaining_patterns:
-                    # Continue IVR navigation
-                    response.pause(length=2)
-                    gather = Gather(
-                        input='speech dtmf',
-                        action=f'{callback_base}/webhook/ivr-navigate',
-                        method='POST',
-                        speech_timeout='3',
-                        timeout=10,
-                        language='en-US'
-                    )
-                    response.append(gather)
-                    response.redirect(f'{callback_base}/webhook/voice/human')
-                else:
-                    # All IVR levels done, wait for human
-                    print(f"✅ IVR navigation complete - waiting for human")
-                    response.pause(length=3)
-                    response.redirect(f'{callback_base}/webhook/voice/human')
+                # Keep listening - when Gather times out (menu done), redirect back here
+                # which will detect pending_match + no speech = execute DTMF
+                gather = Gather(
+                    input='speech dtmf',
+                    action=f'{callback_base}/webhook/ivr-navigate',
+                    method='POST',
+                    speech_timeout='auto',
+                    timeout=15,
+                    language='en-US',
+                    speech_model='phone_call'
+                )
+                response.append(gather)
+                # On Gather timeout (silence = menu done), redirect back to ivr-navigate
+                response.redirect(f'{callback_base}/webhook/ivr-navigate')
+            elif pending_match:
+                # We have a pending match and menu is still talking (speech came in)
+                # Keep the pending match and continue listening for silence
+                print(f"⏳ Pending match exists, menu still talking. Continuing to wait for silence.")
+                gather = Gather(
+                    input='speech dtmf',
+                    action=f'{callback_base}/webhook/ivr-navigate',
+                    method='POST',
+                    speech_timeout='auto',
+                    timeout=15,
+                    language='en-US',
+                    speech_model='phone_call'
+                )
+                response.append(gather)
+                response.redirect(f'{callback_base}/webhook/ivr-navigate')
             else:
                 # No match - might be human or different IVR prompt
-                # Check if it sounds like a human greeting
-                human_indicators = ['hello', 'hi', 'how can i help', 'speaking', 'this is', 'department', 'thank you for calling']
-                is_human = any(indicator in speech_lower for indicator in human_indicators)
+                # Use strict human detection (exclude IVR-like speech)
+                human_indicators = [
+                    'how can i help', 'how may i help', 'how can i assist',
+                    'what can i do for you', 'who am i speaking with',
+                    'go ahead', 'may i have your name', 'can i have your name',
+                    'what is your name', 'name please'
+                ]
+                ivr_like_indicators = ['press', 'option', 'menu', 'para espanol', 'for english', 'dial']
+                is_human = (
+                    any(ind in speech_lower for ind in human_indicators) and
+                    not any(ind in speech_lower for ind in ivr_like_indicators)
+                )
 
                 if is_human or len(ivr_patterns) == 0:
-                    # Probably human - start conversation
-                    print(f"👤 Human detected - starting conversation")
-                    state['call_state'] = CallState.SPEAKING_WITH_HUMAN
-                    response.redirect(f'{callback_base}/webhook/voice/human')
+                    # Likely human - route through wait-for-agent to confirm
+                    print(f"👤 Possible human detected during IVR - verifying via wait-for-agent")
+                    state['call_state'] = CallState.WAITING_FOR_AGENT
+                    state['pending_ivr_match'] = None
+                    response.redirect(f'{callback_base}/webhook/wait-for-agent')
                 else:
-                    # Keep listening for IVR
+                    # Keep listening for IVR - track no-match count
+                    no_match_count = state.get('ivr_no_match_count', 0) + 1
+                    state['ivr_no_match_count'] = no_match_count
+                    print(f"🔄 No IVR match (attempt {no_match_count}) - continuing to listen")
+
+                    # Detect if the IVR is still playing its preamble/menu
+                    ivr_preamble_indicators = [
+                        'press', 'option', 'menu', 'para espanol', 'for english',
+                        'dial', 'please listen', 'options have changed',
+                        'to repeat', 'if you know your party', 'extension',
+                        'for billing', 'for claims', 'for provider', 'for member',
+                        'for pharmacy', 'for eligibility', 'for authorization',
+                        'please make a selection', 'please select',
+                    ]
+                    speech_has_ivr_cues = any(ind in speech_lower for ind in ivr_preamble_indicators)
+                    accumulated_has_ivr_cues = any(ind in accumulated_lower for ind in ivr_preamble_indicators)
+
+                    if speech_has_ivr_cues or accumulated_has_ivr_cues:
+                        # IVR menu is still speaking - reset no-match count and keep listening
+                        state['ivr_no_match_count'] = 0
+                        print(f"📢 IVR menu speech detected, resetting no-match count. Waiting for full menu.")
+                    elif no_match_count >= 5:
+                        # No IVR cues and enough failed attempts - try pressing 0
+                        zero_press_count = state.get('ivr_zero_press_count', 0) + 1
+                        state['ivr_zero_press_count'] = zero_press_count
+                        MAX_ZERO_PRESSES = 2
+
+                        if zero_press_count <= MAX_ZERO_PRESSES:
+                            print(f"⚠️ IVR no-match limit reached ({no_match_count}), pressing 0 for operator (attempt {zero_press_count}/{MAX_ZERO_PRESSES})")
+                            response.play(digits='0')
+                            state['ivr_no_match_count'] = 0
+                            state['accumulated_ivr_speech'] = ''
+                            response.pause(length=4)
+                        else:
+                            # Already pressed 0 max times with no success - give up on IVR
+                            print(f"🛑 Pressed 0 {MAX_ZERO_PRESSES} times with no success. Giving up on IVR, transitioning to wait-for-agent.")
+                            state['call_state'] = CallState.WAITING_FOR_AGENT
+                            state['ivr_no_match_count'] = 0
+                            state['accumulated_ivr_speech'] = ''
+                            response.redirect(f'{callback_base}/webhook/wait-for-agent')
+                            return Response(str(response), mimetype='text/xml')
+
                     response.pause(length=1)
                     gather = Gather(
                         input='speech dtmf',
                         action=f'{callback_base}/webhook/ivr-navigate',
                         method='POST',
-                        speech_timeout='3',
-                        timeout=10,
-                        language='en-US'
+                        speech_timeout='auto',
+                        timeout=15,
+                        language='en-US',
+                        speech_model='phone_call'
                     )
                     response.append(gather)
-                    response.redirect(f'{callback_base}/webhook/voice/human')
+                    response.redirect(f'{callback_base}/webhook/wait-for-agent')
         else:
-            # No call state found - go to human mode
-            response.redirect(f'{callback_base}/webhook/voice/human')
+            # No call state found - go to wait-for-agent
+            response.redirect(f'{callback_base}/webhook/wait-for-agent')
 
         return Response(str(response), mimetype='text/xml')
 
@@ -949,6 +1100,164 @@ def ivr_navigate_webhook():
         traceback.print_exc()
         response = VoiceResponse()
         speak_with_tts(response, "Sorry, there was a technical error. Goodbye.")
+        return Response(str(response), mimetype='text/xml')
+
+
+@app.route('/webhook/wait-for-agent', methods=['POST'])
+def wait_for_agent_webhook():
+    """
+    Wait-for-agent loop: listens for human speech indicators before
+    starting the AI disclosure. Loops indefinitely until a human answers
+    or the call is cancelled. Payors can have 2+ hour hold times.
+    """
+    try:
+        from twilio.twiml.voice_response import Gather
+
+        response = VoiceResponse()
+        call_sid = request.values.get('CallSid')
+        speech_result = request.values.get('SpeechResult', '')
+
+        callback_base = get_callback_base(request)
+
+        # Find call state
+        call_info = None
+        for call_id, state in list(call_states.items()):
+            if state.get('call_sid') == call_sid:
+                call_info = {'call_id': call_id, 'state': state}
+                break
+
+        if not call_info:
+            # No state found, go to human mode as fallback
+            response.redirect(f'{callback_base}/webhook/voice/human')
+            return Response(str(response), mimetype='text/xml')
+
+        state = call_info['state']
+
+        # Initialize wait tracking on first entry
+        if not state.get('wait_for_agent_start_time'):
+            state['wait_for_agent_start_time'] = time.time()
+            state['wait_for_agent_attempts'] = 0
+            state['call_state'] = CallState.WAITING_FOR_AGENT
+            print(f"⏳ Started waiting for agent - CallSID: {call_sid}")
+
+        state['wait_for_agent_attempts'] = state.get('wait_for_agent_attempts', 0) + 1
+        elapsed = time.time() - state['wait_for_agent_start_time']
+        attempt = state['wait_for_agent_attempts']
+
+        print(f"⏳ Wait-for-agent attempt {attempt} (elapsed: {elapsed:.0f}s) - CallSID: {call_sid}")
+
+        # Analyze speech if present
+        if speech_result and speech_result.strip():
+            speech_lower = speech_result.lower().strip()
+            print(f"🎤 Wait-for-agent speech: '{speech_result}' (elapsed: {elapsed:.0f}s)")
+
+            # Hold/automated message indicators - keep waiting
+            hold_indicators = [
+                'please hold', 'please stay on the line', 'please remain on the line',
+                'your call is important', 'estimated wait', 'approximate wait',
+                'all representatives are busy', 'all agents are busy',
+                'all of our representatives', 'all of our agents',
+                'please continue to hold', 'next available',
+                'in the order received', 'in the order it was received',
+                'for quality assurance', 'this call may be recorded',
+                'this call may be monitored', 'for training purposes',
+                'thank you for your patience', 'we appreciate your patience',
+                'thank you for holding', 'thank you for waiting',
+                'please wait', 'one moment please',
+                'your call will be answered', 'remain on the line',
+                'currently experiencing high call volume',
+                'higher than normal call volume',
+                'press', 'for english', 'para espanol',
+                'menu', 'option', 'to repeat these options',
+                'if you know your party',
+            ]
+
+            # Human greeting/conversational indicators - agent answered
+            human_indicators = [
+                'hello', 'hi', 'hey',
+                'good morning', 'good afternoon', 'good evening',
+                'how can i help', 'how may i help', 'how can i assist',
+                'how may i assist', 'what can i do for you',
+                'speaking', 'this is', 'my name is',
+                'department', 'credentialing',
+                'thank you for calling',
+                'who am i speaking with', 'who am i talking to',
+                'may i have your', 'can i have your',
+                'what is your', 'name please',
+                'how are you', 'go ahead',
+                'yes', 'provider services',
+                'can i get your', 'do you have your',
+            ]
+
+            is_hold = any(ind in speech_lower for ind in hold_indicators)
+            is_human = any(ind in speech_lower for ind in human_indicators)
+
+            if is_hold and not is_human:
+                # Definitely hold/automated message - keep waiting
+                print(f"📻 Hold message detected, continuing to wait... ('{speech_result[:60]}')")
+                # Fall through to re-gather below
+
+            elif is_human and not is_hold:
+                # Definitely human - proceed to conversation
+                print(f"👤 Human agent confirmed! Transitioning to conversation. ('{speech_result[:60]}')")
+                state['agent_detected'] = True
+                state['call_state'] = CallState.SPEAKING_WITH_HUMAN
+                response.redirect(f'{callback_base}/webhook/voice/human')
+                return Response(str(response), mimetype='text/xml')
+
+            elif is_human and is_hold:
+                # Matches both - "thank you for calling" can be either IVR or human
+                # Use word count heuristic: short = likely human, long = likely hold message
+                word_count = len(speech_lower.split())
+                if word_count <= 8:
+                    print(f"👤 Short mixed speech, treating as human. ('{speech_result[:60]}')")
+                    state['agent_detected'] = True
+                    state['call_state'] = CallState.SPEAKING_WITH_HUMAN
+                    response.redirect(f'{callback_base}/webhook/voice/human')
+                    return Response(str(response), mimetype='text/xml')
+                else:
+                    print(f"📻 Long mixed speech, treating as hold message. ('{speech_result[:60]}')")
+                    # Fall through to re-gather
+
+            else:
+                # No indicators matched - ambiguous speech
+                word_count = len(speech_lower.split())
+                if word_count <= 5:
+                    # Short ambiguous utterance - likely human
+                    print(f"👤 Short ambiguous speech, treating as human. ('{speech_result[:60]}')")
+                    state['agent_detected'] = True
+                    state['call_state'] = CallState.SPEAKING_WITH_HUMAN
+                    response.redirect(f'{callback_base}/webhook/voice/human')
+                    return Response(str(response), mimetype='text/xml')
+                else:
+                    print(f"❓ Ambiguous speech, continuing to wait. ('{speech_result[:60]}')")
+                    # Fall through to re-gather
+
+        # Continue waiting - set up another gather cycle
+        gather = Gather(
+            input='speech',
+            action=f'{callback_base}/webhook/wait-for-agent',
+            method='POST',
+            speech_timeout='3',
+            timeout=15,
+            language='en-US',
+            speech_model='phone_call'
+        )
+        response.append(gather)
+
+        # If gather times out (silence), loop back to keep waiting
+        response.redirect(f'{callback_base}/webhook/wait-for-agent')
+
+        return Response(str(response), mimetype='text/xml')
+
+    except Exception as e:
+        print(f"❌ Error in wait_for_agent_webhook: {e}")
+        import traceback
+        traceback.print_exc()
+        # Fallback to human mode on error
+        response = VoiceResponse()
+        callback_base = get_callback_base(request)
+        response.redirect(f'{callback_base}/webhook/voice/human')
         return Response(str(response), mimetype='text/xml')
 
 
@@ -1011,8 +1320,8 @@ def speech_webhook():
             print(f"🤖 AI Response: {ai_response}")
             print(f"📋 Stage: {stage}, Questions Asked: {questions_asked_count}/{len(questions)}")
 
-            # Update questions asked count if a question was asked
-            if ai_response.get('question_asked'):
+            # Update questions asked count if a question was asked (cap at total)
+            if ai_response.get('question_asked') and questions_asked_count < len(questions):
                 state['questions_asked_count'] = questions_asked_count + 1
                 print(f"✅ Question asked! New count: {state['questions_asked_count']}")
 
@@ -1176,8 +1485,8 @@ def speech_followup_webhook():
 
             print(f"🤖 AI Response: {ai_response}")
 
-            # Update questions asked count if a question was asked
-            if ai_response.get('question_asked'):
+            # Update questions asked count if a question was asked (cap at total)
+            if ai_response.get('question_asked') and questions_asked_count < len(questions):
                 state['questions_asked_count'] = questions_asked_count + 1
                 print(f"✅ Question asked! New count: {state['questions_asked_count']}")
 
@@ -1191,7 +1500,8 @@ def speech_followup_webhook():
             # Store any extracted info
             if ai_response.get('extracted_info'):
                 for key, value in ai_response['extracted_info'].items():
-                    state['notes'] += f" {key}: {value}."
+                    if value:
+                        state['notes'] += f" {key}: {value}."
 
                 # Check for specific fields
                 extracted = ai_response['extracted_info']

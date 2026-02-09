@@ -52,6 +52,7 @@ class CallState(str, Enum):
     INITIATING = "initiating"
     IVR_NAVIGATION = "ivr_navigation"
     ON_HOLD = "on_hold"
+    WAITING_FOR_AGENT = "waiting_for_agent"
     SPEAKING_WITH_HUMAN = "speaking_with_human"
     EXTRACTING_INFO = "extracting_info"
     COMPLETING = "completing"
@@ -1011,10 +1012,24 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
     @traceable(name="classify_audio")
     def _classify_audio(self, state: CredentialingState) -> CredentialingState:
         """Classify current audio"""
+        # Track consecutive empty-transcript cycles to prevent infinite loops
+        empty_cycles = state.get('_empty_classify_cycles', 0)
+
         if not state.get('transcript'):
+            empty_cycles += 1
+            state['_empty_classify_cycles'] = empty_cycles
             state['current_audio_type'] = AudioType.SILENCE
+
+            if empty_cycles >= 3:
+                # No transcript data after multiple cycles - stop the graph
+                print(f"⚠️ No transcript data after {empty_cycles} cycles, stopping graph")
+                state['should_continue'] = False
+                state['error_message'] = 'No transcript data received - IVR handled by webhooks'
             return state
-        
+
+        # Reset counter when we have transcript data
+        state['_empty_classify_cycles'] = 0
+
         latest_transcript = state['transcript'][-1]['text']
         context = "\n".join([t['text'] for t in state['transcript'][-3:]])
         
@@ -1257,6 +1272,10 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
     
     def _route_by_audio_type(self, state: CredentialingState) -> str:
         """Route based on audio classification"""
+        # Short-circuit if graph should stop (e.g., empty transcript cycles exhausted)
+        if not state.get('should_continue', True):
+            return "human"  # Will be caught by _check_conversation_complete -> "complete"
+
         audio_type = state.get('current_audio_type', AudioType.UNKNOWN)
 
         if audio_type == AudioType.IVR_MENU:
@@ -1265,8 +1284,9 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
             return "hold"
         elif audio_type == AudioType.HUMAN_SPEECH:
             return "human"
+        elif audio_type == AudioType.SILENCE:
+            return "hold"  # Silence is a wait state, not a conversation
         else:
-            # Default to human to prevent infinite loop when audio type is unknown
             return "human"
     
     def _check_continue(self, state: CredentialingState) -> str:
@@ -1283,11 +1303,21 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
         """Check if conversation is complete"""
         if not state.get('should_continue', True):
             return "complete"
+
+        # Guard against indefinite cycling with no meaningful progress
+        conv_cycles = state.get('_conversation_check_cycles', 0) + 1
+        state['_conversation_check_cycles'] = conv_cycles
+        if conv_cycles >= 10 and not state.get('conversation_history'):
+            return "complete"
+
         return "continue"
     
     async def process_call(self, initial_state: CredentialingState) -> CredentialingState:
         """Process a complete credentialing call"""
-        config = {"configurable": {"thread_id": initial_state.get('call_id', 'default')}}
+        config = {
+            "configurable": {"thread_id": initial_state.get('call_id', 'default')},
+            "recursion_limit": 50,
+        }
         
         final_state = await self.graph.ainvoke(initial_state, config=config)
         
