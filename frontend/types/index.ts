@@ -27,6 +27,7 @@ export interface CredentialingRequest {
   tax_id: string;
   address: string;
   insurance_phone: string;
+  provider_phone?: string;
   questions: string[];
   status?: CredentialingStatus;
   reference_number?: string;
@@ -154,6 +155,7 @@ export interface CallDetail {
   tax_id: string;
   address: string;
   insurance_phone: string;
+  provider_phone?: string;
   questions: string[];
   status?: CredentialingStatus;
   reference_number?: string;

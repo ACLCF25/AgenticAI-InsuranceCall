@@ -41,6 +41,11 @@ const callFormSchema = z.object({
   insurance_phone: z.string()
     .transform(val => val.replace(/[\s\-\(\)\.]/g, ''))
     .pipe(z.string().regex(/^\+?1?\d{10,11}$/, 'Valid phone number required (10-11 digits)')),
+  provider_phone: z.string()
+    .transform(val => val.replace(/[\s\-\(\)\.]/g, ''))
+    .pipe(z.string().regex(/^\+?1?\d{10,11}$/, 'Valid phone number required'))
+    .optional()
+    .or(z.literal('')),
   questions: z.string().min(1, 'At least one question is required'),
 })
 
@@ -68,6 +73,7 @@ export function StartCallDialog({ open, onOpenChange }: StartCallDialogProps) {
       tax_id: '',
       address: '',
       insurance_phone: '',
+      provider_phone: '',
       questions: '',
     },
   })
@@ -251,6 +257,23 @@ export function StartCallDialog({ open, onOpenChange }: StartCallDialogProps) {
                     <FormControl>
                       <Input placeholder="Dr. Jane Smith" {...field} />
                     </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="provider_phone"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Provider Callback Phone (Optional)</FormLabel>
+                    <FormControl>
+                      <Input placeholder="+18005551234" {...field} />
+                    </FormControl>
+                    <FormDescription>
+                      Provider's callback number (will be stated in opening greeting)
+                    </FormDescription>
                     <FormMessage />
                   </FormItem>
                 )}

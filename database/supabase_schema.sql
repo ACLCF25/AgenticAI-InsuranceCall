@@ -15,6 +15,7 @@ CREATE TABLE credentialing_requests (
     tax_id VARCHAR(20) NOT NULL,
     address TEXT NOT NULL,
     insurance_phone VARCHAR(20),
+    provider_phone VARCHAR(20),
     questions JSONB NOT NULL,
     status VARCHAR(50) DEFAULT 'initiated',
     reference_number VARCHAR(100),
@@ -224,6 +225,9 @@ CREATE TABLE call_knowledge (
 -- ALTER TABLE call_knowledge ADD COLUMN IF NOT EXISTS chunk_index INTEGER DEFAULT 0;
 -- ALTER TABLE call_knowledge ADD COLUMN IF NOT EXISTS parent_id UUID REFERENCES call_knowledge(id);
 -- ALTER TABLE call_knowledge ADD COLUMN IF NOT EXISTS total_chunks INTEGER DEFAULT 1;
+
+-- Migration: Add provider_phone column if table already exists
+-- ALTER TABLE credentialing_requests ADD COLUMN IF NOT EXISTS provider_phone VARCHAR(20);
 
 -- Indexes for fast search
 CREATE INDEX IF NOT EXISTS call_knowledge_insurance_idx ON call_knowledge (insurance_name);

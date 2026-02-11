@@ -324,7 +324,7 @@ CRITICAL RULES:
 4. Stay focused on the credentialing inquiry
 5. Keep responses SHORT (1-2 sentences max) - this is a phone call
 6. If you don't understand, politely ask for clarification
-7. If they need to transfer you, say "Yes, please transfer me to the credentialing department"
+7. TRANSFER RESTRICTIONS: If they want to transfer you, politely say you need to ask your questions first. Only agree to transfer AFTER all questions are asked (stage="wrapping_up").
 8. When providing NPI, say it DIGIT BY DIGIT with clear pauses: "{npi_spoken}"
 9. When providing Tax ID, say it DIGIT BY DIGIT with clear pauses: "{tax_id_spoken}"
 
@@ -352,6 +352,11 @@ Questions list:
 Current stage: {stage}
 (If stage says "asking_question", you MUST ask the next question!)
 
+=== STAGE-SPECIFIC BEHAVIOR ===
+- "awaiting_disclosure_confirmation": Confirm they can help, then ask first question
+- "initial_contact_ask_question_X": Ask question X - do NOT accept transfers yet
+- "wrapping_up": All questions complete - now you may accept transfers or end call
+
 Previous conversation context:
 {context}
 
@@ -365,9 +370,11 @@ Respond ONLY with this JSON (no other text):
 }}
 
 === ACTION RULES ===
-- action="continue" - Use this for most responses (answering verification, asking questions, etc.)
-- action="end_call" - ONLY use when stage="wrapping_up" AND you've thanked them and said goodbye
-- action="request_transfer" - Use when they say they need to transfer you
+- action="continue" - Use for normal conversation
+- action="end_call" - ONLY use when stage="wrapping_up" AND you've said goodbye
+- action="request_transfer" - Use ONLY when:
+  * All questions have been asked/answered (stage="wrapping_up"), OR
+  * Human explicitly refuses to answer after multiple attempts
 - question_asked=true - Set to true ONLY when your response includes one of the credentialing questions from the list
 
 Example when asking a question:
@@ -560,6 +567,7 @@ def start_credentialing_call():
             'tax_id': data['tax_id'],
             'address': data['address'],
             'insurance_phone': data['insurance_phone'],
+            'provider_phone': data.get('provider_phone'),
             'questions': data['questions'],
             'questions_asked_count': 0,  # Track how many questions have been asked
             'call_id': call_id,
@@ -580,6 +588,7 @@ def start_credentialing_call():
             'turnaround_days': None,
             'notes': '',
             'should_continue': True,
+            'disclosure_acknowledged': False,
             'error_message': None
         }
 
@@ -731,7 +740,7 @@ def voice_webhook():
                 action=f'{callback_base}/webhook/ivr-navigate',
                 method='POST',
                 speech_timeout='3',
-                timeout=10,
+                timeout=30,  # Increased to 30 seconds for long IVR greetings
                 language='en-US'
             )
             # Don't say anything - just listen to IVR prompts
@@ -745,7 +754,9 @@ def voice_webhook():
             call_info['state']['call_state'] = CallState.SPEAKING_WITH_HUMAN
 
             # AI Disclosure message (required for automated calls)
-            disclosure = f"Hello, this is an automated AI assistant calling on behalf of {provider_name} regarding provider credentialing. Is this the credentialing department?"
+            provider_phone = call_info['state'].get('provider_phone', '')
+            phone_part = f" at {provider_phone}" if provider_phone else ""
+            disclosure = f"Hello, I'm calling on behalf of {provider_name}{phone_part} for credentialing. Am I speaking with the credentialing department?"
 
             # Use Gather to capture the response
             gather = Gather(
@@ -799,11 +810,14 @@ def voice_human_webhook():
                 break
 
         provider_name = "a healthcare provider"
+        provider_phone = ""
         if call_info:
             provider_name = call_info['state'].get('provider_name', provider_name)
+            provider_phone = call_info['state'].get('provider_phone', '')
 
         # AI Disclosure message
-        disclosure = f"Hello, this is an automated AI assistant calling on behalf of {provider_name} regarding provider credentialing. Is this the credentialing department?"
+        phone_part = f" at {provider_phone}" if provider_phone else ""
+        disclosure = f"Hello, I'm calling on behalf of {provider_name}{phone_part} for credentialing. Am I speaking with the credentialing department?"
 
         gather = Gather(
             input='speech',
@@ -865,12 +879,37 @@ def ivr_navigate_webhook():
             matched_pattern = None
             speech_lower = speech_result.lower()
 
+            # Log the speech for debugging
+            if speech_lower:
+                print(f"🔍 Analyzing speech: '{speech_lower[:100]}...'")
+                print(f"📊 Current menu level: {current_level}, Available patterns: {len(ivr_patterns)}")
+
             for pattern in ivr_patterns:
-                if pattern['menu_level'] > current_level:
+                pattern_level = pattern['menu_level']
+                # Check patterns at current level or next level
+                if pattern_level >= current_level:
                     detected_phrase = pattern.get('detected_phrase', '').lower()
                     if detected_phrase and detected_phrase in speech_lower:
                         matched_pattern = pattern
-                        print(f"✅ Matched IVR pattern: '{detected_phrase}' at level {pattern['menu_level']}")
+                        print(f"✅ Matched IVR pattern: '{detected_phrase}' at level {pattern_level}")
+                        break
+
+            # If no exact match, try flexible matching for common IVR menu patterns
+            if not matched_pattern and speech_lower:
+                # Look for patterns at the next level only
+                next_level_patterns = [p for p in ivr_patterns if p['menu_level'] == current_level + 1]
+
+                for pattern in next_level_patterns:
+                    action_value = pattern.get('action_value', '')
+                    # Try to detect menu options like "press 1" or "press 2"
+                    if action_value and f"press {action_value}" in speech_lower:
+                        matched_pattern = pattern
+                        print(f"✅ Flexible match: detected 'press {action_value}' at level {pattern['menu_level']}")
+                        break
+                    # Try "option 1" or "dial 1"
+                    elif action_value and (f"option {action_value}" in speech_lower or f"dial {action_value}" in speech_lower):
+                        matched_pattern = pattern
+                        print(f"✅ Flexible match: detected option/dial {action_value} at level {pattern['menu_level']}")
                         break
 
             if matched_pattern:
@@ -903,36 +942,67 @@ def ivr_navigate_webhook():
                         action=f'{callback_base}/webhook/ivr-navigate',
                         method='POST',
                         speech_timeout='3',
-                        timeout=10,
+                        timeout=30,  # Increased to 30 seconds for long IVR messages
                         language='en-US'
                     )
                     response.append(gather)
                     response.redirect(f'{callback_base}/webhook/voice/human')
                 else:
-                    # All IVR levels done, wait for human
-                    print(f"✅ IVR navigation complete - waiting for human")
-                    response.pause(length=3)
+                    # All IVR levels done - enter silent listening mode
+                    print(f"✅ IVR navigation complete - entering silent listening mode")
+                    state['call_state'] = CallState.WAITING_FOR_HUMAN
+                    state['wait_start_time'] = datetime.now().isoformat()
+
+                    # Listen silently for human speech (no Say/Play first)
+                    gather = Gather(
+                        input='speech',
+                        action=f'{callback_base}/webhook/wait-for-human',
+                        method='POST',
+                        speech_timeout='3',  # Detect 3 sec silence
+                        timeout=30,  # Max 30 seconds of listening
+                        language='en-US'
+                    )
+                    response.append(gather)
+
+                    # If timeout (no speech for 30 sec), try speaking
                     response.redirect(f'{callback_base}/webhook/voice/human')
             else:
-                # No match - might be human or different IVR prompt
+                # No match - might be IVR announcement, human, or different IVR prompt
+                # Track how many times we've heard unmatched speech
+                if 'ivr_unmatched_count' not in state:
+                    state['ivr_unmatched_count'] = 0
+                state['ivr_unmatched_count'] += 1
+
+                print(f"⚠️ No IVR pattern matched (attempt {state['ivr_unmatched_count']})")
+
                 # Check if it sounds like a human greeting
-                human_indicators = ['hello', 'hi', 'how can i help', 'speaking', 'this is', 'department', 'thank you for calling']
+                human_indicators = ['hello', 'hi', 'how can i help', 'speaking', 'this is', 'may i help', 'department', 'thank you for calling', 'you have reached']
                 is_human = any(indicator in speech_lower for indicator in human_indicators)
 
-                if is_human or len(ivr_patterns) == 0:
-                    # Probably human - start conversation
-                    print(f"👤 Human detected - starting conversation")
+                # Only treat as human if:
+                # 1. Clear human indicators detected, OR
+                # 2. We've tried multiple times (5+) without matching IVR patterns
+                if is_human and state['ivr_unmatched_count'] >= 2:
+                    # Strong indication of human - start conversation
+                    print(f"👤 Human detected (clear indicators) - starting conversation")
+                    state['call_state'] = CallState.SPEAKING_WITH_HUMAN
+                    response.redirect(f'{callback_base}/webhook/voice/human')
+                elif state['ivr_unmatched_count'] >= 5:
+                    # Tried too many times - assume human or IVR navigation failed
+                    print(f"👤 Switching to human mode after {state['ivr_unmatched_count']} attempts")
                     state['call_state'] = CallState.SPEAKING_WITH_HUMAN
                     response.redirect(f'{callback_base}/webhook/voice/human')
                 else:
-                    # Keep listening for IVR
+                    # Keep listening for IVR menu options
+                    # This could be an announcement before the actual menu
+                    print(f"🔄 Continuing to listen for IVR menu options...")
                     response.pause(length=1)
                     gather = Gather(
                         input='speech dtmf',
                         action=f'{callback_base}/webhook/ivr-navigate',
                         method='POST',
                         speech_timeout='3',
-                        timeout=10,
+                        timeout=30,  # Increased to 30 seconds for long IVR greetings
                         language='en-US'
                     )
                     response.append(gather)
@@ -949,6 +1019,198 @@ def ivr_navigate_webhook():
         traceback.print_exc()
         response = VoiceResponse()
         speak_with_tts(response, "Sorry, there was a technical error. Goodbye.")
+        return Response(str(response), mimetype='text/xml')
+
+
+@app.route('/webhook/wait-for-human', methods=['POST'])
+def wait_for_human_webhook():
+    """
+    Silent listening phase after IVR - detect when actual human speaks
+    """
+    try:
+        from twilio.twiml.voice_response import Gather
+
+        response = VoiceResponse()
+
+        call_sid = request.values.get('CallSid')
+        speech_result = request.values.get('SpeechResult', '')
+
+        # Get the base URL
+        callback_base = os.getenv('CALLBACK_URL', '').replace('/webhook/voice', '')
+        if not callback_base:
+            callback_base = f"https://{request.host}"
+
+        print(f"🎧 Wait-for-human - CallSID: {call_sid}")
+        print(f"📝 Heard: {speech_result}")
+
+        # Find the call state
+        call_info = None
+        for call_id, state in list(call_states.items()):
+            if state.get('call_sid') == call_sid:
+                call_info = {'call_id': call_id, 'state': state}
+                break
+
+        if not call_info:
+            # No state found - proceed to human mode
+            print(f"⚠️ No call state found - proceeding to human mode")
+            response.redirect(f'{callback_base}/webhook/voice/human')
+            return Response(str(response), mimetype='text/xml')
+
+        state = call_info['state']
+        speech_lower = speech_result.lower()
+
+        # Track wait attempts
+        if 'wait_attempts' not in state:
+            state['wait_attempts'] = 0
+        state['wait_attempts'] += 1
+
+        # Empty/very short speech might be hold music blips or IVR fragments
+        is_very_short = len(speech_result.strip()) < 10
+
+        # PRIORITY 1: Detect automated queue/hold systems (check FIRST before human detection)
+        # These are definitive indicators that it's NOT a human
+        queue_system_indicators = [
+            'all representatives are busy',
+            'all agents are busy',
+            'all of our representatives',
+            'currently assisting other callers',
+            'your call will be answered in the order',
+            'please stay on the line',
+            'continue to hold',
+            'press 1 to continue holding',
+            'press 2 if you prefer a call back',
+            'press 3 to leave a message',
+            'your position in queue',
+            'estimated wait time',
+            'currently experiencing high call volume',
+            'you have reached out to',  # "you have reached out to X department"
+            'thank you for calling',
+            'this call is being recorded',
+            'for quality assurance purposes'
+        ]
+        is_queue_system = any(indicator in speech_lower for indicator in queue_system_indicators)
+
+        # PRIORITY 2: Detect transfer/hold messages (keep waiting)
+        transfer_indicators = [
+            'please wait',
+            'please hold',
+            'connecting you',
+            'transferring you',
+            'one moment',
+            'your call is important'
+        ]
+        is_transfer_message = any(indicator in speech_lower for indicator in transfer_indicators)
+
+        # PRIORITY 3: Detect human greeting/response (only if NOT queue/automated)
+        # These ONLY indicate human if no queue indicators present
+        human_indicators = [
+            'how can i help',
+            'how may i help',
+            'may i help you',
+            'speaking',
+            'who am i speaking with',
+            'may i ask who',
+            'this is',  # Only when NOT part of automated message
+            'good morning',
+            'good afternoon',
+            'good evening'
+        ]
+        # Simple greetings only count as human if message is SHORT (not part of long automated message)
+        simple_greetings = ['hello', 'hi', 'credentialing department']
+
+        is_human = (
+            any(indicator in speech_lower for indicator in human_indicators) or
+            (any(greeting in speech_lower for greeting in simple_greetings) and len(speech_result) < 50)
+        )
+
+        # Track total wait time
+        if 'wait_start_time' not in state:
+            from datetime import datetime
+            state['wait_start_time'] = datetime.now().isoformat()
+
+        # Calculate how long we've been waiting
+        from datetime import datetime
+        wait_start = datetime.fromisoformat(state['wait_start_time'])
+        wait_duration_minutes = (datetime.now() - wait_start).total_seconds() / 60
+
+        # DECISION LOGIC - Priority order matters!
+
+        # PRIORITY 1: Detected queue system or transfer - definitely NOT human yet
+        if is_queue_system or is_transfer_message:
+            if wait_duration_minutes < 10:
+                # Still within acceptable wait time - keep waiting
+                print(f"📞 Queue/automated system detected (attempt {state['wait_attempts']}, {wait_duration_minutes:.1f} min)")
+                print(f"   Heard: {speech_result[:100]}...")
+                print(f"   Continuing to wait for human...")
+                gather = Gather(
+                    input='speech',
+                    action=f'{callback_base}/webhook/wait-for-human',
+                    method='POST',
+                    speech_timeout='3',
+                    timeout=30,
+                    language='en-US'
+                )
+                response.append(gather)
+                response.redirect(f'{callback_base}/webhook/voice/human')
+            else:
+                # Waited too long in queue - hang up
+                print(f"⏰ Queue wait time exceeded ({wait_duration_minutes:.1f} minutes) - hanging up")
+                state['call_state'] = CallState.FAILED
+                state['failure_reason'] = f'Long queue - waited {wait_duration_minutes:.1f} minutes'
+                speak_with_tts(response, "The wait time is longer than expected. I'll try calling back later. Goodbye.")
+                response.hangup()
+
+        # PRIORITY 2: Detected human (and NO queue/transfer indicators)
+        elif is_human and not is_very_short:
+            # Confident this is a real human - proceed with disclosure
+            print(f"✅ Human detected after {wait_duration_minutes:.1f} minutes! Starting conversation")
+            print(f"   Heard: {speech_result[:100]}...")
+            state['call_state'] = CallState.SPEAKING_WITH_HUMAN
+            response.redirect(f'{callback_base}/webhook/voice/human')
+
+        # PRIORITY 3: Timeout checks (no clear human or queue detected)
+        elif wait_duration_minutes >= 10:
+            # Waited too long without detecting human - give up
+            print(f"⏰ Maximum wait time exceeded ({wait_duration_minutes:.1f} minutes) without human detection")
+            state['call_state'] = CallState.FAILED
+            state['failure_reason'] = f'No human detected after {wait_duration_minutes:.1f} minutes'
+            speak_with_tts(response, "I've been unable to reach a representative. I'll try calling back later. Goodbye.")
+            response.hangup()
+
+        elif state['wait_attempts'] >= 60:
+            # Fallback: Too many attempts without clear indicators
+            print(f"⏰ Maximum attempts exceeded ({state['wait_attempts']} attempts, {wait_duration_minutes:.1f} min)")
+            state['call_state'] = CallState.FAILED
+            state['failure_reason'] = f'Timeout after {state['wait_attempts']} attempts'
+            speak_with_tts(response, "I've been unable to reach a representative. I'll try calling back later. Goodbye.")
+            response.hangup()
+
+        # PRIORITY 4: Default - unclear what we heard, keep waiting
+        else:
+            print(f"🔄 Unclear signal (attempt {state['wait_attempts']}, {wait_duration_minutes:.1f} min)")
+            print(f"   Heard: {speech_result[:100] if speech_result else '(silence)'}...")
+            print(f"   Continuing to listen...")
+            gather = Gather(
+                input='speech',
+                action=f'{callback_base}/webhook/wait-for-human',
+                method='POST',
+                speech_timeout='3',
+                timeout=30,
+                language='en-US'
+            )
+            response.append(gather)
+            # If Gather times out, try speaking anyway
+            response.redirect(f'{callback_base}/webhook/voice/human')
+
+        return Response(str(response), mimetype='text/xml')
+
+    except Exception as e:
+        print(f"❌ Error in wait_for_human_webhook: {e}")
+        import traceback
+        traceback.print_exc()
+        # On error, proceed to human mode
+        response = VoiceResponse()
+        response.redirect(f'{callback_base}/webhook/voice/human')
         return Response(str(response), mimetype='text/xml')
 
 
@@ -990,12 +1252,37 @@ def speech_webhook():
         if call_info:
             state = call_info['state']
 
-            # Track questions asked using a dedicated counter (not agent message count)
+            # Check if we're hearing IVR menu options instead of human speech
+            # This can happen if we switched to human mode too early
+            speech_lower = speech_result.lower()
+            ivr_menu_indicators = [
+                'press 1', 'press 2', 'press 3', 'press 4', 'press 5',
+                'dial 1', 'dial 2', 'dial 3',
+                'option 1', 'option 2', 'option 3',
+                'say 1', 'say 2',
+                'for english', 'para español',
+                'please listen carefully', 'menu options have changed',
+                'if you are calling about', 'if you need'
+            ]
+
+            is_ivr_menu = any(indicator in speech_lower for indicator in ivr_menu_indicators)
+
+            if is_ivr_menu:
+                print(f"⚠️ Detected IVR menu in human mode - switching back to IVR navigation")
+                # Redirect back to IVR navigation
+                state['call_state'] = CallState.IVR_NAVIGATION
+                response.redirect(f'{callback_base}/webhook/ivr-navigate')
+                return Response(str(response), mimetype='text/xml')
+
+            # Track disclosure acknowledgment and questions asked
+            disclosure_acknowledged = state.get('disclosure_acknowledged', False)
             questions = state.get('questions', [])
             questions_asked_count = state.get('questions_asked_count', 0)
 
-            # Determine the stage based on actual questions asked, not total messages
-            if questions_asked_count >= len(questions):
+            # Determine the stage based on disclosure and questions progress
+            if not disclosure_acknowledged:
+                stage = "awaiting_disclosure_confirmation"
+            elif questions_asked_count >= len(questions):
                 stage = "wrapping_up"
             else:
                 # We're in initial contact until first question is asked
@@ -1010,6 +1297,14 @@ def speech_webhook():
 
             print(f"🤖 AI Response: {ai_response}")
             print(f"📋 Stage: {stage}, Questions Asked: {questions_asked_count}/{len(questions)}")
+
+            # Detect if human acknowledged the disclosure
+            if not state.get('disclosure_acknowledged', False):
+                speech_lower = speech_result.lower()
+                confirmation_keywords = ['yes', 'correct', 'speaking', 'this is', 'how can', 'what']
+                if any(keyword in speech_lower for keyword in confirmation_keywords):
+                    state['disclosure_acknowledged'] = True
+                    print(f"✅ Disclosure acknowledged by human")
 
             # Update questions asked count if a question was asked
             if ai_response.get('question_asked'):
@@ -1062,20 +1357,40 @@ def speech_webhook():
                 response.pause(length=8)
                 response.hangup()
             elif action == 'request_transfer':
-                speak_with_tts(response, ai_response.get('response', 'Could you please transfer me to the credentialing department?'))
-                response.pause(length=30)  # Wait for transfer
-                # After pause, gather again
-                gather = Gather(
-                    input='speech',
-                    action=f'{callback_base}/webhook/speech',
-                    method='POST',
-                    speech_timeout='auto',
-                    language='en-US'
-                )
-                speak_with_tts(response, "Hello? Is anyone there?", gather=gather)
-                response.append(gather)
-                # Fallback if no response after transfer
-                response.redirect(f'{callback_base}/webhook/speech')
+                questions_asked_count = state.get('questions_asked_count', 0)
+                total_questions = len(state.get('questions', []))
+
+                # Block transfer until all questions are asked
+                if questions_asked_count < total_questions:
+                    # Politely refuse and continue with questions
+                    remaining_questions = total_questions - questions_asked_count
+                    next_question = state.get('questions', [])[questions_asked_count]
+                    response_text = f"I understand you'd like to transfer me, but I need to ask {remaining_questions} quick question{'s' if remaining_questions > 1 else ''} first. {next_question}"
+
+                    gather = Gather(
+                        input='speech',
+                        action=f'{callback_base}/webhook/speech/followup',
+                        method='POST',
+                        speech_timeout='auto',
+                        language='en-US'
+                    )
+                    speak_with_tts(response, response_text, gather=gather)
+                    response.append(gather)
+                    speak_with_tts(response, "Are you still there?")
+                else:
+                    # All questions asked - allow transfer
+                    speak_with_tts(response, ai_response.get('response', 'Yes, please transfer me to the credentialing department.'))
+                    response.pause(length=30)  # Wait for transfer
+                    # After pause, gather again
+                    gather = Gather(
+                        input='speech',
+                        action=f'{callback_base}/webhook/speech',
+                        method='POST',
+                        speech_timeout='auto',
+                        language='en-US'
+                    )
+                    speak_with_tts(response, "Hello? Is anyone there?", gather=gather)
+                    response.append(gather)
             else:
                 # Continue conversation
                 gather = Gather(
@@ -1154,12 +1469,37 @@ def speech_followup_webhook():
         if call_info:
             state = call_info['state']
 
-            # Track questions asked using a dedicated counter
+            # Check if we're hearing IVR menu options instead of human speech
+            # This can happen if we switched to human mode too early
+            speech_lower = speech_result.lower()
+            ivr_menu_indicators = [
+                'press 1', 'press 2', 'press 3', 'press 4', 'press 5',
+                'dial 1', 'dial 2', 'dial 3',
+                'option 1', 'option 2', 'option 3',
+                'say 1', 'say 2',
+                'for english', 'para español',
+                'please listen carefully', 'menu options have changed',
+                'if you are calling about', 'if you need'
+            ]
+
+            is_ivr_menu = any(indicator in speech_lower for indicator in ivr_menu_indicators)
+
+            if is_ivr_menu:
+                print(f"⚠️ Detected IVR menu in human mode - switching back to IVR navigation")
+                # Redirect back to IVR navigation
+                state['call_state'] = CallState.IVR_NAVIGATION
+                response.redirect(f'{callback_base}/webhook/ivr-navigate')
+                return Response(str(response), mimetype='text/xml')
+
+            # Track disclosure acknowledgment and questions asked
+            disclosure_acknowledged = state.get('disclosure_acknowledged', False)
             questions = state.get('questions', [])
             questions_asked_count = state.get('questions_asked_count', 0)
 
-            # Determine stage - ask questions if we have more to ask
-            if questions_asked_count >= len(questions):
+            # Determine stage - check disclosure first, then questions
+            if not disclosure_acknowledged:
+                stage = "awaiting_disclosure_confirmation"
+            elif questions_asked_count >= len(questions):
                 stage = "wrapping_up"
             else:
                 stage = f"asking_question_{questions_asked_count + 1}_of_{len(questions)}"
@@ -1175,6 +1515,14 @@ def speech_followup_webhook():
             )
 
             print(f"🤖 AI Response: {ai_response}")
+
+            # Detect if human acknowledged the disclosure
+            if not state.get('disclosure_acknowledged', False):
+                speech_lower = speech_result.lower()
+                confirmation_keywords = ['yes', 'correct', 'speaking', 'this is', 'how can', 'what']
+                if any(keyword in speech_lower for keyword in confirmation_keywords):
+                    state['disclosure_acknowledged'] = True
+                    print(f"✅ Disclosure acknowledged by human")
 
             # Update questions asked count if a question was asked
             if ai_response.get('question_asked'):
@@ -1233,19 +1581,39 @@ def speech_followup_webhook():
                 response.pause(length=8)
                 response.hangup()
             elif action == 'request_transfer':
-                speak_with_tts(response, ai_response.get('response', 'Could you please transfer me?'))
-                response.pause(length=30)
-                gather = Gather(
-                    input='speech',
-                    action=f'{callback_base}/webhook/speech/followup',
-                    method='POST',
-                    speech_timeout='auto',
-                    language='en-US'
-                )
-                speak_with_tts(response, "Hello? Is anyone there?", gather=gather)
-                response.append(gather)
-                # Fallback if no response after transfer
-                response.redirect(f'{callback_base}/webhook/speech/followup')
+                questions_asked_count = state.get('questions_asked_count', 0)
+                total_questions = len(state.get('questions', []))
+
+                # Block transfer until all questions are asked
+                if questions_asked_count < total_questions:
+                    # Politely refuse and continue with questions
+                    remaining_questions = total_questions - questions_asked_count
+                    next_question = state.get('questions', [])[questions_asked_count]
+                    response_text = f"I understand you'd like to transfer me, but I need to ask {remaining_questions} quick question{'s' if remaining_questions > 1 else ''} first. {next_question}"
+
+                    gather = Gather(
+                        input='speech',
+                        action=f'{callback_base}/webhook/speech/followup',
+                        method='POST',
+                        speech_timeout='auto',
+                        language='en-US'
+                    )
+                    speak_with_tts(response, response_text, gather=gather)
+                    response.append(gather)
+                    speak_with_tts(response, "Are you still there?")
+                else:
+                    # All questions asked - allow transfer
+                    speak_with_tts(response, ai_response.get('response', 'Yes, please transfer me to the credentialing department.'))
+                    response.pause(length=30)  # Wait for transfer
+                    gather = Gather(
+                        input='speech',
+                        action=f'{callback_base}/webhook/speech/followup',
+                        method='POST',
+                        speech_timeout='auto',
+                        language='en-US'
+                    )
+                    speak_with_tts(response, "Hello? Is anyone there?", gather=gather)
+                    response.append(gather)
             else:
                 # Continue conversation
                 gather = Gather(
