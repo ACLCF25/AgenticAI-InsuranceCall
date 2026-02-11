@@ -52,6 +52,7 @@ class CallState(str, Enum):
     INITIATING = "initiating"
     IVR_NAVIGATION = "ivr_navigation"
     ON_HOLD = "on_hold"
+    WAITING_FOR_HUMAN = "waiting_for_human"
     SPEAKING_WITH_HUMAN = "speaking_with_human"
     EXTRACTING_INFO = "extracting_info"
     COMPLETING = "completing"
@@ -84,7 +85,9 @@ class CredentialingState(TypedDict):
     tax_id: str
     address: str
     insurance_phone: str
+    provider_phone: Optional[str]
     questions: List[str]
+    questions_asked_count: int
     
     # Call tracking
     call_id: Optional[str]
@@ -117,6 +120,7 @@ class CredentialingState(TypedDict):
     
     # Control flow
     should_continue: bool
+    disclosure_acknowledged: bool
     error_message: Optional[str]
 
     # Timing metrics (optional)
@@ -161,9 +165,9 @@ class DatabaseManager:
         """Save initial credentialing request"""
         with self.conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO credentialing_requests 
-                (insurance_name, provider_name, npi, tax_id, address, insurance_phone, questions, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO credentialing_requests
+                (insurance_name, provider_name, npi, tax_id, address, insurance_phone, provider_phone, questions, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 state['insurance_name'],
@@ -172,6 +176,7 @@ class DatabaseManager:
                 state['tax_id'],
                 state['address'],
                 state.get('insurance_phone'),
+                state.get('provider_phone'),
                 json.dumps(state['questions']),
                 'initiated'
             ))
