@@ -37,7 +37,7 @@ const ivrFormSchema = z.object({
   action_value: z.string().optional(),
 })
 
-type IVRFormValues = z.infer<typeof ivrFormSchema>
+type IVRFormValues = z.input<typeof ivrFormSchema>
 
 interface AddIVRDialogProps {
   open: boolean
@@ -74,7 +74,7 @@ export function AddIVRDialog({ open, onOpenChange, insuranceName }: AddIVRDialog
     mutationFn: (values: IVRFormValues) => {
       return api.addIVRKnowledge({
         insurance_name: insuranceName,
-        menu_level: values.menu_level,
+        menu_level: parseInt(values.menu_level, 10),
         detected_phrase: values.detected_phrase,
         preferred_action: values.preferred_action,
         action_value: values.action_value || undefined,
@@ -82,6 +82,7 @@ export function AddIVRDialog({ open, onOpenChange, insuranceName }: AddIVRDialog
     },
     onSuccess: () => {
       toast.success('IVR step added successfully')
+      queryClient.invalidateQueries({ queryKey: ['ivr-knowledge'] })
       queryClient.invalidateQueries({ queryKey: ['ivr-knowledge', insuranceName] })
       onOpenChange(false)
       form.reset()

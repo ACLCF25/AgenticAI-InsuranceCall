@@ -89,7 +89,7 @@ const DialogOverlay = React.forwardRef<
     <div
       ref={ref}
       className={cn(
-        "fixed inset-0 z-[999] bg-black/80",
+        "fixed inset-0 z-[999] bg-black/45 backdrop-blur-[2px]",
         className
       )}
       onClick={() => onOpenChange?.(false)}
@@ -128,14 +128,14 @@ const DialogContent = React.forwardRef<
     <>
       {/* Overlay */}
       <div
-        className="fixed inset-0 z-[999] bg-black/80"
+        className="fixed inset-0 z-[999] bg-black/45 backdrop-blur-[2px]"
         onClick={() => onOpenChange?.(false)}
       />
       {/* Content */}
       <div
         ref={ref}
         className={cn(
-          "fixed left-[50%] top-[50%] z-[1000] grid w-full max-w-lg translate-x-[-50%] translate-y-[-50%] gap-4 border bg-white text-gray-900 p-6 shadow-lg sm:rounded-lg",
+          "fixed left-[50%] top-[50%] z-[1000] grid w-[calc(100%-2rem)] max-w-lg translate-x-[-50%] translate-y-[-50%] gap-4 rounded-2xl border border-border bg-card/95 p-6 text-card-foreground shadow-xl",
           className
         )}
         onClick={(e) => e.stopPropagation()}
@@ -143,7 +143,7 @@ const DialogContent = React.forwardRef<
       >
         {children}
         <button
-          className="absolute right-4 top-4 rounded-sm opacity-70 transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+          className="absolute right-4 top-4 rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
           onClick={() => onOpenChange?.(false)}
         >
           <X className="h-4 w-4" />

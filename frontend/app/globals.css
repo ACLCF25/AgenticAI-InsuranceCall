@@ -1,52 +1,85 @@
-/* app/globals.css */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
+    --background: 210 33% 98%;
+    --foreground: 222 36% 14%;
+
     --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
+    --card-foreground: 222 36% 14%;
+
     --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
-    --primary: 221.2 83.2% 53.3%;
-    --primary-foreground: 210 40% 98%;
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
-    --accent: 210 40% 96.1%;
-    --accent-foreground: 222.2 47.4% 11.2%;
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 221.2 83.2% 53.3%;
-    --radius: 0.5rem;
+    --popover-foreground: 222 36% 14%;
+
+    --primary: 217 75% 48%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 210 18% 94%;
+    --secondary-foreground: 222 28% 18%;
+
+    --muted: 214 23% 95%;
+    --muted-foreground: 220 10% 42%;
+
+    --accent: 212 30% 92%;
+    --accent-foreground: 222 28% 18%;
+
+    --destructive: 0 72% 52%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 214 20% 86%;
+    --input: 214 20% 86%;
+    --ring: 217 75% 48%;
+    --radius: 0.9rem;
+
+    --success: 158 69% 36%;
+    --warning: 40 92% 47%;
+    --info: 217 75% 48%;
+
+    --sidebar: 0 0% 100%;
+    --sidebar-foreground: 222 36% 14%;
+    --sidebar-border: 214 20% 90%;
+    --sidebar-accent: 214 30% 95%;
   }
 
   .dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
-    --card: 222.2 84% 4.9%;
-    --card-foreground: 210 40% 98%;
-    --popover: 222.2 84% 4.9%;
-    --popover-foreground: 210 40% 98%;
-    --primary: 217.2 91.2% 59.8%;
-    --primary-foreground: 222.2 47.4% 11.2%;
-    --secondary: 217.2 32.6% 17.5%;
-    --secondary-foreground: 210 40% 98%;
-    --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
-    --accent: 217.2 32.6% 17.5%;
-    --accent-foreground: 210 40% 98%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 217.2 32.6% 17.5%;
-    --input: 217.2 32.6% 17.5%;
-    --ring: 224.3 76.3% 48%;
+    --background: 222 24% 10%;
+    --foreground: 215 24% 92%;
+
+    --card: 222 22% 13%;
+    --card-foreground: 215 24% 92%;
+
+    --popover: 222 22% 13%;
+    --popover-foreground: 215 24% 92%;
+
+    --primary: 215 90% 68%;
+    --primary-foreground: 222 30% 12%;
+
+    --secondary: 223 16% 18%;
+    --secondary-foreground: 215 24% 92%;
+
+    --muted: 223 16% 18%;
+    --muted-foreground: 217 12% 66%;
+
+    --accent: 223 18% 20%;
+    --accent-foreground: 215 24% 92%;
+
+    --destructive: 0 63% 50%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 223 14% 23%;
+    --input: 223 14% 23%;
+    --ring: 215 90% 68%;
+
+    --success: 158 70% 46%;
+    --warning: 40 96% 56%;
+    --info: 215 90% 68%;
+
+    --sidebar: 223 25% 8%;
+    --sidebar-foreground: 215 24% 92%;
+    --sidebar-border: 223 14% 21%;
+    --sidebar-accent: 223 18% 17%;
   }
 }
 
@@ -56,30 +89,33 @@
   }
   body {
     @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+    background-image:
+      radial-gradient(circle at 0% 0%, hsl(var(--primary) / 0.08), transparent 34%),
+      radial-gradient(circle at 100% 100%, hsl(var(--accent-foreground) / 0.05), transparent 40%);
+    min-height: 100vh;
   }
 }
 
-/* Custom scrollbar */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 
 ::-webkit-scrollbar-track {
-  @apply bg-muted;
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  @apply bg-muted-foreground/30 rounded-md;
+  @apply rounded-full bg-muted-foreground/25;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  @apply bg-muted-foreground/50;
+  @apply bg-muted-foreground/40;
 }
 
-/* Loading spinner */
 .spinner {
-  border: 2px solid rgba(0, 0, 0, 0.1);
+  border: 2px solid hsl(var(--muted));
   border-left-color: hsl(var(--primary));
   border-radius: 50%;
   width: 24px;
@@ -93,13 +129,13 @@
   }
 }
 
-/* Pulse animation for active calls */
 @keyframes pulse-dot {
-  0%, 100% {
+  0%,
+  100% {
     opacity: 1;
   }
   50% {
-    opacity: 0.5;
+    opacity: 0.35;
   }
 }
 

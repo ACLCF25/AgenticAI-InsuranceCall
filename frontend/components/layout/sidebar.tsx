@@ -1,0 +1,30 @@
+import { Bot } from 'lucide-react'
+import { SidebarNav } from './sidebar-nav'
+import { ThemeSwitcher } from './theme-switcher'
+
+export function Sidebar() {
+  return (
+    <aside className="hidden md:fixed md:inset-y-4 md:left-4 md:z-40 md:flex md:w-[220px] md:flex-col rounded-2xl border border-sidebar-border bg-sidebar/95 backdrop-blur">
+      <div className="flex items-center gap-3 border-b border-sidebar-border px-5 py-4">
+        <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-primary/10 text-primary">
+          <Bot className="h-4 w-4" />
+        </div>
+        <div className="flex flex-col">
+          <span className="text-sm font-semibold tracking-tight">Credentialing</span>
+          <span className="text-[11px] text-muted-foreground leading-none">Control Panel</span>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto py-4">
+        <SidebarNav />
+      </div>
+
+      <div className="border-t border-sidebar-border px-4 py-3">
+        <div className="flex items-center justify-between">
+          <span className="text-[11px] uppercase tracking-[0.08em] text-muted-foreground">v1.0.0</span>
+          <ThemeSwitcher />
+        </div>
+      </div>
+    </aside>
+  )
+}

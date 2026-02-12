@@ -2455,6 +2455,23 @@ def update_insurance_provider(provider_id: str):
         db = DatabaseManager()
 
         with db.conn.cursor() as cur:
+            # Read old name first so IVR rows can be kept in sync when renamed.
+            cur.execute("""
+                SELECT insurance_name
+                FROM insurance_providers
+                WHERE id = %s
+            """, (provider_id,))
+            existing = cur.fetchone()
+            if not existing:
+                db.close()
+                return jsonify({
+                    'success': False,
+                    'error': 'Insurance provider not found'
+                }), 404
+
+            old_insurance_name = existing[0]
+            new_insurance_name = data['insurance_name']
+
             cur.execute("""
                 UPDATE insurance_providers
                 SET insurance_name = %s,
@@ -2476,13 +2493,15 @@ def update_insurance_provider(provider_id: str):
                 provider_id
             ))
 
-            result = cur.fetchone()
-            if not result:
-                db.close()
-                return jsonify({
-                    'success': False,
-                    'error': 'Insurance provider not found'
-                }), 404
+            cur.fetchone()
+
+            # Keep IVR knowledge visible after provider renames.
+            if old_insurance_name != new_insurance_name:
+                cur.execute("""
+                    UPDATE ivr_knowledge
+                    SET insurance_name = %s
+                    WHERE insurance_name = %s
+                """, (new_insurance_name, old_insurance_name))
 
             db.conn.commit()
 

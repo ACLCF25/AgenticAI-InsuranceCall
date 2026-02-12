@@ -119,6 +119,13 @@ export interface APIResponse<T = any> {
   message?: string;
 }
 
+export interface StartCallResponse extends APIResponse {
+  call_id?: string;
+  request_id?: string | null;
+  provider?: string;
+  insurance?: string;
+}
+
 export interface DashboardStats {
   total_calls_today: number;
   active_calls: number;

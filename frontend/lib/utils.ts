@@ -46,32 +46,36 @@ export function formatPhoneNumber(phone?: string | null): string {
   return phone;
 }
 
+export function formatStatus(status: string): string {
+  return status.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+}
+
 export function getStatusColor(status: string): string {
   const colors: Record<string, string> = {
-    'initiated': 'bg-blue-100 text-blue-800',
-    'approved': 'bg-green-100 text-green-800',
-    'pending_review': 'bg-yellow-100 text-yellow-800',
-    'missing_documents': 'bg-orange-100 text-orange-800',
-    'denied': 'bg-red-100 text-red-800',
-    'office_closed': 'bg-gray-100 text-gray-800',
-    'failed': 'bg-red-100 text-red-800',
+    'initiated': 'bg-blue-500/15 text-blue-400 border border-blue-500/20',
+    'approved': 'bg-green-500/15 text-green-400 border border-green-500/20',
+    'pending_review': 'bg-yellow-500/15 text-yellow-400 border border-yellow-500/20',
+    'missing_documents': 'bg-orange-500/15 text-orange-400 border border-orange-500/20',
+    'denied': 'bg-red-500/15 text-red-400 border border-red-500/20',
+    'office_closed': 'bg-gray-500/15 text-gray-400 border border-gray-500/20',
+    'failed': 'bg-red-500/15 text-red-400 border border-red-500/20',
   };
-  
-  return colors[status] || 'bg-gray-100 text-gray-800';
+
+  return colors[status] || 'bg-gray-500/15 text-gray-400 border border-gray-500/20';
 }
 
 export function getCallStateColor(state: string): string {
   const colors: Record<string, string> = {
-    'initiating': 'bg-blue-100 text-blue-800',
-    'ivr_navigation': 'bg-purple-100 text-purple-800',
-    'on_hold': 'bg-yellow-100 text-yellow-800',
-    'speaking_with_human': 'bg-green-100 text-green-800',
-    'extracting_info': 'bg-indigo-100 text-indigo-800',
-    'completing': 'bg-teal-100 text-teal-800',
-    'failed': 'bg-red-100 text-red-800',
+    'initiating': 'bg-blue-500/15 text-blue-400 border border-blue-500/20',
+    'ivr_navigation': 'bg-purple-500/15 text-purple-400 border border-purple-500/20',
+    'on_hold': 'bg-yellow-500/15 text-yellow-400 border border-yellow-500/20',
+    'speaking_with_human': 'bg-green-500/15 text-green-400 border border-green-500/20',
+    'extracting_info': 'bg-indigo-500/15 text-indigo-400 border border-indigo-500/20',
+    'completing': 'bg-teal-500/15 text-teal-400 border border-teal-500/20',
+    'failed': 'bg-red-500/15 text-red-400 border border-red-500/20',
   };
-  
-  return colors[state] || 'bg-gray-100 text-gray-800';
+
+  return colors[state] || 'bg-gray-500/15 text-gray-400 border border-gray-500/20';
 }
 
 export function formatCurrency(amount: number): string {
