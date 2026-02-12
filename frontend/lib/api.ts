@@ -12,6 +12,7 @@ import type {
   InsuranceProvider,
   ScheduledFollowup,
   APIResponse,
+  StartCallResponse,
   DashboardStats,
 } from '@/types';
 
@@ -27,13 +28,9 @@ class APIClient {
       },
     });
 
-    // Add request interceptor for error handling
     this.client.interceptors.response.use(
       (response) => response,
-      (error) => {
-        console.error('API Error:', error.response?.data || error.message);
-        return Promise.reject(error);
-      }
+      (error) => Promise.reject(error)
     );
   }
 
@@ -44,7 +41,7 @@ class APIClient {
   }
 
   // Start a new credentialing call
-  async startCall(request: CredentialingRequest): Promise<APIResponse> {
+  async startCall(request: CredentialingRequest): Promise<StartCallResponse> {
     const { data } = await this.client.post('/start-call', request);
     return data;
   }
@@ -87,7 +84,8 @@ class APIClient {
 
   // Get IVR knowledge for an insurance provider
   async getIVRKnowledge(insuranceName: string): Promise<APIResponse<IVRKnowledge[]>> {
-    const { data } = await this.client.get(`/ivr-knowledge/${insuranceName}`);
+    const encodedInsuranceName = encodeURIComponent(insuranceName);
+    const { data } = await this.client.get(`/ivr-knowledge/${encodedInsuranceName}`);
     return data;
   }
 

@@ -40,7 +40,7 @@ const insuranceFormSchema = z.object({
   notes: z.string().optional(),
 })
 
-type InsuranceFormValues = z.infer<typeof insuranceFormSchema>
+type InsuranceFormValues = z.input<typeof insuranceFormSchema>
 
 interface AddInsuranceDialogProps {
   open: boolean
@@ -92,7 +92,7 @@ export function AddInsuranceDialog({ open, onOpenChange, editingProvider }: AddI
         insurance_name: values.insurance_name,
         phone_number: values.phone_number,
         department: values.department || undefined,
-        average_wait_time_minutes: values.average_wait_time_minutes || undefined,
+        average_wait_time_minutes: values.average_wait_time_minutes ? parseInt(values.average_wait_time_minutes, 10) : undefined,
         notes: values.notes || undefined,
       }
       return api.addInsuranceProvider(payload)
@@ -116,7 +116,7 @@ export function AddInsuranceDialog({ open, onOpenChange, editingProvider }: AddI
         insurance_name: values.insurance_name,
         phone_number: values.phone_number,
         department: values.department || undefined,
-        average_wait_time_minutes: values.average_wait_time_minutes || undefined,
+        average_wait_time_minutes: values.average_wait_time_minutes ? parseInt(values.average_wait_time_minutes, 10) : undefined,
         notes: values.notes || undefined,
       }
       return api.updateInsuranceProvider(editingProvider!.id!, payload)
@@ -124,6 +124,7 @@ export function AddInsuranceDialog({ open, onOpenChange, editingProvider }: AddI
     onSuccess: () => {
       toast.success('Insurance provider updated successfully')
       queryClient.invalidateQueries({ queryKey: ['insurance-providers'] })
+      queryClient.invalidateQueries({ queryKey: ['ivr-knowledge'] })
       onOpenChange(false)
       form.reset()
     },

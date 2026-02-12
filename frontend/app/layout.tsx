@@ -1,11 +1,11 @@
-// app/layout.tsx
 import type { Metadata } from 'next'
-import { Inter } from 'next/font/google'
+import { Manrope } from 'next/font/google'
 import './globals.css'
 import { Providers } from './providers'
 import { Toaster } from '@/components/ui/toaster'
+import { AppShell } from '@/components/layout/app-shell'
 
-const inter = Inter({ subsets: ['latin'] })
+const manrope = Manrope({ subsets: ['latin'] })
 
 export const metadata: Metadata = {
   title: 'Autonomous Credentialing Agent',
@@ -19,9 +19,11 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body className={inter.className}>
+      <body className={`${manrope.className} antialiased`}>
         <Providers>
-          {children}
+          <AppShell>
+            {children}
+          </AppShell>
           <Toaster />
         </Providers>
       </body>
