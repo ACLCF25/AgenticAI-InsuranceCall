@@ -951,7 +951,8 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
                 "ivr": "navigate_ivr",
                 "hold": "handle_hold",
                 "human": "converse_with_human",
-                "classify": "classify_audio"
+                "classify": "classify_audio",
+                "error": END,
             }
         )
         
@@ -972,7 +973,8 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
             self._check_conversation_complete,
             {
                 "continue": "classify_audio",
-                "complete": "extract_results"
+                "complete": "extract_results",
+                "error": END,
             }
         )
         
@@ -1017,16 +1019,25 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
     def _classify_audio(self, state: CredentialingState) -> CredentialingState:
         """Classify current audio"""
         if not state.get('transcript'):
+            state['retry_count'] = state.get('retry_count', 0) + 1
             state['current_audio_type'] = AudioType.SILENCE
+            max_empty_loops = int(os.getenv("AGENT_MAX_EMPTY_TRANSCRIPT_LOOPS", "25"))
+            if state['retry_count'] >= max_empty_loops:
+                state['error_message'] = (
+                    f'No transcript events after {state["retry_count"]} checks; '
+                    'stopping internal graph loop to prevent recursion.'
+                )
+                state['should_continue'] = False
             return state
         
         latest_transcript = state['transcript'][-1]['text']
         context = "\n".join([t['text'] for t in state['transcript'][-3:]])
         
         classification = self.audio_classifier.classify(latest_transcript, context)
-        
+
         state['current_audio_type'] = AudioType(classification['type'])
         state['confidence'] = classification['confidence']
+        state['retry_count'] = 0
         
         # Log event
         self.db.log_call_event(
@@ -1262,6 +1273,9 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
     
     def _route_by_audio_type(self, state: CredentialingState) -> str:
         """Route based on audio classification"""
+        if state.get('error_message') or not state.get('should_continue', True):
+            return "error"
+
         audio_type = state.get('current_audio_type', AudioType.UNKNOWN)
 
         if audio_type == AudioType.IVR_MENU:
@@ -1270,9 +1284,10 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
             return "hold"
         elif audio_type == AudioType.HUMAN_SPEECH:
             return "human"
+        elif audio_type == AudioType.SILENCE:
+            return "classify"
         else:
-            # Default to human to prevent infinite loop when audio type is unknown
-            return "human"
+            return "classify"
     
     def _check_continue(self, state: CredentialingState) -> str:
         """Check if should continue or complete"""
@@ -1286,6 +1301,8 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
     
     def _check_conversation_complete(self, state: CredentialingState) -> str:
         """Check if conversation is complete"""
+        if state.get('error_message'):
+            return "error"
         if not state.get('should_continue', True):
             return "complete"
         return "continue"
