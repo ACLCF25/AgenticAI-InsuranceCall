@@ -3,6 +3,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ThemeProvider } from 'next-themes'
 import { useState } from 'react'
+import { AuthProvider } from '@/lib/auth-context'
 
 // Suppress React 19 ref warnings from Radix UI components
 if (typeof window !== 'undefined') {
@@ -38,7 +39,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
       themes={['dark', 'light']}
     >
       <QueryClientProvider client={queryClient}>
-        {children}
+        <AuthProvider>
+          {children}
+        </AuthProvider>
       </QueryClientProvider>
     </ThemeProvider>
   )

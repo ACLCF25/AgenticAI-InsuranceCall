@@ -12,6 +12,7 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { useAuth } from '@/lib/auth-context'
 
 interface NavItem {
   href: string
@@ -19,7 +20,7 @@ interface NavItem {
   icon: LucideIcon
 }
 
-const navItems: NavItem[] = [
+const adminNavItems: NavItem[] = [
   { href: '/', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/calls', label: 'Calls', icon: Phone },
   { href: '/insurance', label: 'Insurance', icon: Building2 },
@@ -27,8 +28,14 @@ const navItems: NavItem[] = [
   { href: '/settings', label: 'Settings', icon: Settings },
 ]
 
+const userNavItems: NavItem[] = [
+  { href: '/calls/new', label: 'New Call', icon: Phone },
+]
+
 export function SidebarNav() {
   const pathname = usePathname()
+  const { user } = useAuth()
+  const navItems = user?.role === 'admin' ? adminNavItems : userNavItems
 
   const isActive = (href: string) => {
     if (href === '/') return pathname === '/'

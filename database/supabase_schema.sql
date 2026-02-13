@@ -283,3 +283,37 @@ CREATE TRIGGER trigger_audit_credentialing_requests
 AFTER INSERT OR UPDATE OR DELETE ON credentialing_requests
 FOR EACH ROW
 EXECUTE FUNCTION log_audit_event();
+
+-- =============================================================================
+-- Authentication Tables
+-- =============================================================================
+
+CREATE TYPE user_role AS ENUM ('admin', 'user');
+
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    username VARCHAR(50) NOT NULL UNIQUE,
+    email VARCHAR(255) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    role user_role NOT NULL DEFAULT 'user',
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT NOW(),
+    last_login TIMESTAMP
+);
+
+CREATE INDEX idx_users_username ON users(username);
+CREATE INDEX idx_users_email ON users(email);
+
+-- Token blacklist for logout/revocation
+CREATE TABLE token_blacklist (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    jti VARCHAR(36) NOT NULL UNIQUE,
+    expires_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_token_blacklist_jti ON token_blacklist(jti);
+CREATE INDEX idx_token_blacklist_expires ON token_blacklist(expires_at);
+
+GRANT ALL ON users TO authenticated;
+GRANT ALL ON token_blacklist TO authenticated;

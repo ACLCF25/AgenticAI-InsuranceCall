@@ -3,7 +3,6 @@ import { Manrope } from 'next/font/google'
 import './globals.css'
 import { Providers } from './providers'
 import { Toaster } from '@/components/ui/toaster'
-import { AppShell } from '@/components/layout/app-shell'
 
 const manrope = Manrope({ subsets: ['latin'] })
 
@@ -21,9 +20,7 @@ export default function RootLayout({
     <html lang="en" suppressHydrationWarning>
       <body className={`${manrope.className} antialiased`}>
         <Providers>
-          <AppShell>
-            {children}
-          </AppShell>
+          {children}
           <Toaster />
         </Providers>
       </body>
