@@ -1,7 +1,7 @@
 // lib/api.ts
 // API client for communicating with the Python backend
 
-import axios, { AxiosInstance } from 'axios';
+import axios, { AxiosInstance, InternalAxiosRequestConfig } from 'axios';
 import type {
   CredentialingRequest,
   CallStatus,
@@ -28,10 +28,65 @@ class APIClient {
       },
     });
 
+    // Synchronously seed the auth token from localStorage so the header is
+    // present on the very first React Query request (before any useEffect runs).
+    if (typeof window !== 'undefined') {
+      const token = localStorage.getItem('auth_token')
+      if (token) {
+        this.client.defaults.headers.common['Authorization'] = `Bearer ${token}`
+      }
+    }
+
+    // Response interceptor – attempt token refresh on 401 (expired token)
     this.client.interceptors.response.use(
       (response) => response,
-      (error) => Promise.reject(error)
-    );
+      async (error) => {
+        const original = error.config as InternalAxiosRequestConfig & { _retry?: boolean }
+        const status = error.response?.status
+        const jwtErrorMessage = String(error.response?.data?.msg || '').toLowerCase()
+        const isJwt422 =
+          status === 422 &&
+          (jwtErrorMessage.includes('token') ||
+            jwtErrorMessage.includes('subject') ||
+            jwtErrorMessage.includes('jwt'))
+
+        if ((status === 401 || isJwt422) && !original._retry) {
+          original._retry = true
+          try {
+            const refreshToken = typeof window !== 'undefined'
+              ? localStorage.getItem('auth_refresh_token')
+              : null
+            if (!refreshToken) throw new Error('No refresh token')
+            const res = await axios.post(
+              `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/api'}/auth/refresh`,
+              {},
+              { headers: { Authorization: `Bearer ${refreshToken}` } }
+            )
+            const newToken = res.data.access_token
+            this.setAuthToken(newToken)
+            return this.client(original)
+          } catch {
+            // Refresh failed – clear auth state and redirect to login
+            if (typeof window !== 'undefined') {
+              localStorage.removeItem('auth_token')
+              localStorage.removeItem('auth_refresh_token')
+              localStorage.removeItem('auth_user')
+              window.location.href = '/login'
+            }
+          }
+        }
+        return Promise.reject(error)
+      }
+    )
+  }
+
+  // Set (or clear) the Authorization header on all future requests
+  setAuthToken(token: string | null) {
+    if (token) {
+      this.client.defaults.headers.common['Authorization'] = `Bearer ${token}`
+    } else {
+      delete this.client.defaults.headers.common['Authorization']
+    }
   }
 
   // Health check

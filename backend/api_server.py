@@ -13,11 +13,12 @@ load_dotenv()
 import asyncio
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
+from flask_jwt_extended import JWTManager, jwt_required
 from twilio.twiml.voice_response import VoiceResponse, Stream, Connect
 from twilio.rest import Client as TwilioClient
 import threading
@@ -48,8 +49,23 @@ ENABLE_ELEVENLABS_TTS = os.getenv("ENABLE_ELEVENLABS_TTS", "true").lower() == "t
 CHECK_CALLBACK_REACHABLE = os.getenv("CHECK_CALLBACK_REACHABLE", "false").lower() == "true"
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)  # Enable CORS for all routes (Bearer token auth doesn't require restricted origins)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+# JWT Configuration
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", os.getenv("SECRET_KEY", "change-me-in-production"))
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)
+app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=30)
+
+jwt_manager = JWTManager(app)
+
+from auth import auth_bp, check_token_blacklist, admin_required  # noqa: E402
+
+@jwt_manager.token_in_blocklist_loader
+def check_blocklist(jwt_header, jwt_payload):
+    return check_token_blacklist(jwt_payload)
+
+app.register_blueprint(auth_bp)
 
 # Global state management
 active_calls: Dict[str, CredentialingAgent] = {}
@@ -511,6 +527,7 @@ def serve_audio(filename):
 
 
 @app.route('/api/start-call', methods=['POST'])
+@jwt_required()
 def start_credentialing_call():
     """
     API endpoint to start a new credentialing call
@@ -1853,6 +1870,7 @@ def transcription_webhook():
 
 
 @app.route('/api/call-status/<call_id>', methods=['GET'])
+@admin_required
 def get_call_status(call_id: str):
     """
     Get current status of a call
@@ -1879,6 +1897,7 @@ def get_call_status(call_id: str):
 
 
 @app.route('/api/call-transcript/<call_id>', methods=['GET'])
+@admin_required
 def get_call_transcript(call_id: str):
     """
     Get full conversation transcript
@@ -1900,6 +1919,7 @@ def get_call_transcript(call_id: str):
 
 
 @app.route('/api/call-detail/<call_id>', methods=['GET'])
+@admin_required
 def get_call_detail(call_id: str):
     """
     Get full call details from the database (persists across server restarts).
@@ -2007,6 +2027,7 @@ def get_call_detail(call_id: str):
 
 
 @app.route('/api/metrics', methods=['GET'])
+@admin_required
 def get_metrics():
     """
     Get system metrics
@@ -2065,6 +2086,7 @@ def health_check():
 
 
 @app.route('/api/ivr-knowledge', methods=['POST'])
+@admin_required
 def add_ivr_knowledge():
     """
     Add new IVR knowledge
@@ -2116,6 +2138,7 @@ def add_ivr_knowledge():
 
 
 @app.route('/api/calls', methods=['GET'])
+@admin_required
 def get_recent_calls():
     """
     Get recent credentialing calls
@@ -2172,6 +2195,7 @@ def get_recent_calls():
 
 
 @app.route('/api/dashboard-stats', methods=['GET'])
+@admin_required
 def get_dashboard_stats():
     """
     Get dashboard statistics
@@ -2227,6 +2251,7 @@ def get_dashboard_stats():
 
 
 @app.route('/api/knowledge/search', methods=['GET'])
+@admin_required
 def knowledge_search():
     """Search prior call knowledge stored in pgvector."""
     insurance = request.args.get('insurance')
@@ -2252,6 +2277,7 @@ def knowledge_search():
 
 
 @app.route('/api/scheduled-followups', methods=['GET'])
+@admin_required
 def get_scheduled_followups():
     """
     Get all pending follow-ups
@@ -2298,6 +2324,7 @@ def get_scheduled_followups():
 
 
 @app.route('/api/followup/<followup_id>/execute', methods=['POST'])
+@admin_required
 def execute_followup(followup_id: str):
     """
     Execute a scheduled follow-up
@@ -2346,6 +2373,7 @@ def execute_followup(followup_id: str):
 
 
 @app.route('/api/call/<call_id>/cancel', methods=['POST'])
+@admin_required
 def cancel_call(call_id: str):
     """
     Cancel an active call
@@ -2380,6 +2408,7 @@ def cancel_call(call_id: str):
 
 
 @app.route('/api/ivr-knowledge/<insurance_name>', methods=['GET'])
+@admin_required
 def get_ivr_knowledge(insurance_name: str):
     """
     Get IVR knowledge for a specific insurance provider
@@ -2432,6 +2461,7 @@ def get_ivr_knowledge(insurance_name: str):
 # ============================================================================
 
 @app.route('/api/insurance-providers', methods=['GET'])
+@admin_required
 def get_insurance_providers():
     """
     Get all insurance providers
@@ -2484,6 +2514,7 @@ def get_insurance_providers():
 
 
 @app.route('/api/insurance-providers', methods=['POST'])
+@admin_required
 def add_insurance_provider():
     """
     Add a new insurance provider
@@ -2546,6 +2577,7 @@ def add_insurance_provider():
 
 
 @app.route('/api/insurance-providers/<provider_id>', methods=['PUT'])
+@admin_required
 def update_insurance_provider(provider_id: str):
     """
     Update an existing insurance provider
@@ -2633,6 +2665,7 @@ def update_insurance_provider(provider_id: str):
 
 
 @app.route('/api/insurance-providers/<provider_id>', methods=['DELETE'])
+@admin_required
 def delete_insurance_provider(provider_id: str):
     """
     Delete an insurance provider
@@ -2684,6 +2717,7 @@ def delete_insurance_provider(provider_id: str):
 
 
 @app.route('/api/ivr-knowledge/<ivr_id>', methods=['DELETE'])
+@admin_required
 def delete_ivr_knowledge(ivr_id: str):
     """
     Delete an IVR knowledge entry
@@ -2726,6 +2760,7 @@ def delete_ivr_knowledge(ivr_id: str):
 
 
 @app.route('/api/ivr-knowledge/<ivr_id>', methods=['PUT'])
+@admin_required
 def update_ivr_knowledge(ivr_id: str):
     """
     Update an IVR knowledge entry
@@ -2784,6 +2819,7 @@ def update_ivr_knowledge(ivr_id: str):
 # ============================================================================
 
 @app.route('/api/call-metrics/<call_id>', methods=['GET'])
+@admin_required
 def get_call_metrics_endpoint(call_id: str):
     """Get call metrics for a specific call."""
     try:
@@ -2809,6 +2845,7 @@ def get_call_metrics_endpoint(call_id: str):
 
 
 @app.route('/api/call-metrics', methods=['GET'])
+@admin_required
 def get_all_call_metrics():
     """Get call metrics with optional filtering."""
     try:
@@ -2843,6 +2880,7 @@ def get_all_call_metrics():
 # ============================================================================
 
 @app.route('/api/config', methods=['GET'])
+@admin_required
 def get_all_config():
     """Get all system configuration values."""
     try:
@@ -2864,6 +2902,7 @@ def get_all_config():
 
 
 @app.route('/api/config/<config_key>', methods=['GET'])
+@admin_required
 def get_config_value(config_key: str):
     """Get a specific configuration value."""
     try:
@@ -2882,6 +2921,7 @@ def get_config_value(config_key: str):
 
 
 @app.route('/api/config/<config_key>', methods=['PUT'])
+@admin_required
 def update_config_value(config_key: str):
     """Update a configuration value."""
     try:
@@ -2906,6 +2946,7 @@ def update_config_value(config_key: str):
 
 
 @app.route('/api/config/<config_key>', methods=['DELETE'])
+@admin_required
 def delete_config_value(config_key: str):
     """Delete a configuration value."""
     try:
@@ -2929,6 +2970,7 @@ def delete_config_value(config_key: str):
 # ============================================================================
 
 @app.route('/api/audit-logs', methods=['GET'])
+@admin_required
 def get_audit_logs_endpoint():
     """
     Get audit logs with filtering and pagination.
@@ -2998,6 +3040,7 @@ def get_audit_logs_endpoint():
 
 
 @app.route('/api/audit-logs', methods=['POST'])
+@admin_required
 def create_audit_log():
     """
     Manually create an audit log entry.

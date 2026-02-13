@@ -1,8 +1,13 @@
+'use client'
+
 import { Bot } from 'lucide-react'
 import { SidebarNav } from './sidebar-nav'
 import { ThemeSwitcher } from './theme-switcher'
+import { useAuth } from '@/lib/auth-context'
 
 export function Sidebar() {
+  const { user } = useAuth()
+
   return (
     <aside className="hidden md:fixed md:inset-y-4 md:left-4 md:z-40 md:flex md:w-[220px] md:flex-col rounded-2xl border border-sidebar-border bg-sidebar/95 backdrop-blur">
       <div className="flex items-center gap-3 border-b border-sidebar-border px-5 py-4">
@@ -21,7 +26,10 @@ export function Sidebar() {
 
       <div className="border-t border-sidebar-border px-4 py-3">
         <div className="flex items-center justify-between">
-          <span className="text-[11px] uppercase tracking-[0.08em] text-muted-foreground">v1.0.0</span>
+          <div className="flex flex-col">
+            <span className="text-xs font-medium">{user?.username}</span>
+            <span className="text-[11px] capitalize text-muted-foreground">{user?.role}</span>
+          </div>
           <ThemeSwitcher />
         </div>
       </div>
