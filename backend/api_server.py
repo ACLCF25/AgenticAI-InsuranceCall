@@ -715,6 +715,24 @@ def voice_webhook():
                     from credentialing_agent import DatabaseManager
                     db = DatabaseManager()
                     ivr_patterns = db.get_ivr_knowledge(insurance_name)
+
+                    # Load IVR auto-response flags (NPI/Tax ID)
+                    with db.conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT ivr_asks_npi, ivr_npi_method, ivr_asks_tax_id, ivr_tax_id_method, ivr_tax_id_digits_to_send
+                            FROM insurance_providers
+                            WHERE insurance_name ILIKE %s
+                            LIMIT 1
+                        """, (f"%{insurance_name}%",))
+                        provider_row = cur.fetchone()
+                        if provider_row and call_info:
+                            call_info['state']['ivr_asks_npi'] = provider_row[0] or False
+                            call_info['state']['ivr_npi_method'] = provider_row[1] or 'speech'
+                            call_info['state']['ivr_asks_tax_id'] = provider_row[2] or False
+                            call_info['state']['ivr_tax_id_method'] = provider_row[3] or 'speech'
+                            call_info['state']['ivr_tax_id_digits_to_send'] = provider_row[4]
+                            print(f"📋 IVR flags - NPI: {provider_row[0]} ({provider_row[1]}), Tax ID: {provider_row[2]} ({provider_row[3]}), Tax Digits: {provider_row[4]}")
+
                     db.close()
                     print(f"🎯 Found {len(ivr_patterns)} IVR patterns for {insurance_name}")
                 except Exception as e:
@@ -883,6 +901,71 @@ def ivr_navigate_webhook():
             if speech_lower:
                 print(f"🔍 Analyzing speech: '{speech_lower[:100]}...'")
                 print(f"📊 Current menu level: {current_level}, Available patterns: {len(ivr_patterns)}")
+
+            # ── NPI / Tax ID auto-response ──────────────────────────────────
+            # If the insurance provider is flagged as asking for NPI or Tax ID
+            # during IVR navigation, detect the request and respond automatically.
+            ivr_asks_npi = state.get('ivr_asks_npi', False)
+            ivr_asks_tax_id = state.get('ivr_asks_tax_id', False)
+
+            if ivr_asks_npi or ivr_asks_tax_id:
+                npi_keywords = ['npi', 'national provider', 'provider number', 'provider identification']
+                tax_keywords = ['tax id', 'tax identification', 'ein', 'employer identification',
+                                'federal tax', 'tax number', 'taxpayer']
+
+                npi_detected = ivr_asks_npi and any(kw in speech_lower for kw in npi_keywords)
+                tax_detected = ivr_asks_tax_id and any(kw in speech_lower for kw in tax_keywords)
+
+                if npi_detected or tax_detected:
+                    print(f"📋 IVR requesting credentials - NPI: {npi_detected}, Tax ID: {tax_detected}")
+
+                    # Pause 2 seconds before responding
+                    response.pause(length=2)
+
+                    if npi_detected and state.get('npi'):
+                        method = state.get('ivr_npi_method', 'speech')
+                        if method == 'dtmf':
+                            response.play(digits=state['npi'])
+                            print(f"🔢 Sent NPI via DTMF: {state['npi']}")
+                        else:
+                            npi_spoken = format_npi_for_speech(state['npi'])
+                            speak_with_tts(response, npi_spoken)
+                            print(f"🔢 Spoke NPI: {npi_spoken}")
+
+                    if tax_detected and state.get('tax_id'):
+                        method = state.get('ivr_tax_id_method', 'speech')
+                        clean_tax = re.sub(r'\D', '', state['tax_id'])
+                        digits_to_send = state.get('ivr_tax_id_digits_to_send')
+                        selected_tax = clean_tax
+
+                        if isinstance(digits_to_send, int):
+                            if 1 <= digits_to_send <= len(clean_tax):
+                                selected_tax = clean_tax[-digits_to_send:]
+                            else:
+                                print(f"⚠️ Invalid ivr_tax_id_digits_to_send={digits_to_send}; falling back to full Tax ID")
+
+                        if method == 'dtmf':
+                            response.play(digits=selected_tax)
+                            print(f"🔢 Sent Tax ID via DTMF: {selected_tax}")
+                        else:
+                            tax_spoken = '. '.join(list(selected_tax)) + '.'
+                            speak_with_tts(response, tax_spoken)
+                            print(f"🔢 Spoke Tax ID: {tax_spoken}")
+
+                    # Continue listening for more IVR prompts
+                    response.pause(length=2)
+                    gather = Gather(
+                        input='speech dtmf',
+                        action=f'{callback_base}/webhook/ivr-navigate',
+                        method='POST',
+                        speech_timeout='3',
+                        timeout=30,
+                        language='en-US'
+                    )
+                    response.append(gather)
+                    response.redirect(f'{callback_base}/webhook/voice/human')
+                    return Response(str(response), mimetype='text/xml')
+            # ── End NPI / Tax ID auto-response ──────────────────────────────
 
             for pattern in ivr_patterns:
                 pattern_level = pattern['menu_level']
@@ -1827,6 +1910,13 @@ def get_call_detail(call_id: str):
         from psycopg2.extras import RealDictCursor
 
         db = DatabaseManager()
+        lookup_id = call_id
+
+        # If frontend passed runtime call_id, map it to request_id when available.
+        if call_id in call_states:
+            mapped_request_id = call_states[call_id].get('db_request_id')
+            if mapped_request_id:
+                lookup_id = mapped_request_id
 
         # Fetch credentialing request
         with db.conn.cursor() as cur:
@@ -1837,7 +1927,7 @@ def get_call_detail(call_id: str):
                        created_at, updated_at, completed_at
                 FROM credentialing_requests
                 WHERE id = %s
-            """, (call_id,))
+            """, (lookup_id,))
             row = cur.fetchone()
 
         if not row:
@@ -1870,7 +1960,7 @@ def get_call_detail(call_id: str):
                 FROM conversation_history
                 WHERE call_id = %s OR request_id = %s
                 ORDER BY timestamp ASC
-            """, (call_id, call_id))
+            """, (lookup_id, lookup_id))
             conversations = []
             for r in cur.fetchall():
                 conversations.append({
@@ -1886,7 +1976,7 @@ def get_call_detail(call_id: str):
                 FROM call_events
                 WHERE call_id = %s
                 ORDER BY timestamp ASC
-            """, (call_id,))
+            """, (lookup_id,))
             events = []
             for r in cur.fetchall():
                 events.append({
@@ -2354,7 +2444,8 @@ def get_insurance_providers():
         with db.conn.cursor() as cur:
             cur.execute("""
                 SELECT id, insurance_name, phone_number, department,
-                       best_call_times, average_wait_time_minutes, notes, last_updated
+                       best_call_times, average_wait_time_minutes, notes, last_updated,
+                       ivr_asks_npi, ivr_npi_method, ivr_asks_tax_id, ivr_tax_id_method, ivr_tax_id_digits_to_send
                 FROM insurance_providers
                 ORDER BY insurance_name ASC
             """)
@@ -2369,7 +2460,12 @@ def get_insurance_providers():
                     'best_call_times': row[4],
                     'average_wait_time_minutes': row[5],
                     'notes': row[6],
-                    'last_updated': row[7].isoformat() if row[7] else None
+                    'last_updated': row[7].isoformat() if row[7] else None,
+                    'ivr_asks_npi': row[8] or False,
+                    'ivr_npi_method': row[9] or 'speech',
+                    'ivr_asks_tax_id': row[10] or False,
+                    'ivr_tax_id_method': row[11] or 'speech',
+                    'ivr_tax_id_digits_to_send': row[12],
                 })
 
         db.close()
@@ -2412,8 +2508,9 @@ def add_insurance_provider():
             cur.execute("""
                 INSERT INTO insurance_providers
                 (insurance_name, phone_number, department, best_call_times,
-                 average_wait_time_minutes, notes)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                 average_wait_time_minutes, notes,
+                 ivr_asks_npi, ivr_npi_method, ivr_asks_tax_id, ivr_tax_id_method, ivr_tax_id_digits_to_send)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 data['insurance_name'],
@@ -2421,7 +2518,12 @@ def add_insurance_provider():
                 data.get('department'),
                 json.dumps(data.get('best_call_times')) if data.get('best_call_times') else None,
                 data.get('average_wait_time_minutes'),
-                data.get('notes')
+                data.get('notes'),
+                data.get('ivr_asks_npi', False),
+                data.get('ivr_npi_method', 'speech'),
+                data.get('ivr_asks_tax_id', False),
+                data.get('ivr_tax_id_method', 'speech'),
+                data.get('ivr_tax_id_digits_to_send'),
             ))
 
             provider_id = cur.fetchone()[0]
@@ -2480,6 +2582,11 @@ def update_insurance_provider(provider_id: str):
                     best_call_times = %s,
                     average_wait_time_minutes = %s,
                     notes = %s,
+                    ivr_asks_npi = %s,
+                    ivr_npi_method = %s,
+                    ivr_asks_tax_id = %s,
+                    ivr_tax_id_method = %s,
+                    ivr_tax_id_digits_to_send = %s,
                     last_updated = NOW()
                 WHERE id = %s
                 RETURNING id
@@ -2490,6 +2597,11 @@ def update_insurance_provider(provider_id: str):
                 json.dumps(data.get('best_call_times')) if data.get('best_call_times') else None,
                 data.get('average_wait_time_minutes'),
                 data.get('notes'),
+                data.get('ivr_asks_npi', False),
+                data.get('ivr_npi_method', 'speech'),
+                data.get('ivr_asks_tax_id', False),
+                data.get('ivr_tax_id_method', 'speech'),
+                data.get('ivr_tax_id_digits_to_send'),
                 provider_id
             ))
 

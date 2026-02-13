@@ -98,6 +98,11 @@ export interface InsuranceProvider {
     hours: number[];
   };
   average_wait_time_minutes?: number;
+  ivr_asks_npi?: boolean;
+  ivr_npi_method?: 'speech' | 'dtmf';
+  ivr_asks_tax_id?: boolean;
+  ivr_tax_id_method?: 'speech' | 'dtmf';
+  ivr_tax_id_digits_to_send?: number;
   notes?: string;
   last_updated?: string;
 }

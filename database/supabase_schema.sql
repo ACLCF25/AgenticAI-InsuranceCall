@@ -121,9 +121,22 @@ CREATE TABLE insurance_providers (
     average_wait_time_minutes INTEGER,
     typical_hold_music TEXT,
     notes TEXT,
+    ivr_asks_npi BOOLEAN DEFAULT FALSE,
+    ivr_npi_method VARCHAR(10) DEFAULT 'speech',  -- 'speech' or 'dtmf'
+    ivr_asks_tax_id BOOLEAN DEFAULT FALSE,
+    ivr_tax_id_method VARCHAR(10) DEFAULT 'speech',  -- 'speech' or 'dtmf'
+    ivr_tax_id_digits_to_send INTEGER,
+    CONSTRAINT chk_ivr_tax_id_digits_to_send
+        CHECK (ivr_tax_id_digits_to_send IS NULL OR ivr_tax_id_digits_to_send BETWEEN 1 AND 9),
     last_updated TIMESTAMP DEFAULT NOW(),
     INDEX idx_insurance_name (insurance_name)
 );
+
+-- Existing environments migration notes:
+-- ALTER TABLE insurance_providers ADD COLUMN IF NOT EXISTS ivr_tax_id_digits_to_send INTEGER;
+-- ALTER TABLE insurance_providers
+--   ADD CONSTRAINT chk_ivr_tax_id_digits_to_send
+--   CHECK (ivr_tax_id_digits_to_send IS NULL OR ivr_tax_id_digits_to_send BETWEEN 1 AND 9);
 
 -- System Configuration Table
 CREATE TABLE system_config (

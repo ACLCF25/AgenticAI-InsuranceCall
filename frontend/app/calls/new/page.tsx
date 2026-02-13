@@ -36,6 +36,10 @@ export default function NewCallPage() {
             isActive
             onCancel={() => router.push('/calls')}
             onSuccess={(response) => {
+              if (response.request_id) {
+                router.push(`/calls/${response.request_id}`)
+                return
+              }
               if (response.call_id) {
                 router.push(`/calls/${response.call_id}`)
                 return
