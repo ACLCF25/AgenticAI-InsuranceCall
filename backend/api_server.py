@@ -1281,7 +1281,7 @@ def wait_for_human_webhook():
             # Fallback: Too many attempts without clear indicators
             print(f"⏰ Maximum attempts exceeded ({state['wait_attempts']} attempts, {wait_duration_minutes:.1f} min)")
             state['call_state'] = CallState.FAILED
-            state['failure_reason'] = f'Timeout after {state['wait_attempts']} attempts'
+            state['failure_reason'] = f"Timeout after {state['wait_attempts']} attempts"
             speak_with_tts(response, "I've been unable to reach a representative. I'll try calling back later. Goodbye.")
             response.hangup()
 
