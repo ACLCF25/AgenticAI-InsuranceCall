@@ -1,0 +1,27 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Environment / secrets - NEVER bake into image
+.env
+.env.*
+!.env.example
+
+# Logs and temp files
+logs/
+temp_audio/
+exports/
+*.log
+
+# Git
+.git/
+.gitignore
+
+# Dev tools
+.pytest_cache/
+.mypy_cache/
