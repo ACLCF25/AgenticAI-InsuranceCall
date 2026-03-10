@@ -179,6 +179,11 @@ export interface CallDetail {
   completed_at?: string;
   conversation: ConversationMessage[];
   events: CallDetailEvent[];
+  recording?: {
+    available: boolean;
+    url: string;
+    duration?: number;
+  };
 }
 
 export interface LangSmithTrace {
