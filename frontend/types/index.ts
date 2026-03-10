@@ -184,6 +184,7 @@ export interface CallDetail {
     url: string;
     duration?: number;
   };
+  qa_pairs?: any[];
 }
 
 export interface LangSmithTrace {
