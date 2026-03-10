@@ -183,6 +183,76 @@ export default function CallDetailPage() {
             </CardContent>
           </Card>
 
+          {call.recording?.available && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-lg flex items-center gap-2">
+                  <Phone className="h-4 w-4" />
+                  Call Recording
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <audio
+                  controls
+                  className="w-full"
+                  src={`${process.env.NEXT_PUBLIC_API_URL}${call.recording.url}`}
+                  preload="metadata"
+                >
+                  Your browser does not support audio playback.
+                </audio>
+                <p className="text-xs text-muted-foreground mt-2">
+                  Duration: {Math.floor((call.recording.duration || 0) / 60)}:
+                  {((call.recording.duration || 0) % 60).toString().padStart(2, '0')}
+                </p>
+              </CardContent>
+            </Card>
+          )}
+
+          {call.qa_pairs && call.qa_pairs.length > 0 && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-lg flex items-center gap-2">
+                  <MessageSquare className="h-4 w-4" />
+                  Questions & Answers
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                {call.qa_pairs.map((qa: any) => (
+                  <div key={qa.id} className="border-l-2 border-primary/30 pl-4">
+                    <div className="flex items-start gap-2 mb-2">
+                      <span className="flex-shrink-0 w-6 h-6 rounded-full bg-primary/15 text-primary text-xs flex items-center justify-center font-medium">
+                        {qa.question_index + 1}
+                      </span>
+                      <div className="flex-1">
+                        <p className="text-sm font-medium">{qa.question_text}</p>
+                      </div>
+                    </div>
+                    {qa.answer_text ? (
+                      <div className="ml-8 mt-2">
+                        <p className="text-sm text-muted-foreground bg-muted/50 p-3 rounded-md">
+                          {qa.answer_text}
+                        </p>
+                        <div className="flex items-center gap-2 mt-2">
+                          <div className="h-1.5 w-full bg-muted rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-green-500"
+                              style={{ width: `${qa.confidence * 100}%` }}
+                            />
+                          </div>
+                          <span className="text-xs text-muted-foreground whitespace-nowrap">
+                            {Math.round(qa.confidence * 100)}%
+                          </span>
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="ml-8 text-sm text-yellow-600">Not answered</p>
+                    )}
+                  </div>
+                ))}
+              </CardContent>
+            </Card>
+          )}
+
           {call.missing_documents && call.missing_documents.length > 0 && (
             <Card className="border-yellow-500/30">
               <CardHeader>
@@ -218,7 +288,14 @@ export default function CallDetailPage() {
               {call.conversation && call.conversation.length > 0 ? (
                 <div className="space-y-3">
                   {call.conversation.map(
-                    (msg: { speaker: string; message: string; timestamp?: string }, i: number) => (
+                    (msg: {
+                      speaker: string
+                      message: string
+                      timestamp?: string
+                      is_question?: boolean
+                      is_answer?: boolean
+                      related_qa_id?: string
+                    }, i: number) => (
                       <div
                         key={i}
                         className={`flex gap-3 ${
@@ -230,9 +307,13 @@ export default function CallDetailPage() {
                             msg.speaker === 'agent'
                               ? 'bg-primary text-primary-foreground'
                               : 'bg-muted'
+                          } ${
+                            msg.is_question || msg.is_answer
+                              ? 'ring-2 ring-yellow-400/50'
+                              : ''
                           }`}
                         >
-                          <div className="flex items-center gap-2 mb-1">
+                          <div className="flex items-center gap-2 mb-1 flex-wrap">
                             <span className="text-xs font-medium opacity-80">
                               {msg.speaker === 'agent' ? 'AI Agent' : 'Representative'}
                             </span>
@@ -240,6 +321,16 @@ export default function CallDetailPage() {
                               <span className="text-xs opacity-60">
                                 {formatRelativeTime(msg.timestamp)}
                               </span>
+                            )}
+                            {msg.is_question && (
+                              <Badge variant="outline" className="text-xs h-5">
+                                Q
+                              </Badge>
+                            )}
+                            {msg.is_answer && (
+                              <Badge variant="outline" className="text-xs h-5">
+                                A
+                              </Badge>
                             )}
                           </div>
                           <p className="text-sm">{msg.message}</p>

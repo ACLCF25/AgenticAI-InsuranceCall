@@ -218,12 +218,11 @@ def generate_elevenlabs_audio_url(text: str) -> Optional[str]:
         return None
 
     try:
-        # Generate audio stream
-        audio_stream = elevenlabs_client.generate(
+        # Generate audio using the text_to_speech API
+        audio_generator = elevenlabs_client.text_to_speech.convert(
+            voice_id=ELEVENLABS_VOICE_ID,
             text=text,
-            voice=ELEVENLABS_VOICE_ID,
-            model="eleven_turbo_v2",
-            stream=True
+            model_id="eleven_turbo_v2",
         )
 
         # Save to temp file
@@ -234,8 +233,9 @@ def generate_elevenlabs_audio_url(text: str) -> Optional[str]:
         filepath = os.path.join(temp_dir, filename)
 
         with open(filepath, 'wb') as f:
-            for chunk in audio_stream:
-                f.write(chunk)
+            for chunk in audio_generator:
+                if chunk:
+                    f.write(chunk)
 
         # Return URL (needs to be publicly accessible)
         audio_url = f"{BASE_URL}/audio/{filename}"
@@ -774,15 +774,11 @@ def voice_webhook():
                 input='speech dtmf',
                 action=f'{callback_base}/webhook/ivr-navigate',
                 method='POST',
-                speech_timeout='3',
-                timeout=30,  # Increased to 30 seconds for long IVR greetings
+                speech_timeout='2',
+                timeout=30,
                 language='en-US'
             )
-            # Don't say anything - just listen to IVR prompts
             response.append(gather)
-
-            # If no IVR detected, proceed with regular conversation
-            response.redirect(f'{callback_base}/webhook/voice/human')
         else:
             # No IVR patterns - go straight to human conversation
             print(f"📞 Direct Human Mode - No IVR patterns configured")
@@ -970,12 +966,12 @@ def ivr_navigate_webhook():
                             print(f"🔢 Spoke Tax ID: {tax_spoken}")
 
                     # Continue listening for more IVR prompts
-                    response.pause(length=2)
+                    response.pause(length=1)
                     gather = Gather(
                         input='speech dtmf',
                         action=f'{callback_base}/webhook/ivr-navigate',
                         method='POST',
-                        speech_timeout='3',
+                        speech_timeout='2',
                         timeout=30,
                         language='en-US'
                     )
@@ -996,8 +992,9 @@ def ivr_navigate_webhook():
 
             # If no exact match, try flexible matching for common IVR menu patterns
             if not matched_pattern and speech_lower:
-                # Look for patterns at the next level only
-                next_level_patterns = [p for p in ivr_patterns if p['menu_level'] == current_level + 1]
+                # Check all remaining patterns at or above current level (not just next level)
+                # so same-level patterns aren't skipped when current_level starts at 0.
+                next_level_patterns = [p for p in ivr_patterns if p['menu_level'] >= current_level]
 
                 for pattern in next_level_patterns:
                     action_value = pattern.get('action_value', '')
@@ -1011,6 +1008,11 @@ def ivr_navigate_webhook():
                         matched_pattern = pattern
                         print(f"✅ Flexible match: detected option/dial {action_value} at level {pattern['menu_level']}")
                         break
+                    # Try "say provider" or "say credentialing" (speech-based IVR prompts)
+                    elif action_value and f"say {action_value}" in speech_lower:
+                        matched_pattern = pattern
+                        print(f"✅ Flexible match: detected 'say {action_value}' at level {pattern['menu_level']}")
+                        break
 
             if matched_pattern:
                 # Execute the matched action
@@ -1018,6 +1020,10 @@ def ivr_navigate_webhook():
                 action_value = matched_pattern.get('action_value', '')
 
                 print(f"🎮 Executing IVR action: {action} = {action_value}")
+
+                # Wait 2 seconds after the menu prompt finishes before responding.
+                # This lets the IVR complete its full prompt before DTMF/speech is sent.
+                response.pause(length=2)
 
                 if action == 'dtmf' and action_value:
                     # Send DTMF tones
@@ -1028,25 +1034,26 @@ def ivr_navigate_webhook():
                     speak_with_tts(response, action_value)
                     print(f"🗣️ Saying: {action_value}")
 
-                # Update the current menu level
+                # Update the current menu level and reset the unmatched counter
+                # so subsequent human detection reacts quickly after navigation.
                 state['current_menu_level'] = matched_pattern['menu_level']
+                state['ivr_unmatched_count'] = 0
 
                 # Check if we have more IVR levels to navigate
                 remaining_patterns = [p for p in ivr_patterns if p['menu_level'] > state['current_menu_level']]
 
                 if remaining_patterns:
                     # Continue IVR navigation
-                    response.pause(length=2)
+                    response.pause(length=1)
                     gather = Gather(
                         input='speech dtmf',
                         action=f'{callback_base}/webhook/ivr-navigate',
                         method='POST',
-                        speech_timeout='3',
-                        timeout=30,  # Increased to 30 seconds for long IVR messages
+                        speech_timeout='2',
+                        timeout=30,
                         language='en-US'
                     )
                     response.append(gather)
-                    response.redirect(f'{callback_base}/webhook/voice/human')
                 else:
                     # All IVR levels done - enter silent listening mode
                     print(f"✅ IVR navigation complete - entering silent listening mode")
@@ -1058,14 +1065,11 @@ def ivr_navigate_webhook():
                         input='speech',
                         action=f'{callback_base}/webhook/wait-for-human',
                         method='POST',
-                        speech_timeout='3',  # Detect 3 sec silence
-                        timeout=30,  # Max 30 seconds of listening
+                        speech_timeout='2',
+                        timeout=30,
                         language='en-US'
                     )
                     response.append(gather)
-
-                    # If timeout (no speech for 30 sec), try speaking
-                    response.redirect(f'{callback_base}/webhook/voice/human')
             else:
                 # No match - might be IVR announcement, human, or different IVR prompt
                 # Track how many times we've heard unmatched speech
@@ -1075,38 +1079,104 @@ def ivr_navigate_webhook():
 
                 print(f"⚠️ No IVR pattern matched (attempt {state['ivr_unmatched_count']})")
 
-                # Check if it sounds like a human greeting
-                human_indicators = ['hello', 'hi', 'how can i help', 'speaking', 'this is', 'may i help', 'department', 'thank you for calling', 'you have reached']
-                is_human = any(indicator in speech_lower for indicator in human_indicators)
+                # Definitive IVR indicators — absolutely prove we are in an IVR.
+                # No human indicator can override these.
+                definitive_ivr_indicators = [
+                    # DTMF prompts
+                    'press 1', 'press 2', 'press 3', 'press 4', 'press 5',
+                    'press 6', 'press 7', 'press 8', 'press 9', 'press 0',
+                    'press star', 'press pound', 'press the',
+                    'press or say',
+                    # Speech prompts
+                    'say ', 'option 1', 'option 2', 'option 3', 'option 4',
+                    'dial ', 'select ',
+                    # Department routing
+                    'for billing', 'for claims', 'for provider', 'for member',
+                    'for english', 'for spanish',
+                    # IVR navigation
+                    'main menu', 'previous menu', 'return to',
+                    'if you are a', 'if you know your',
+                    # Caller type selection
+                    'are you a member', 'are you a provider',
+                    # Definitive non-human actions
+                    'please hang up and dial', 'leave a message', 'voicemail',
+                ]
 
-                # Only treat as human if:
-                # 1. Clear human indicators detected, OR
-                # 2. We've tried multiple times (5+) without matching IVR patterns
-                if is_human and state['ivr_unmatched_count'] >= 2:
-                    # Strong indication of human - start conversation
-                    print(f"👤 Human detected (clear indicators) - starting conversation")
-                    state['call_state'] = CallState.SPEAKING_WITH_HUMAN
-                    response.redirect(f'{callback_base}/webhook/voice/human')
-                elif state['ivr_unmatched_count'] >= 5:
-                    # Tried too many times - assume human or IVR navigation failed
-                    print(f"👤 Switching to human mode after {state['ivr_unmatched_count']} attempts")
-                    state['call_state'] = CallState.SPEAKING_WITH_HUMAN
-                    response.redirect(f'{callback_base}/webhook/voice/human')
-                else:
-                    # Keep listening for IVR menu options
-                    # This could be an announcement before the actual menu
+                # Passive IVR indicators — common in IVR recordings but also said
+                # by humans. A strong human indicator overrides these.
+                passive_ivr_indicators = [
+                    'this call may be monitored', 'this call may be recorded',
+                    'for quality assurance', 'quality assurance purposes',
+                    'please hold', 'please wait', 'please listen',
+                    'your call is important', 'your call will be',
+                    'all representatives', 'all agents',
+                    'estimated wait time', 'high call volume',
+                    'thank you for calling', 'you have reached',
+                ]
+
+                # Strong human indicators (no IVR-ambiguous phrases).
+                # Simple greetings are gated by message length to avoid false
+                # positives from long IVR recordings containing 'hello'.
+                human_indicators = [
+                    'how can i help', 'how may i help', 'how may i assist',
+                    'may i help you', 'who am i speaking with', 'may i ask who',
+                    'what is your name', 'can i get your name',
+                    'good morning', 'good afternoon', 'good evening',
+                ]
+                simple_greetings = ['hello', 'hi', 'credentialing', 'speaking']
+                is_human = (
+                    any(ind in speech_lower for ind in human_indicators) or
+                    (any(g in speech_lower for g in simple_greetings) and len(speech_result) < 50)
+                )
+
+                is_definitive_ivr = any(ind in speech_lower for ind in definitive_ivr_indicators)
+                is_passive_ivr    = any(ind in speech_lower for ind in passive_ivr_indicators)
+                # Passive indicators only block human detection when no strong human
+                # indicator is present. e.g. "Thank you for calling X. How can I help?"
+                # contains 'thank you for calling' (passive) + 'how can i help' (human)
+                # → is_ivr_system = False → human detected correctly.
+                is_ivr_system = is_definitive_ivr or (is_passive_ivr and not is_human)
+
+                # DECISION — priority order matters
+                if is_ivr_system:
+                    # Definitely still in IVR — decrement counter so false positives
+                    # don't accumulate toward the human-mode fallback threshold.
+                    state['ivr_unmatched_count'] = max(state['ivr_unmatched_count'] - 1, 0)
+                    print(f"🤖 IVR system speech detected (not a human), heard: {speech_result[:80]}...")
                     print(f"🔄 Continuing to listen for IVR menu options...")
-                    response.pause(length=1)
                     gather = Gather(
                         input='speech dtmf',
                         action=f'{callback_base}/webhook/ivr-navigate',
                         method='POST',
-                        speech_timeout='3',
-                        timeout=30,  # Increased to 30 seconds for long IVR greetings
+                        speech_timeout='2',
+                        timeout=30,
                         language='en-US'
                     )
                     response.append(gather)
+                elif is_human and state['ivr_unmatched_count'] >= 1:
+                    # Respond immediately on the first human signal.
+                    # IVR counter-indicators already filter out pure IVR speech, so
+                    # threshold=1 is safe — waiting longer just causes the agent to hang up.
+                    print(f"👤 Human detected (clear indicators, attempt {state['ivr_unmatched_count']}) - starting conversation")
+                    state['call_state'] = CallState.SPEAKING_WITH_HUMAN
                     response.redirect(f'{callback_base}/webhook/voice/human')
+                elif state['ivr_unmatched_count'] >= 8:
+                    # Many unmatched attempts with no IVR counter-signal — assume human or unknown system
+                    print(f"👤 Switching to human mode after {state['ivr_unmatched_count']} unmatched attempts")
+                    state['call_state'] = CallState.SPEAKING_WITH_HUMAN
+                    response.redirect(f'{callback_base}/webhook/voice/human')
+                else:
+                    # Unrecognised speech — keep listening for the IVR menu
+                    print(f"🔄 Continuing to listen for IVR menu options...")
+                    gather = Gather(
+                        input='speech dtmf',
+                        action=f'{callback_base}/webhook/ivr-navigate',
+                        method='POST',
+                        speech_timeout='2',
+                        timeout=30,
+                        language='en-US'
+                    )
+                    response.append(gather)
         else:
             # No call state found - go to human mode
             response.redirect(f'{callback_base}/webhook/voice/human')
@@ -1246,7 +1316,7 @@ def wait_for_human_webhook():
                     input='speech',
                     action=f'{callback_base}/webhook/wait-for-human',
                     method='POST',
-                    speech_timeout='3',
+                    speech_timeout='2',
                     timeout=30,
                     language='en-US'
                 )
@@ -1294,7 +1364,7 @@ def wait_for_human_webhook():
                 input='speech',
                 action=f'{callback_base}/webhook/wait-for-human',
                 method='POST',
-                speech_timeout='3',
+                speech_timeout='2',
                 timeout=30,
                 language='en-US'
             )
@@ -1439,9 +1509,9 @@ def speech_webhook():
             try:
                 from credentialing_agent import DatabaseManager
                 db = DatabaseManager()
-                db.save_conversation(call_info['call_id'], 'representative', speech_result)
-                db.save_conversation(call_info['call_id'], 'agent', ai_response.get('response', ''))
                 request_id = state.get('db_request_id') or state.get('call_id')
+                db.save_conversation(call_info['call_id'], 'representative', speech_result, state.get('db_request_id'))
+                db.save_conversation(call_info['call_id'], 'agent', ai_response.get('response', ''), state.get('db_request_id'))
                 if request_id:
                     if finalize:
                         db.save_final_results(request_id, state)
@@ -1663,9 +1733,9 @@ def speech_followup_webhook():
             try:
                 from credentialing_agent import DatabaseManager
                 db = DatabaseManager()
-                db.save_conversation(call_info['call_id'], 'representative', speech_result)
-                db.save_conversation(call_info['call_id'], 'agent', ai_response.get('response', ''))
                 request_id = state.get('db_request_id') or state.get('call_id')
+                db.save_conversation(call_info['call_id'], 'representative', speech_result, state.get('db_request_id'))
+                db.save_conversation(call_info['call_id'], 'agent', ai_response.get('response', ''), state.get('db_request_id'))
                 if request_id:
                     if finalize:
                         db.save_final_results(request_id, state)
@@ -1869,6 +1939,174 @@ def transcription_webhook():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/webhook/recording-status', methods=['POST'])
+def recording_status_webhook():
+    """
+    Twilio webhook for recording status updates.
+    Called when a call recording is completed or fails.
+    """
+    try:
+        from credentialing_agent import DatabaseManager
+
+        recording_sid = request.values.get('RecordingSid')
+        recording_url = request.values.get('RecordingUrl')
+        recording_status = request.values.get('RecordingStatus')
+        recording_duration = request.values.get('RecordingDuration')
+        call_sid = request.values.get('CallSid')
+
+        logger.info(f"Recording webhook: {recording_sid} status={recording_status} for call {call_sid}")
+
+        # Find call_id from call_sid
+        state = None
+        with call_state_lock:
+            state = call_states_by_sid.get(call_sid)
+
+        call_id = state.get('call_id') if state else call_sid
+        request_id = state.get('db_request_id') if state else None
+
+        # Save to database
+        db = DatabaseManager()
+        try:
+            db.save_recording(
+                call_id=call_id,
+                call_sid=call_sid,
+                recording_sid=recording_sid,
+                recording_url=recording_url,
+                recording_duration=int(recording_duration or 0),
+                recording_status=recording_status,
+                request_id=request_id,
+            )
+            logger.info(f"Saved recording {recording_sid} for call {call_id}")
+
+            # Trigger Q&A extraction in background if recording is completed
+            if recording_status == 'completed':
+                from qa_extractor import extract_qa_async
+                threading.Thread(target=extract_qa_async, args=(call_id,), daemon=True).start()
+                logger.info(f"Triggered Q&A extraction for call {call_id}")
+
+        except Exception as e:
+            logger.error(f"Failed to save recording: {e}")
+        finally:
+            db.close()
+
+        return jsonify({'success': True}), 200
+
+    except Exception as e:
+        logger.error(f"Recording webhook error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/call-recording/<call_id>', methods=['GET'])
+@admin_required
+def get_call_recording(call_id: str):
+    """
+    Get recording metadata for a call.
+    """
+    try:
+        db = DatabaseManager()
+        recording = db.get_recording(call_id=call_id)
+        db.close()
+
+        if not recording:
+            return jsonify({
+                'success': False,
+                'error': 'Recording not found'
+            }), 404
+
+        return jsonify({
+            'success': True,
+            'recording': {
+                'recording_sid': recording['recording_sid'],
+                'recording_url': recording['recording_url'],
+                'duration': recording['recording_duration'],
+                'format': recording['recording_format'],
+                'status': recording['recording_status'],
+                'created_at': recording['created_at'].isoformat() if recording['created_at'] else None,
+            }
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Get recording error: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/call-recording/<call_id>/stream', methods=['GET'])
+@admin_required
+def stream_call_recording(call_id: str):
+    """
+    Stream call recording audio.
+    Proxies the audio from Twilio to avoid CORS issues.
+    """
+    try:
+        db = DatabaseManager()
+        recording = db.get_recording(call_id=call_id)
+        db.close()
+
+        if not recording:
+            return jsonify({
+                'success': False,
+                'error': 'Recording not found'
+            }), 404
+
+        if recording['recording_status'] != 'completed':
+            return jsonify({
+                'success': False,
+                'error': f"Recording not ready (status: {recording['recording_status']})"
+            }), 400
+
+        # Fetch recording from Twilio
+        recording_url = recording['recording_url']
+
+        # If it's a relative URL, construct the full URL
+        if not recording_url.startswith('http'):
+            recording_url = f"https://api.twilio.com{recording_url}.mp3"
+        elif not recording_url.endswith('.mp3'):
+            recording_url = f"{recording_url}.mp3"
+
+        # Stream from Twilio with authentication
+        import requests
+        from requests.auth import HTTPBasicAuth
+
+        twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
+        twilio_token = os.getenv("TWILIO_AUTH_TOKEN")
+
+        response = requests.get(
+            recording_url,
+            auth=HTTPBasicAuth(twilio_sid, twilio_token),
+            stream=True
+        )
+
+        if response.status_code != 200:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to fetch recording from Twilio'
+            }), 500
+
+        # Stream the audio
+        def generate():
+            for chunk in response.iter_content(chunk_size=8192):
+                yield chunk
+
+        return Response(
+            generate(),
+            mimetype='audio/mpeg',
+            headers={
+                'Content-Disposition': f'inline; filename="call_{call_id}.mp3"',
+                'Content-Type': 'audio/mpeg'
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Stream recording error: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
 @app.route('/api/call-status/<call_id>', methods=['GET'])
 @admin_required
 def get_call_status(call_id: str):
@@ -1916,6 +2154,72 @@ def get_call_transcript(call_id: str):
         'conversation': state.get('conversation_history', []),
         'transcript': state.get('transcript', [])
     }), 200
+
+
+@app.route('/api/call-qa/extract/<call_id>', methods=['POST'])
+@admin_required
+def extract_call_qa(call_id: str):
+    """
+    Manually trigger Q&A extraction for a call.
+    Useful for retries or extracting from historical calls.
+    """
+    try:
+        data = request.json or {}
+        force = data.get('force', False)
+
+        # Check if already extracted (unless force=true)
+        if not force:
+            db = DatabaseManager()
+            existing_qa = db.get_qa_pairs(call_id)
+            db.close()
+
+            if existing_qa:
+                return jsonify({
+                    'success': True,
+                    'message': 'Q&A already extracted',
+                    'qa_pairs_extracted': len(existing_qa)
+                }), 200
+
+        # Extract in background
+        from qa_extractor import extract_qa_async
+        threading.Thread(target=extract_qa_async, args=(call_id,), daemon=True).start()
+
+        return jsonify({
+            'success': True,
+            'message': 'Q&A extraction started'
+        }), 202
+
+    except Exception as e:
+        logger.error(f"Q&A extraction trigger error: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/call-qa/<call_id>', methods=['GET'])
+@admin_required
+def get_call_qa(call_id: str):
+    """
+    Get Q&A pairs for a call.
+    Returns questions asked and answers received with confidence scores.
+    """
+    try:
+        db = DatabaseManager()
+        qa_pairs = db.get_qa_pairs(call_id)
+        db.close()
+
+        return jsonify({
+            'success': True,
+            'qa_pairs': qa_pairs
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Get Q&A error: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 
 @app.route('/api/call-detail/<call_id>', methods=['GET'])
@@ -2008,7 +2312,56 @@ def get_call_detail(call_id: str):
                     'metadata': r[5] or {},
                 })
 
+        # Fetch recording data
+        recording = db.get_recording(call_id=lookup_id)
+
+        # Fetch Q&A pairs
+        qa_pairs = db.get_qa_pairs(call_id=lookup_id)
+
+        # Enrich conversation with Q&A flags
+        qa_map = {qa['id']: qa for qa in qa_pairs}
+        for conv in conversations:
+            # Check if this message is part of a Q&A
+            for qa in qa_pairs:
+                if qa.get('conversation_snippet'):
+                    try:
+                        snippet = qa['conversation_snippet'] if isinstance(qa['conversation_snippet'], list) else json.loads(qa['conversation_snippet'])
+                        for msg in snippet:
+                            if (msg.get('speaker') == conv['speaker'] and
+                                msg.get('text') == conv['message']):
+                                conv['related_qa_id'] = str(qa['id'])
+                                conv['is_question'] = msg['speaker'] == 'agent'
+                                conv['is_answer'] = msg['speaker'] != 'agent'
+                                break
+                    except:
+                        pass
+
         db.close()
+
+        # Prepare recording data
+        recording_data = None
+        if recording:
+            recording_data = {
+                'available': True,
+                'url': f"/call-recording/{lookup_id}/stream",
+                'duration': recording.get('recording_duration'),
+                'status': recording.get('recording_status'),
+                'created_at': recording['created_at'].isoformat() if recording.get('created_at') else None,
+            }
+
+        # Prepare Q&A pairs data
+        qa_pairs_data = []
+        for qa in qa_pairs:
+            qa_pairs_data.append({
+                'id': str(qa['id']),
+                'question_index': qa['question_index'],
+                'question_text': qa['question_text'],
+                'answer_text': qa.get('answer_text'),
+                'confidence': qa.get('confidence', 0.0),
+                'extracted_at': qa['extracted_at'].isoformat() if qa.get('extracted_at') else None,
+                'verified': qa.get('verified', False),
+                'conversation_snippet': qa.get('conversation_snippet') if isinstance(qa.get('conversation_snippet'), list) else (json.loads(qa.get('conversation_snippet')) if qa.get('conversation_snippet') else []),
+            })
 
         return jsonify({
             'success': True,
@@ -2016,6 +2369,8 @@ def get_call_detail(call_id: str):
                 **call_data,
                 'conversation': conversations,
                 'events': events,
+                'recording': recording_data,
+                'qa_pairs': qa_pairs_data,
             }
         }), 200
 
