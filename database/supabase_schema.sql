@@ -317,3 +317,86 @@ CREATE INDEX idx_token_blacklist_expires ON token_blacklist(expires_at);
 
 GRANT ALL ON users TO authenticated;
 GRANT ALL ON token_blacklist TO authenticated;
+
+-- =============================================================================
+-- Call Recording and Q&A Tables
+-- =============================================================================
+
+-- Call Recordings Table
+CREATE TABLE call_recordings (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    call_id VARCHAR(100) NOT NULL,
+    request_id UUID REFERENCES credentialing_requests(id),
+    call_sid VARCHAR(100) NOT NULL,
+    recording_sid VARCHAR(100) NOT NULL UNIQUE,
+    recording_url TEXT NOT NULL,
+    recording_duration INTEGER,  -- Duration in seconds
+    recording_status VARCHAR(50) DEFAULT 'processing',  -- 'processing', 'completed', 'failed', 'expired'
+    recording_format VARCHAR(10) DEFAULT 'mp3',  -- 'mp3', 'wav'
+    file_size INTEGER,  -- Size in bytes
+    downloaded BOOLEAN DEFAULT FALSE,  -- If stored locally/S3
+    local_path TEXT,  -- Optional: local/S3 storage path
+    retention_until TIMESTAMP,  -- For automatic cleanup
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Create indexes for call_recordings
+CREATE INDEX idx_call_recordings_call_id ON call_recordings(call_id);
+CREATE INDEX idx_call_recordings_recording_sid ON call_recordings(recording_sid);
+CREATE INDEX idx_call_recordings_request_id ON call_recordings(request_id);
+CREATE INDEX idx_call_recordings_retention ON call_recordings(retention_until);
+
+-- Call Q&A Pairs Table
+CREATE TABLE call_qa_pairs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    call_id VARCHAR(100) NOT NULL,
+    request_id UUID REFERENCES credentialing_requests(id),
+    question_index INTEGER NOT NULL,  -- Which question from the questions array
+    question_text TEXT NOT NULL,
+    answer_text TEXT,
+    confidence FLOAT DEFAULT 0.0,  -- Confidence in extraction (0.0-1.0)
+    extracted_at TIMESTAMP DEFAULT NOW(),
+    extraction_method VARCHAR(50) DEFAULT 'gpt4',  -- 'gpt4', 'manual', 'rule-based'
+    conversation_snippet JSONB,  -- Related conversation context
+    verified BOOLEAN DEFAULT FALSE,  -- Manual verification flag
+    notes TEXT,
+    UNIQUE (call_id, question_index)
+);
+
+-- Create indexes for call_qa_pairs
+CREATE INDEX idx_call_qa_pairs_call_id ON call_qa_pairs(call_id);
+CREATE INDEX idx_call_qa_pairs_request_id ON call_qa_pairs(request_id);
+CREATE INDEX idx_call_qa_pairs_question_index ON call_qa_pairs(question_index);
+
+-- Enhance conversation_history table
+ALTER TABLE conversation_history
+    ADD COLUMN IF NOT EXISTS conversation_turn INTEGER,
+    ADD COLUMN IF NOT EXISTS is_question BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS is_answer BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS related_qa_id UUID REFERENCES call_qa_pairs(id),
+    ADD COLUMN IF NOT EXISTS audio_timestamp FLOAT;
+
+-- Enhance call_metrics table
+ALTER TABLE call_metrics
+    ADD COLUMN IF NOT EXISTS recording_sid VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS recording_available BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS qa_pairs_extracted INTEGER DEFAULT 0;
+
+-- Grant permissions
+GRANT ALL ON call_recordings TO authenticated;
+GRANT ALL ON call_qa_pairs TO authenticated;
+
+-- Function to auto-update updated_at timestamp
+CREATE OR REPLACE FUNCTION update_call_recording_timestamp()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at := NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_update_call_recording_timestamp
+BEFORE UPDATE ON call_recordings
+FOR EACH ROW
+EXECUTE FUNCTION update_call_recording_timestamp();

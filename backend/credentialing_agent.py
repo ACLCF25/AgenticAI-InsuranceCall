@@ -211,13 +211,13 @@ class DatabaseManager:
             ))
             self.conn.commit()
     
-    def save_conversation(self, call_id: str, speaker: str, message: str):
+    def save_conversation(self, call_id: str, speaker: str, message: str, request_id: str = None):
         """Save conversation message"""
         with self.conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO conversation_history (call_id, speaker, message)
-                VALUES (%s, %s, %s)
-            """, (call_id, speaker, message))
+                INSERT INTO conversation_history (call_id, request_id, speaker, message)
+                VALUES (%s, %s, %s, %s)
+            """, (call_id, request_id, speaker, message))
             self.conn.commit()
     
     def update_ivr_knowledge(self, ivr_id: str, success: bool):
@@ -525,6 +525,143 @@ class DatabaseManager:
 
         return logs, total_count
 
+    # =========================================================================
+    # Call Recording Methods
+    # =========================================================================
+
+    def save_recording(
+        self,
+        call_id: str,
+        call_sid: str,
+        recording_sid: str,
+        recording_url: str,
+        recording_duration: int,
+        recording_status: str,
+        request_id: Optional[str] = None,
+    ) -> str:
+        """Save or update call recording metadata."""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO call_recordings
+                (call_id, call_sid, recording_sid, recording_url,
+                 recording_duration, recording_status, request_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (recording_sid) DO UPDATE SET
+                    recording_url = EXCLUDED.recording_url,
+                    recording_status = EXCLUDED.recording_status,
+                    recording_duration = EXCLUDED.recording_duration,
+                    updated_at = NOW()
+                RETURNING id
+                """,
+                (
+                    call_id,
+                    call_sid,
+                    recording_sid,
+                    recording_url,
+                    recording_duration,
+                    recording_status,
+                    request_id,
+                ),
+            )
+            result = cur.fetchone()
+            self.conn.commit()
+
+            # Update call_metrics
+            if recording_status == "completed":
+                cur.execute(
+                    """
+                    UPDATE call_metrics
+                    SET recording_sid = %s, recording_available = TRUE
+                    WHERE call_id = %s
+                    """,
+                    (recording_sid, call_id),
+                )
+                self.conn.commit()
+
+            return str(result[0])
+
+    def get_recording(self, call_id: str) -> Optional[Dict]:
+        """Get recording metadata for a call."""
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT * FROM call_recordings
+                WHERE call_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (call_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    # =========================================================================
+    # Q&A Pairs Methods
+    # =========================================================================
+
+    def save_qa_pairs(
+        self, call_id: str, request_id: str, qa_pairs: List[Dict]
+    ) -> int:
+        """Save Q&A pairs to database. Returns count of saved pairs."""
+        with self.conn.cursor() as cur:
+            saved_count = 0
+            for qa in qa_pairs:
+                cur.execute(
+                    """
+                    INSERT INTO call_qa_pairs
+                    (call_id, request_id, question_index, question_text,
+                     answer_text, confidence, extraction_method,
+                     conversation_snippet)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (call_id, question_index) DO UPDATE SET
+                        answer_text = EXCLUDED.answer_text,
+                        confidence = EXCLUDED.confidence,
+                        conversation_snippet = EXCLUDED.conversation_snippet,
+                        extracted_at = NOW()
+                    """,
+                    (
+                        call_id,
+                        request_id,
+                        qa.get("question_index"),
+                        qa.get("question_text"),
+                        qa.get("answer_text"),
+                        qa.get("confidence", 0.0),
+                        qa.get("extraction_method", "gpt4"),
+                        json.dumps(qa.get("conversation_snippet", [])),
+                    ),
+                )
+                saved_count += 1
+
+            # Update call_metrics with Q&A count
+            cur.execute(
+                """
+                UPDATE call_metrics
+                SET qa_pairs_extracted = %s
+                WHERE call_id = %s
+                """,
+                (saved_count, call_id),
+            )
+
+            self.conn.commit()
+            return saved_count
+
+    def get_qa_pairs(self, call_id: str) -> List[Dict]:
+        """Get Q&A pairs for a call."""
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, question_index, question_text, answer_text,
+                       confidence, conversation_snippet, extracted_at,
+                       verified, notes, extraction_method
+                FROM call_qa_pairs
+                WHERE call_id = %s
+                ORDER BY question_index ASC
+                """,
+                (call_id,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
     def close(self):
         """Close database connection"""
         if self.conn:
@@ -615,13 +752,19 @@ class TelephonyManager:
         self.phone_number = os.getenv("TWILIO_PHONE_NUMBER")
     
     def initiate_call(self, to_number: str, callback_url: str) -> str:
-        """Initiate outbound call"""
+        """Initiate outbound call with recording"""
+        # Extract base URL from callback URL to construct recording status callback
+        base_url = callback_url.replace('/webhook/voice', '')
+        recording_status_callback = f"{base_url}/webhook/recording-status"
+
         call = self.client.calls.create(
             to=to_number,
             from_=self.phone_number,
             url=callback_url,
             status_callback=f"{callback_url}/status",
             record=True,
+            recording_status_callback=recording_status_callback,
+            recording_status_callback_event=['completed', 'failed'],
             machine_detection="Enable"
         )
         return call.sid
@@ -1114,8 +1257,8 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
         response = self.conversation_agent.generate_response(state, latest_transcript)
         
         # Save to conversation history
-        self.db.save_conversation(state['call_id'], 'representative', latest_transcript)
-        self.db.save_conversation(state['call_id'], 'agent', response['response'])
+        self.db.save_conversation(state['call_id'], 'representative', latest_transcript, state.get('db_request_id'))
+        self.db.save_conversation(state['call_id'], 'agent', response['response'], state.get('db_request_id'))
         
         # Add to state
         state['conversation_history'].append({
