@@ -1956,10 +1956,13 @@ def recording_status_webhook():
 
         logger.info(f"Recording webhook: {recording_sid} status={recording_status} for call {call_sid}")
 
-        # Find call_id from call_sid
+        # Find call_id and request_id from in-memory state first
         state = None
         with call_state_lock:
             state = call_states_by_sid.get(call_sid)
+            if state is None:
+                # Also try linear scan in case sid was registered under different key
+                state = get_state_by_sid(call_sid)
 
         call_id = state.get('call_id') if state else call_sid
         request_id = state.get('db_request_id') if state else None
@@ -1967,6 +1970,29 @@ def recording_status_webhook():
         # Save to database
         db = DatabaseManager()
         try:
+            # If in-memory state is gone (e.g. server restarted between call end and webhook),
+            # attempt to recover request_id by matching call_sid against conversation_history
+            # or call_metrics, which persist across restarts.
+            if request_id is None:
+                try:
+                    with db.conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT request_id FROM call_metrics
+                            WHERE call_id = %s
+                            LIMIT 1
+                            """,
+                            (call_sid,),
+                        )
+                        row = cur.fetchone()
+                        if row and row[0]:
+                            request_id = str(row[0])
+                            logger.info(
+                                f"Recovered request_id {request_id} from call_metrics for call_sid {call_sid}"
+                            )
+                except Exception as lookup_err:
+                    logger.warning(f"Could not recover request_id from DB: {lookup_err}")
+
             db.save_recording(
                 call_id=call_id,
                 call_sid=call_sid,
@@ -1976,13 +2002,15 @@ def recording_status_webhook():
                 recording_status=recording_status,
                 request_id=request_id,
             )
-            logger.info(f"Saved recording {recording_sid} for call {call_id}")
+            logger.info(f"Saved recording {recording_sid} for call {call_id} (request_id={request_id})")
 
             # Trigger Q&A extraction in background if recording is completed
             if recording_status == 'completed':
                 from qa_extractor import extract_qa_async
-                threading.Thread(target=extract_qa_async, args=(call_id,), daemon=True).start()
-                logger.info(f"Triggered Q&A extraction for call {call_id}")
+                # Use request_id as the primary identifier for extraction when available
+                qa_target = request_id or call_id
+                threading.Thread(target=extract_qa_async, args=(qa_target,), daemon=True).start()
+                logger.info(f"Triggered Q&A extraction for call {qa_target}")
 
         except Exception as e:
             logger.error(f"Failed to save recording: {e}")
@@ -2312,8 +2340,12 @@ def get_call_detail(call_id: str):
                     'metadata': r[5] or {},
                 })
 
-        # Fetch recording data
+        # Fetch recording data.  Try lookup_id (request UUID) first; if that
+        # misses, try the original runtime call_id (different from lookup_id
+        # when the frontend passed a runtime UUID that was mapped to request_id).
         recording = db.get_recording(call_id=lookup_id)
+        if recording is None and lookup_id != call_id:
+            recording = db.get_recording(call_id=call_id)
 
         # Fetch Q&A pairs
         qa_pairs = db.get_qa_pairs(call_id=lookup_id)
@@ -2338,12 +2370,13 @@ def get_call_detail(call_id: str):
 
         db.close()
 
-        # Prepare recording data
+        # Prepare recording data.  'available' is True only when the recording
+        # has finished processing so the audio stream endpoint can serve it.
         recording_data = None
         if recording:
             recording_data = {
-                'available': True,
-                'url': f"/call-recording/{lookup_id}/stream",
+                'available': recording.get('recording_status') == 'completed',
+                'url': f"/api/call-recording/{lookup_id}/stream",
                 'duration': recording.get('recording_duration'),
                 'status': recording.get('recording_status'),
                 'created_at': recording['created_at'].isoformat() if recording.get('created_at') else None,

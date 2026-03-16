@@ -183,6 +183,8 @@ export interface CallDetail {
     available: boolean;
     url: string;
     duration?: number;
+    status?: string;
+    created_at?: string;
   };
   qa_pairs?: any[];
 }

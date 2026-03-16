@@ -582,12 +582,47 @@ class DatabaseManager:
             return str(result[0])
 
     def get_recording(self, call_id: str) -> Optional[Dict]:
-        """Get recording metadata for a call."""
+        """Get recording metadata for a call.
+
+        Searches by call_id first (runtime UUID stored at call start), then
+        falls back to request_id (Postgres UUID from credentialing_requests)
+        and finally by call_sid (Twilio SID) so recordings are found regardless
+        of which identifier was active when the Twilio webhook fired.
+        """
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Primary lookup: runtime call_id column
             cur.execute(
                 """
                 SELECT * FROM call_recordings
                 WHERE call_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (call_id,),
+            )
+            row = cur.fetchone()
+            if row:
+                return dict(row)
+
+            # Fallback 1: request_id column (Postgres UUID from credentialing_requests)
+            cur.execute(
+                """
+                SELECT * FROM call_recordings
+                WHERE request_id::text = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (call_id,),
+            )
+            row = cur.fetchone()
+            if row:
+                return dict(row)
+
+            # Fallback 2: call_sid column (Twilio SID, used when in-memory state was lost)
+            cur.execute(
+                """
+                SELECT * FROM call_recordings
+                WHERE call_sid = %s
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
