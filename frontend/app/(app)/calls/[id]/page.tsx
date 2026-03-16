@@ -3,6 +3,7 @@
 import { useParams, useRouter } from 'next/navigation'
 import { useQuery } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
+import { useEffect, useState } from 'react'
 import {
   ArrowLeft,
   Phone,
@@ -35,6 +36,32 @@ export default function CallDetailPage() {
   })
 
   const call = data?.data
+
+  // Fetch the recording as a blob so the Authorization header is sent.
+  // A plain <audio src="..."> cannot attach JWT tokens, causing a 401 on the
+  // protected /api/call-recording/:id/stream endpoint.
+  const [recordingBlobUrl, setRecordingBlobUrl] = useState<string | null>(null)
+  const [recordingLoadError, setRecordingLoadError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!call?.recording?.available || call.recording.status !== 'completed') return
+
+    let objectUrl: string | null = null
+
+    api
+      .getCallRecordingBlob(callId)
+      .then((blob) => {
+        objectUrl = URL.createObjectURL(blob)
+        setRecordingBlobUrl(objectUrl)
+      })
+      .catch(() => {
+        setRecordingLoadError('Recording could not be loaded.')
+      })
+
+    return () => {
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [callId, call?.recording?.available, call?.recording?.status])
 
   if (isLoading) {
     return (
@@ -192,18 +219,37 @@ export default function CallDetailPage() {
                 </CardTitle>
               </CardHeader>
               <CardContent>
-                <audio
-                  controls
-                  className="w-full"
-                  src={`${process.env.NEXT_PUBLIC_API_URL}${call.recording.url}`}
-                  preload="metadata"
-                >
-                  Your browser does not support audio playback.
-                </audio>
-                <p className="text-xs text-muted-foreground mt-2">
-                  Duration: {Math.floor((call.recording.duration || 0) / 60)}:
-                  {((call.recording.duration || 0) % 60).toString().padStart(2, '0')}
-                </p>
+                {call.recording.status !== 'completed' ? (
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground py-2">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    <span>Recording is being processed&hellip;</span>
+                  </div>
+                ) : recordingLoadError ? (
+                  <div className="flex items-center gap-2 text-sm text-yellow-600 py-2">
+                    <AlertTriangle className="h-4 w-4" />
+                    <span>{recordingLoadError}</span>
+                  </div>
+                ) : recordingBlobUrl ? (
+                  <>
+                    <audio
+                      controls
+                      className="w-full"
+                      src={recordingBlobUrl}
+                      preload="metadata"
+                    >
+                      Your browser does not support audio playback.
+                    </audio>
+                    <p className="text-xs text-muted-foreground mt-2">
+                      Duration: {Math.floor((call.recording.duration || 0) / 60)}:
+                      {((call.recording.duration || 0) % 60).toString().padStart(2, '0')}
+                    </p>
+                  </>
+                ) : (
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground py-2">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    <span>Loading recording&hellip;</span>
+                  </div>
+                )}
               </CardContent>
             </Card>
           )}

@@ -203,6 +203,14 @@ class APIClient {
     const { data } = await this.client.put(`/ivr-knowledge/${id}`, knowledge);
     return data;
   }
+
+  // Fetch call recording as a blob (carries the auth header that a plain <audio src> cannot)
+  async getCallRecordingBlob(callId: string): Promise<Blob> {
+    const { data } = await this.client.get(`/call-recording/${callId}/stream`, {
+      responseType: 'blob',
+    });
+    return data;
+  }
 }
 
 export const api = new APIClient();
