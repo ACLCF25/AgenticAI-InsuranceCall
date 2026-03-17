@@ -5,6 +5,7 @@ import uuid
 from typing import List, Optional, Dict, Any
 
 import psycopg2
+import psycopg2.pool
 from psycopg2.extras import RealDictCursor
 from openai import OpenAI, AsyncOpenAI
 from loguru import logger
@@ -12,6 +13,21 @@ import tiktoken
 
 # Default embedding model; override with OPENAI_EMBEDDING_MODEL
 EMBED_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+
+# ---------------------------------------------------------------------------
+# Module-level connection pool for KnowledgeBase instances.
+# All KnowledgeBase objects share this pool so repeated instantiation
+# (e.g. per conversation turn) does not open new TCP connections to Postgres.
+# ---------------------------------------------------------------------------
+_kb_pool = psycopg2.pool.ThreadedConnectionPool(
+    minconn=2,
+    maxconn=10,
+    host=os.getenv("SUPABASE_HOST"),
+    database="postgres",
+    user=os.getenv("SUPABASE_USER", "postgres"),
+    password=os.getenv("SUPABASE_PASSWORD"),
+    port=5432,
+)
 
 # Configure loguru for knowledge base operations
 logger.add(
@@ -131,13 +147,9 @@ class KnowledgeBase:
 
     def __init__(self):
         try:
-            self.conn = psycopg2.connect(
-                host=os.getenv("SUPABASE_HOST"),
-                database="postgres",
-                user=os.getenv("SUPABASE_USER", "postgres"),
-                password=os.getenv("SUPABASE_PASSWORD"),
-                port=5432,
-            )
+            # Acquire a connection from the module-level pool rather than
+            # opening a new TCP connection on every instantiation.
+            self.conn = _kb_pool.getconn()
             self.openai_sync = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
             self.openai_async = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
             self.chunker = TextChunker(chunk_size=500, overlap=100, model=EMBED_MODEL)
@@ -148,8 +160,11 @@ class KnowledgeBase:
 
     def close(self):
         if self.conn:
-            self.conn.close()
-            logger.debug("KnowledgeBase connection closed")
+            # Return the connection to the pool instead of closing it so the
+            # underlying TCP connection is reused by the next KnowledgeBase call.
+            _kb_pool.putconn(self.conn)
+            self.conn = None
+            logger.debug("KnowledgeBase connection returned to pool")
 
     # -------------------------------------------------------------------------
     # Synchronous Embedding Methods
@@ -208,22 +223,31 @@ class KnowledgeBase:
             raise EmbeddingError(f"Failed to generate embedding: {e}")
 
     async def embed_batch_async(self, texts: List[str]) -> List[List[float]]:
-        """Asynchronous batch embedding for multiple texts (cost-efficient)."""
+        """Asynchronous batch embedding for multiple texts (cost-efficient).
+
+        All batches are dispatched concurrently via asyncio.gather() so that
+        multiple API round-trips overlap instead of waiting sequentially.
+        The result list is reconstructed in the original input order.
+        """
         if not texts:
             return []
 
         try:
             batch_size = 100
-            all_embeddings = []
 
-            for i in range(0, len(texts), batch_size):
-                batch = texts[i:i + batch_size]
-                resp = await self.openai_async.embeddings.create(
-                    model=EMBED_MODEL,
-                    input=batch,
-                )
-                batch_embeddings = [item.embedding for item in resp.data]
-                all_embeddings.extend(batch_embeddings)
+            # Build the list of batches preserving order.
+            batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
+
+            # Fire all embedding requests in parallel.
+            responses = await asyncio.gather(*[
+                self.openai_async.embeddings.create(model=EMBED_MODEL, input=batch)
+                for batch in batches
+            ])
+
+            # Flatten results in order: each response corresponds to its batch.
+            all_embeddings = []
+            for resp, batch in zip(responses, batches):
+                all_embeddings.extend([item.embedding for item in resp.data])
                 logger.debug(f"Async batch embedded {len(batch)} texts")
 
             return all_embeddings

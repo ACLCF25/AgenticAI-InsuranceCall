@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import bcrypt
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import (
     create_access_token,
@@ -23,17 +24,28 @@ auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 
 
 # ---------------------------------------------------------------------------
-# DB helper – raw psycopg2 (mirrors DatabaseManager connection pattern)
+# Module-level connection pool — created once at import time, shared across
+# all auth requests.  minconn=2 is sufficient for auth (low concurrency);
+# maxconn=10 caps memory on constrained deployments.
+# ---------------------------------------------------------------------------
+
+_auth_pool = psycopg2.pool.ThreadedConnectionPool(
+    minconn=2,
+    maxconn=10,
+    host=os.getenv("SUPABASE_HOST"),
+    database="postgres",
+    user=os.getenv("SUPABASE_USER", "postgres"),
+    password=os.getenv("SUPABASE_PASSWORD"),
+    port=5432,
+)
+
+
+# ---------------------------------------------------------------------------
+# DB helper – acquires from pool instead of creating a new connection
 # ---------------------------------------------------------------------------
 
 def _get_conn():
-    return psycopg2.connect(
-        host=os.getenv("SUPABASE_HOST"),
-        database="postgres",
-        user=os.getenv("SUPABASE_USER", "postgres"),
-        password=os.getenv("SUPABASE_PASSWORD"),
-        port=5432,
-    )
+    return _auth_pool.getconn()
 
 
 def _query_one(sql: str, params: tuple):
@@ -45,7 +57,9 @@ def _query_one(sql: str, params: tuple):
             row = cur.fetchone()
             return dict(row) if row else None
     finally:
-        conn.close()
+        # Return to pool instead of closing so the underlying TCP connection
+        # is reused by the next request.
+        _auth_pool.putconn(conn)
 
 
 def _execute(sql: str, params: tuple):
@@ -56,7 +70,7 @@ def _execute(sql: str, params: tuple):
             cur.execute(sql, params)
         conn.commit()
     finally:
-        conn.close()
+        _auth_pool.putconn(conn)
 
 
 # ---------------------------------------------------------------------------

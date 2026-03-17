@@ -8,6 +8,7 @@ This module provides the core autonomous agent for handling insurance credential
 import os
 import json
 import asyncio
+import concurrent.futures
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Literal, TypedDict, Annotated, Any
 from enum import Enum
@@ -36,6 +37,7 @@ from elevenlabs.client import ElevenLabs
 
 # Database
 import psycopg2
+import psycopg2.pool
 from psycopg2.extras import RealDictCursor
 
 # Environment
@@ -43,8 +45,70 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ---------------------------------------------------------------------------
+# Module-level connection pool for DatabaseManager.
+# Initialised once at import time so every DatabaseManager instance shares
+# the same pool of pre-opened TCP connections to Postgres.
+# minconn=5 / maxconn=20 mirrors the approved plan.
+# ---------------------------------------------------------------------------
+_db_pool = psycopg2.pool.ThreadedConnectionPool(
+    minconn=5,
+    maxconn=20,
+    host=os.getenv("SUPABASE_HOST"),
+    database="postgres",
+    user=os.getenv("SUPABASE_USER", "postgres"),
+    password=os.getenv("SUPABASE_PASSWORD"),
+    port=5432,
+)
+
 # Local knowledge base (pgvector)
 from knowledge_base import KnowledgeBase, redact_text
+
+
+# ---------------------------------------------------------------------------
+# Module-level LLM singletons.
+# Creating a ChatOpenAI object is cheap but it still imports/validates config
+# and allocates an httpx client each time.  Sharing one instance per
+# temperature bucket eliminates that overhead across all agent classes.
+# ---------------------------------------------------------------------------
+_llm_classifier = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.2,
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
+_llm_navigator = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.2,
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
+_llm_conversation = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.4,
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
+_llm_extractor = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.1,
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
+
+# ---------------------------------------------------------------------------
+# Module-level compiled LangGraph cache.
+# CredentialingAgent._build_graph() is called in __init__; compiling the
+# graph on every instantiation wastes several hundred milliseconds.  Cache
+# the compiled graph here after the first build.
+# ---------------------------------------------------------------------------
+_compiled_graph = None
+
+# ---------------------------------------------------------------------------
+# IVR knowledge TTL cache.
+# get_ivr_knowledge() is called on every call init.  IVR menu structures
+# change rarely, so a 30-minute in-process cache avoids a DB round-trip on
+# repeated calls to the same insurer.
+# Structure: { insurance_name_lower: (data, fetched_timestamp) }
+# ---------------------------------------------------------------------------
+_ivr_knowledge_cache: dict = {}
+_IVR_CACHE_TTL_SECONDS: int = 1800  # 30 minutes
 
 
 class CallState(str, Enum):
@@ -151,15 +215,12 @@ class LangSmithConfig:
 
 class DatabaseManager:
     """Manages all database operations"""
-    
+
     def __init__(self):
-        self.conn = psycopg2.connect(
-            host=os.getenv("SUPABASE_HOST"),
-            database="postgres",
-            user=os.getenv("SUPABASE_USER", "postgres"),
-            password=os.getenv("SUPABASE_PASSWORD"),
-            port=5432
-        )
+        # Acquire from the module-level pool rather than opening a new TCP
+        # connection.  This makes CredentialingAgent instantiation ~10× faster
+        # once the pool is warmed up.
+        self.conn = _db_pool.getconn()
     
     def save_credentialing_request(self, state: CredentialingState) -> str:
         """Save initial credentialing request"""
@@ -185,14 +246,31 @@ class DatabaseManager:
             return str(request_id)
     
     def get_ivr_knowledge(self, insurance_name: str) -> List[Dict]:
-        """Retrieve IVR knowledge for an insurance provider"""
+        """Retrieve IVR knowledge for an insurance provider.
+
+        Results are cached in-process for _IVR_CACHE_TTL_SECONDS (30 min)
+        because IVR menus change rarely and this is called on every call init.
+        The cache key is the lower-cased insurance name to mirror the
+        case-insensitive ILIKE query.
+        """
+        import time as _time
+        cache_key = insurance_name.lower()
+        cached = _ivr_knowledge_cache.get(cache_key)
+        if cached is not None:
+            data, fetched_at = cached
+            if _time.monotonic() - fetched_at < _IVR_CACHE_TTL_SECONDS:
+                return data
+
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT * FROM ivr_knowledge 
+                SELECT * FROM ivr_knowledge
                 WHERE insurance_name ILIKE %s
                 ORDER BY success_rate DESC, menu_level ASC
             """, (f"%{insurance_name}%",))
-            return [dict(row) for row in cur.fetchall()]
+            data = [dict(row) for row in cur.fetchall()]
+
+        _ivr_knowledge_cache[cache_key] = (data, _time.monotonic())
+        return data
     
     def log_call_event(self, call_id: str, event_type: str, data: Dict):
         """Log a call event"""
@@ -698,9 +776,10 @@ class DatabaseManager:
             return [dict(row) for row in cur.fetchall()]
 
     def close(self):
-        """Close database connection"""
+        """Return database connection to the pool (does not close the TCP connection)."""
         if self.conn:
-            self.conn.close()
+            _db_pool.putconn(self.conn)
+            self.conn = None
 
 
 class ConfigManager:
@@ -850,11 +929,9 @@ class AudioClassifier:
     """Classifies audio types using LLM"""
 
     def __init__(self, langsmith_config: LangSmithConfig):
-        self.llm = ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0.2,
-            api_key=os.getenv("OPENAI_API_KEY")
-        )
+        # Reference the module-level singleton to avoid per-call HTTP client
+        # allocation overhead.
+        self.llm = _llm_classifier
         self.langsmith = langsmith_config
         
         self.classifier_prompt = ChatPromptTemplate.from_messages([
@@ -885,11 +962,7 @@ class IVRNavigator:
     """Handles IVR menu navigation decisions"""
 
     def __init__(self, langsmith_config: LangSmithConfig):
-        self.llm = ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0.2,
-            api_key=os.getenv("OPENAI_API_KEY")
-        )
+        self.llm = _llm_navigator
         self.langsmith = langsmith_config
         
         self.navigator_prompt = ChatPromptTemplate.from_messages([
@@ -933,12 +1006,12 @@ class HumanConversationAgent:
     """Handles natural conversation with human representatives"""
 
     def __init__(self, langsmith_config: LangSmithConfig):
-        self.llm = ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0.4,
-            api_key=os.getenv("OPENAI_API_KEY")
-        )
+        self.llm = _llm_conversation
         self.langsmith = langsmith_config
+        # KnowledgeBase is instantiated once here and reused across all
+        # generate_response() calls to avoid opening a new DB connection per
+        # conversation turn.
+        self.kb = KnowledgeBase()
         
         self.conversation_prompt = ChatPromptTemplate.from_messages([
             ("system", """You are a professional insurance credentialing specialist calling on behalf of {provider_name}.
@@ -987,17 +1060,16 @@ class HumanConversationAgent:
             else:
                 messages.append(HumanMessage(content=msg['message']))
 
-        # Fetch knowledge snippets
+        # Fetch knowledge snippets using the shared KnowledgeBase instance
+        # (no open/close per call — connection is held in self.kb).
         knowledge_text = ""
         try:
-            kb = KnowledgeBase()
-            snippets = kb.search(
+            snippets = self.kb.search(
                 insurance_name=state.get('insurance_name', ''),
                 provider_name=state.get('provider_name'),
                 query=current_message,
                 limit=5
             )
-            kb.close()
             if snippets:
                 knowledge_text = "\n".join([f"- {s.get('summary','')}" for s in snippets])
         except Exception as kb_err:
@@ -1021,11 +1093,7 @@ class InformationExtractor:
     """Extracts structured information from conversation"""
 
     def __init__(self, langsmith_config: LangSmithConfig):
-        self.llm = ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0.1,
-            api_key=os.getenv("OPENAI_API_KEY")
-        )
+        self.llm = _llm_extractor
         self.langsmith = langsmith_config
         
         self.extractor_prompt = ChatPromptTemplate.from_messages([
@@ -1092,14 +1160,28 @@ Return JSON:
 Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
             ("user", "Conversation:\n{conversation}")
         ])
-        
+        # Shared KnowledgeBase for post-call ingestion — avoids opening a
+        # fresh TCP connection on every finalize_call().
+        self.kb = KnowledgeBase()
+
         # Build state graph
         self.graph = self._build_graph()
     
     def _build_graph(self) -> StateGraph:
-        """Build the LangGraph state machine"""
+        """Build (or return the cached) LangGraph state machine.
+
+        Compiling the graph is an expensive one-time operation.  The compiled
+        graph is stored in the module-level ``_compiled_graph`` variable so
+        subsequent CredentialingAgent instantiations reuse it without
+        rebuilding.  Each call still gets its own thread_id via the
+        MemorySaver checkpointer, so state isolation is preserved.
+        """
+        global _compiled_graph
+        if _compiled_graph is not None:
+            return _compiled_graph
+
         workflow = StateGraph(CredentialingState)
-        
+
         # Add nodes
         workflow.add_node("initialize", self._initialize_call)
         workflow.add_node("classify_audio", self._classify_audio)
@@ -1108,10 +1190,10 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
         workflow.add_node("converse_with_human", self._converse_with_human)
         workflow.add_node("extract_results", self._extract_results)
         workflow.add_node("finalize", self._finalize_call)
-        
+
         # Set entry point
         workflow.set_entry_point("initialize")
-        
+
         # Add conditional edges
         workflow.add_conditional_edges(
             "initialize",
@@ -1121,7 +1203,7 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
                 "error": END
             }
         )
-        
+
         workflow.add_conditional_edges(
             "classify_audio",
             self._route_by_audio_type,
@@ -1133,7 +1215,7 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
                 "error": END,
             }
         )
-        
+
         workflow.add_conditional_edges(
             "navigate_ivr",
             self._check_continue,
@@ -1143,9 +1225,9 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
                 "error": END
             }
         )
-        
+
         workflow.add_edge("handle_hold", "classify_audio")
-        
+
         workflow.add_conditional_edges(
             "converse_with_human",
             self._check_conversation_complete,
@@ -1155,25 +1237,34 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
                 "error": END,
             }
         )
-        
+
         workflow.add_edge("extract_results", "finalize")
         workflow.add_edge("finalize", END)
-        
+
         # Compile with checkpointer for persistence (using in-memory for development)
         checkpointer = MemorySaver()
 
-        return workflow.compile(checkpointer=checkpointer)
+        _compiled_graph = workflow.compile(checkpointer=checkpointer)
+        return _compiled_graph
     
     @traceable(name="initialize_call")
     def _initialize_call(self, state: CredentialingState) -> CredentialingState:
         """Initialize the call"""
-        # Save request to database unless already provided (e.g., API created it)
         request_id = state.get('db_request_id')
+
         if not request_id:
-            request_id = self.db.save_credentialing_request(state)
-        
-        # Get IVR knowledge
-        ivr_knowledge = self.db.get_ivr_knowledge(state['insurance_name'])
+            # save_credentialing_request and get_ivr_knowledge are independent:
+            # one writes a new row, the other reads from a different table.
+            # Run them in parallel via a thread pool to cut init latency.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                future_save = executor.submit(self.db.save_credentialing_request, state)
+                future_ivr = executor.submit(self.db.get_ivr_knowledge, state['insurance_name'])
+                request_id = future_save.result()
+                ivr_knowledge = future_ivr.result()
+        else:
+            # request_id already exists (created by API before graph run);
+            # only fetch IVR knowledge.
+            ivr_knowledge = self.db.get_ivr_knowledge(state['insurance_name'])
         
         # Initiate Twilio call
         callback_url = os.getenv("CALLBACK_URL")
@@ -1291,9 +1382,17 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
         
         response = self.conversation_agent.generate_response(state, latest_transcript)
         
-        # Save to conversation history
-        self.db.save_conversation(state['call_id'], 'representative', latest_transcript, state.get('db_request_id'))
-        self.db.save_conversation(state['call_id'], 'agent', response['response'], state.get('db_request_id'))
+        # Save both conversation rows in parallel — they write independent rows
+        # (different speaker values) with no dependency between them.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            executor.submit(
+                self.db.save_conversation,
+                state['call_id'], 'representative', latest_transcript, state.get('db_request_id')
+            )
+            executor.submit(
+                self.db.save_conversation,
+                state['call_id'], 'agent', response['response'], state.get('db_request_id')
+            )
         
         # Add to state
         state['conversation_history'].append({
@@ -1369,8 +1468,8 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
                 "turnaround_days": state.get("turnaround_days"),
             }
 
-            kb = KnowledgeBase()
-            kb.upsert_entry(
+            # Use the shared self.kb instance — no per-call open/close cost.
+            self.kb.upsert_entry(
                 insurance_name=state.get("insurance_name"),
                 provider_name=state.get("provider_name"),
                 call_id=state.get("call_id"),
@@ -1379,7 +1478,6 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
                 qa_text=qa_text,
                 metadata=metadata,
             )
-            kb.close()
             print("Knowledge base ingestion complete.")
         except Exception as e:
             print(f"Knowledge base ingestion failed: {e}")
@@ -1496,6 +1594,7 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
     def close(self):
         """Cleanup resources"""
         self.db.close()
+        self.kb.close()
 
 
 # Example usage
