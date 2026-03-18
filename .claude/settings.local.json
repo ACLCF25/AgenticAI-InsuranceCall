@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(dir:*)",
-      "Bash(del \"c:\\\\Users\\\\AaronCarlCladoLibago\\\\Desktop\\\\monolith\\\\nul\")"
+      "Bash(del \"c:\\\\Users\\\\AaronCarlCladoLibago\\\\Desktop\\\\monolith\\\\nul\")",
+      "Bash(git -C \"c:/Users/AaronCarlCladoLibago/Desktop/monolith\" diff main...HEAD -- backend/credentialing_agent.py)",
+      "Bash(git -C \"c:/Users/AaronCarlCladoLibago/Desktop/monolith\" diff main...HEAD -- backend/auth.py)",
+      "Bash(git -C \"c:/Users/AaronCarlCladoLibago/Desktop/monolith\" diff main...HEAD -- backend/knowledge_base.py)",
+      "Bash(git -C \"c:/Users/AaronCarlCladoLibago/Desktop/monolith\" diff main...HEAD -- backend/api_server.py)"
     ]
   }
 }

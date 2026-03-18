@@ -2004,13 +2004,13 @@ def recording_status_webhook():
             )
             logger.info(f"Saved recording {recording_sid} for call {call_id} (request_id={request_id})")
 
-            # Trigger Q&A extraction in background if recording is completed
+            # Trigger Q&A extraction in background if recording is completed.
+            # extract_qa_async queries conversation_history by call_id, so always
+            # pass call_id here — it resolves request_id itself via a DB JOIN.
             if recording_status == 'completed':
                 from qa_extractor import extract_qa_async
-                # Use request_id as the primary identifier for extraction when available
-                qa_target = request_id or call_id
-                threading.Thread(target=extract_qa_async, args=(qa_target,), daemon=True).start()
-                logger.info(f"Triggered Q&A extraction for call {qa_target}")
+                threading.Thread(target=extract_qa_async, args=(call_id,), daemon=True).start()
+                logger.info(f"Triggered Q&A extraction for call {call_id}")
 
         except Exception as e:
             logger.error(f"Failed to save recording: {e}")
@@ -2031,6 +2031,7 @@ def get_call_recording(call_id: str):
     Get recording metadata for a call.
     """
     try:
+        from credentialing_agent import DatabaseManager
         db = DatabaseManager()
         recording = db.get_recording(call_id=call_id)
         db.close()
@@ -2069,6 +2070,7 @@ def stream_call_recording(call_id: str):
     Proxies the audio from Twilio to avoid CORS issues.
     """
     try:
+        from credentialing_agent import DatabaseManager
         db = DatabaseManager()
         recording = db.get_recording(call_id=call_id)
         db.close()
@@ -2197,6 +2199,7 @@ def extract_call_qa(call_id: str):
 
         # Check if already extracted (unless force=true)
         if not force:
+            from credentialing_agent import DatabaseManager
             db = DatabaseManager()
             existing_qa = db.get_qa_pairs(call_id)
             db.close()
@@ -2233,6 +2236,7 @@ def get_call_qa(call_id: str):
     Returns questions asked and answers received with confidence scores.
     """
     try:
+        from credentialing_agent import DatabaseManager
         db = DatabaseManager()
         qa_pairs = db.get_qa_pairs(call_id)
         db.close()

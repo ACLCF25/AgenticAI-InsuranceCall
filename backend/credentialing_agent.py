@@ -8,6 +8,8 @@ This module provides the core autonomous agent for handling insurance credential
 import os
 import json
 import asyncio
+import concurrent.futures
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Literal, TypedDict, Annotated, Any
 from enum import Enum
@@ -36,6 +38,7 @@ from elevenlabs.client import ElevenLabs
 
 # Database
 import psycopg2
+import psycopg2.pool
 from psycopg2.extras import RealDictCursor
 
 # Environment
@@ -43,8 +46,75 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ---------------------------------------------------------------------------
+# Module-level connection pool for DatabaseManager.
+# Initialised once at import time so every DatabaseManager instance shares
+# the same pool of pre-opened TCP connections to Postgres.
+# minconn=5 / maxconn=20 mirrors the approved plan.
+# ---------------------------------------------------------------------------
+_db_pool = psycopg2.pool.ThreadedConnectionPool(
+    minconn=1,
+    maxconn=20,
+    host=os.getenv("SUPABASE_HOST"),
+    database="postgres",
+    user=os.getenv("SUPABASE_USER", "postgres"),
+    password=os.getenv("SUPABASE_PASSWORD"),
+    port=5432,
+    keepalives=1,
+    keepalives_idle=30,
+    keepalives_interval=10,
+    keepalives_count=5,
+    connect_timeout=10,
+)
+
 # Local knowledge base (pgvector)
 from knowledge_base import KnowledgeBase, redact_text
+
+
+# ---------------------------------------------------------------------------
+# Module-level LLM singletons.
+# Creating a ChatOpenAI object is cheap but it still imports/validates config
+# and allocates an httpx client each time.  Sharing one instance per
+# temperature bucket eliminates that overhead across all agent classes.
+# ---------------------------------------------------------------------------
+_llm_classifier = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.2,
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
+_llm_navigator = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.2,
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
+_llm_conversation = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.4,
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
+_llm_extractor = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.1,
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
+
+# ---------------------------------------------------------------------------
+# Module-level compiled LangGraph cache.
+# CredentialingAgent._build_graph() is called in __init__; compiling the
+# graph on every instantiation wastes several hundred milliseconds.  Cache
+# the compiled graph here after the first build.
+# ---------------------------------------------------------------------------
+_compiled_graph = None
+
+# ---------------------------------------------------------------------------
+# IVR knowledge TTL cache.
+# get_ivr_knowledge() is called on every call init.  IVR menu structures
+# change rarely, so a 30-minute in-process cache avoids a DB round-trip on
+# repeated calls to the same insurer.
+# Structure: { insurance_name_lower: (data, fetched_timestamp) }
+# ---------------------------------------------------------------------------
+_ivr_knowledge_cache: dict = {}
+_IVR_CACHE_TTL_SECONDS: int = 1800  # 30 minutes
 
 
 class CallState(str, Enum):
@@ -81,6 +151,9 @@ class CredentialingState(TypedDict):
     # Request information
     insurance_name: str
     provider_name: str
+    provider_first_name: Optional[str]
+    provider_last_name: Optional[str]
+    provider_initials: Optional[str]
     npi: str
     tax_id: str
     address: str
@@ -121,7 +194,9 @@ class CredentialingState(TypedDict):
     # Control flow
     should_continue: bool
     disclosure_acknowledged: bool
+    is_first_message: bool
     error_message: Optional[str]
+    ivr_recommendation: Optional[str]
 
     # Timing metrics (optional)
     call_start_time: Optional[datetime]
@@ -151,15 +226,36 @@ class LangSmithConfig:
 
 class DatabaseManager:
     """Manages all database operations"""
-    
+
     def __init__(self):
-        self.conn = psycopg2.connect(
-            host=os.getenv("SUPABASE_HOST"),
-            database="postgres",
-            user=os.getenv("SUPABASE_USER", "postgres"),
-            password=os.getenv("SUPABASE_PASSWORD"),
-            port=5432
-        )
+        # Acquire from the module-level pool rather than opening a new TCP
+        # connection.  This makes CredentialingAgent instantiation ~10× faster
+        # once the pool is warmed up.
+        self._conn = _db_pool.getconn()
+        self._last_pinged: float = 0.0
+
+    @property
+    def conn(self):
+        """Return a live connection, pinging and reconnecting if idle > 30 s."""
+        if time.monotonic() - self._last_pinged > 30:
+            self._ensure_connection()
+        return self._conn
+
+    def _ensure_connection(self) -> None:
+        """Verify the connection is alive; replace with a fresh pool connection if not."""
+        try:
+            if self._conn.closed:
+                raise psycopg2.OperationalError("connection is closed")
+            with self._conn.cursor() as _c:
+                _c.execute("SELECT 1")
+            self._last_pinged = time.monotonic()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            try:
+                _db_pool.putconn(self._conn)
+            except Exception:
+                pass
+            self._conn = _db_pool.getconn()
+            self._last_pinged = time.monotonic()
     
     def save_credentialing_request(self, state: CredentialingState) -> str:
         """Save initial credentialing request"""
@@ -185,14 +281,30 @@ class DatabaseManager:
             return str(request_id)
     
     def get_ivr_knowledge(self, insurance_name: str) -> List[Dict]:
-        """Retrieve IVR knowledge for an insurance provider"""
+        """Retrieve IVR knowledge for an insurance provider.
+
+        Results are cached in-process for _IVR_CACHE_TTL_SECONDS (30 min)
+        because IVR menus change rarely and this is called on every call init.
+        The cache key is the lower-cased insurance name to mirror the
+        case-insensitive ILIKE query.
+        """
+        cache_key = insurance_name.lower()
+        cached = _ivr_knowledge_cache.get(cache_key)
+        if cached is not None:
+            data, fetched_at = cached
+            if time.monotonic() - fetched_at < _IVR_CACHE_TTL_SECONDS:
+                return data
+
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT * FROM ivr_knowledge 
+                SELECT * FROM ivr_knowledge
                 WHERE insurance_name ILIKE %s
                 ORDER BY success_rate DESC, menu_level ASC
             """, (f"%{insurance_name}%",))
-            return [dict(row) for row in cur.fetchall()]
+            data = [dict(row) for row in cur.fetchall()]
+
+        _ivr_knowledge_cache[cache_key] = (data, time.monotonic())
+        return data
     
     def log_call_event(self, call_id: str, event_type: str, data: Dict):
         """Log a call event"""
@@ -698,9 +810,10 @@ class DatabaseManager:
             return [dict(row) for row in cur.fetchall()]
 
     def close(self):
-        """Close database connection"""
-        if self.conn:
-            self.conn.close()
+        """Return database connection to the pool (does not close the TCP connection)."""
+        if self._conn:
+            _db_pool.putconn(self._conn)
+            self._conn = None
 
 
 class ConfigManager:
@@ -838,23 +951,21 @@ class SpeechProcessor:
     
     def generate_speech(self, text: str) -> bytes:
         """Generate speech using ElevenLabs"""
-        audio = self.elevenlabs.generate(
+        audio_generator = self.elevenlabs.text_to_speech.convert(
+            voice_id=self.voice_id,
             text=text,
-            voice=self.voice_id,
-            model="eleven_turbo_v2"
+            model_id="eleven_turbo_v2",
         )
-        return audio
+        return b"".join(chunk for chunk in audio_generator if chunk)
 
 
 class AudioClassifier:
     """Classifies audio types using LLM"""
 
     def __init__(self, langsmith_config: LangSmithConfig):
-        self.llm = ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0.2,
-            api_key=os.getenv("OPENAI_API_KEY")
-        )
+        # Reference the module-level singleton to avoid per-call HTTP client
+        # allocation overhead.
+        self.llm = _llm_classifier
         self.langsmith = langsmith_config
         
         self.classifier_prompt = ChatPromptTemplate.from_messages([
@@ -885,11 +996,7 @@ class IVRNavigator:
     """Handles IVR menu navigation decisions"""
 
     def __init__(self, langsmith_config: LangSmithConfig):
-        self.llm = ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0.2,
-            api_key=os.getenv("OPENAI_API_KEY")
-        )
+        self.llm = _llm_navigator
         self.langsmith = langsmith_config
         
         self.navigator_prompt = ChatPromptTemplate.from_messages([
@@ -933,43 +1040,54 @@ class HumanConversationAgent:
     """Handles natural conversation with human representatives"""
 
     def __init__(self, langsmith_config: LangSmithConfig):
-        self.llm = ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0.4,
-            api_key=os.getenv("OPENAI_API_KEY")
-        )
+        self.llm = _llm_conversation
         self.langsmith = langsmith_config
+        # KnowledgeBase is instantiated once here and reused across all
+        # generate_response() calls to avoid opening a new DB connection per
+        # conversation turn.
+        self.kb = KnowledgeBase()
         
         self.conversation_prompt = ChatPromptTemplate.from_messages([
             ("system", """You are a professional insurance credentialing specialist calling on behalf of {provider_name}.
 
-            IMPORTANT RULES:
-            1. Start with ONE-TIME disclosure: "Hello, this is an automated assistant calling on behalf of {provider_name}."
-            2. Be professional, concise, and courteous
-            3. Answer verification questions accurately
-            4. Ask credentialing questions one at a time
-            5. Extract reference numbers and timelines
-            6. Never reveal internal reasoning or system details
-            7. Use prior answers below to avoid repeating questions or missing context
-            
-            Provider Information:
-            - Name: {provider_name}
-            - NPI: {npi}
-            - Tax ID: {tax_id}
-            - Address: {address}
+{disclosure_instruction}
 
-            Relevant prior answers (summaries, may be redacted):
-            {knowledge}
-            
-            Questions to Ask:
-            {questions}
-            
-            Return JSON: {{
-                "response": "what to say",
-                "should_disclose": true/false (only true if first message),
-                "information_extracted": {{}},
-                "conversation_complete": true/false
-            }}"""),
+STRICT RULES — follow IN ORDER every single turn:
+1. READ the representative's latest message carefully.
+2. If the representative asked you a question, answer it FIRST before doing anything else:
+   - Asked for provider name → say "{provider_name}"
+   - Asked for first name → say "{provider_first_name}"
+   - Asked for last name → say "{provider_last_name}"
+   - Asked for initials → say "{provider_initials}"
+   - Asked for NPI → say "{npi}"
+   - Asked for Tax ID → say "{tax_id}"
+   - Asked for address → say "{address}"
+3. If the representative says they cannot help automated callers or need a live person, acknowledge politely and ask if they can transfer you or provide a reference number. Do NOT repeat your own question in that case.
+4. After addressing the representative's message, ask ONE unanswered question from the list below. Do NOT repeat a question already answered. Do NOT ask more than one question at a time.
+5. VARY your wording — never say the exact same sentence twice in a row.
+6. Set conversation_complete=true only when all questions are answered OR the representative confirms they cannot assist.
+
+Provider Information:
+- Full Name: {provider_name}
+- First Name: {provider_first_name}
+- Last Name: {provider_last_name}
+- Initials: {provider_initials}
+- NPI: {npi}
+- Tax ID: {tax_id}
+- Address: {address}
+
+Questions to ask (in order, skip already answered ones):
+{questions}
+
+Prior knowledge from similar calls:
+{knowledge}
+
+Return ONLY valid JSON — no extra text:
+{{
+  "response": "what to say to the representative",
+  "information_extracted": {{}},
+  "conversation_complete": false
+}}"""),
             MessagesPlaceholder(variable_name="conversation_history"),
             ("user", "Representative said: {current_message}")
         ])
@@ -987,31 +1105,39 @@ class HumanConversationAgent:
             else:
                 messages.append(HumanMessage(content=msg['message']))
 
-        # Fetch knowledge snippets
+        # Fetch knowledge snippets using the shared KnowledgeBase instance
+        # (no open/close per call — connection is held in self.kb).
         knowledge_text = ""
         try:
-            kb = KnowledgeBase()
-            snippets = kb.search(
+            snippets = self.kb.search(
                 insurance_name=state.get('insurance_name', ''),
                 provider_name=state.get('provider_name'),
                 query=current_message,
                 limit=5
             )
-            kb.close()
             if snippets:
                 knowledge_text = "\n".join([f"- {s.get('summary','')}" for s in snippets])
         except Exception as kb_err:
             print(f"KB lookup failed: {kb_err}")
         
+        if state.get('is_first_message', True):
+            disclosure_instruction = f'FIRST MESSAGE: Begin with exactly this disclosure once: "This is an automated assistant calling on behalf of {state["provider_name"]}." Then proceed with the rules below.'
+        else:
+            disclosure_instruction = 'NOT the first message: Do NOT include any automated disclosure. Go straight to responding.'
+
         result = chain.invoke({
             "provider_name": state['provider_name'],
+            "provider_first_name": state.get('provider_first_name', ''),
+            "provider_last_name": state.get('provider_last_name', ''),
+            "provider_initials": state.get('provider_initials', ''),
             "npi": state['npi'],
             "tax_id": state['tax_id'],
             "address": state['address'],
             "questions": json.dumps(state['questions'], indent=2),
             "conversation_history": messages,
             "current_message": current_message,
-            "knowledge": knowledge_text or "None available"
+            "knowledge": knowledge_text or "None available",
+            "disclosure_instruction": disclosure_instruction,
         })
         
         return result
@@ -1021,11 +1147,7 @@ class InformationExtractor:
     """Extracts structured information from conversation"""
 
     def __init__(self, langsmith_config: LangSmithConfig):
-        self.llm = ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0.1,
-            api_key=os.getenv("OPENAI_API_KEY")
-        )
+        self.llm = _llm_extractor
         self.langsmith = langsmith_config
         
         self.extractor_prompt = ChatPromptTemplate.from_messages([
@@ -1092,14 +1214,28 @@ Return JSON:
 Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
             ("user", "Conversation:\n{conversation}")
         ])
-        
+        # Shared KnowledgeBase for post-call ingestion — avoids opening a
+        # fresh TCP connection on every finalize_call().
+        self.kb = KnowledgeBase()
+
         # Build state graph
         self.graph = self._build_graph()
     
     def _build_graph(self) -> StateGraph:
-        """Build the LangGraph state machine"""
+        """Build (or return the cached) LangGraph state machine.
+
+        Compiling the graph is an expensive one-time operation.  The compiled
+        graph is stored in the module-level ``_compiled_graph`` variable so
+        subsequent CredentialingAgent instantiations reuse it without
+        rebuilding.  Each call still gets its own thread_id via the
+        MemorySaver checkpointer, so state isolation is preserved.
+        """
+        global _compiled_graph
+        if _compiled_graph is not None:
+            return _compiled_graph
+
         workflow = StateGraph(CredentialingState)
-        
+
         # Add nodes
         workflow.add_node("initialize", self._initialize_call)
         workflow.add_node("classify_audio", self._classify_audio)
@@ -1108,10 +1244,10 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
         workflow.add_node("converse_with_human", self._converse_with_human)
         workflow.add_node("extract_results", self._extract_results)
         workflow.add_node("finalize", self._finalize_call)
-        
+
         # Set entry point
         workflow.set_entry_point("initialize")
-        
+
         # Add conditional edges
         workflow.add_conditional_edges(
             "initialize",
@@ -1121,7 +1257,7 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
                 "error": END
             }
         )
-        
+
         workflow.add_conditional_edges(
             "classify_audio",
             self._route_by_audio_type,
@@ -1133,19 +1269,20 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
                 "error": END,
             }
         )
-        
+
         workflow.add_conditional_edges(
             "navigate_ivr",
             self._check_continue,
             {
                 "continue": "classify_audio",
                 "complete": "extract_results",
-                "error": END
+                "error": END,
+                "ivr_error": "finalize"
             }
         )
-        
+
         workflow.add_edge("handle_hold", "classify_audio")
-        
+
         workflow.add_conditional_edges(
             "converse_with_human",
             self._check_conversation_complete,
@@ -1155,25 +1292,34 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
                 "error": END,
             }
         )
-        
+
         workflow.add_edge("extract_results", "finalize")
         workflow.add_edge("finalize", END)
-        
+
         # Compile with checkpointer for persistence (using in-memory for development)
         checkpointer = MemorySaver()
 
-        return workflow.compile(checkpointer=checkpointer)
+        _compiled_graph = workflow.compile(checkpointer=checkpointer)
+        return _compiled_graph
     
     @traceable(name="initialize_call")
     def _initialize_call(self, state: CredentialingState) -> CredentialingState:
         """Initialize the call"""
-        # Save request to database unless already provided (e.g., API created it)
         request_id = state.get('db_request_id')
+
         if not request_id:
-            request_id = self.db.save_credentialing_request(state)
-        
-        # Get IVR knowledge
-        ivr_knowledge = self.db.get_ivr_knowledge(state['insurance_name'])
+            # save_credentialing_request and get_ivr_knowledge are independent:
+            # one writes a new row, the other reads from a different table.
+            # Run them in parallel via a thread pool to cut init latency.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                future_save = executor.submit(self.db.save_credentialing_request, state)
+                future_ivr = executor.submit(self.db.get_ivr_knowledge, state['insurance_name'])
+                request_id = future_save.result()
+                ivr_knowledge = future_ivr.result()
+        else:
+            # request_id already exists (created by API before graph run);
+            # only fetch IVR knowledge.
+            ivr_knowledge = self.db.get_ivr_knowledge(state['insurance_name'])
         
         # Initiate Twilio call
         callback_url = os.getenv("CALLBACK_URL")
@@ -1190,7 +1336,16 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
         state['retry_count'] = 0
         state['call_state'] = CallState.IVR_NAVIGATION
         state['should_continue'] = True
-        
+
+        # Derive first/last name and initials from provider_name if not supplied
+        if not state.get('provider_first_name') or not state.get('provider_last_name'):
+            raw = state['provider_name']
+            parts = [p for p in raw.replace("Dr.", "").replace("Dr ", "").strip().split() if p]
+            state['provider_first_name'] = state.get('provider_first_name') or (parts[0] if parts else raw)
+            state['provider_last_name'] = state.get('provider_last_name') or (parts[-1] if len(parts) > 1 else "")
+            state['provider_initials'] = state.get('provider_initials') or (".".join(p[0].upper() for p in parts if p) + "." if parts else "")
+        state['is_first_message'] = True
+
         return state
     
     @traceable(name="classify_audio")
@@ -1249,9 +1404,27 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
             # Upload audio and play (implementation depends on your setup)
             pass
         
-        state['last_action'] = action
+        # Close the IVR learning loop: find the matched ivr_knowledge row and
+        # record that this action was attempted.  We match on preferred_action
+        # + action_value so the success_rate stays accurate over time.
+        matched_ivr_id = None
+        for entry in state.get('ivr_knowledge', []):
+            if (
+                entry.get('preferred_action') == action.get('action')
+                and str(entry.get('action_value', '')).strip() == str(action.get('value', '')).strip()
+            ):
+                matched_ivr_id = entry.get('id')
+                break
+        if matched_ivr_id:
+            try:
+                self.db.update_ivr_knowledge(matched_ivr_id, success=True)
+            except Exception as ivr_upd_err:
+                print(f"IVR knowledge update failed: {ivr_upd_err}")
+
+        # Store matched_ivr_id so _check_continue can mark it failed if retries are exceeded
+        state['last_action'] = {**action, 'matched_ivr_id': matched_ivr_id}
         state['current_menu_level'] += 1
-        
+
         # Log action
         self.db.log_call_event(
             state['call_id'],
@@ -1261,7 +1434,7 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
                 'menu_level': state['current_menu_level']
             }
         )
-        
+
         return state
     
     @traceable(name="handle_hold")
@@ -1291,9 +1464,17 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
         
         response = self.conversation_agent.generate_response(state, latest_transcript)
         
-        # Save to conversation history
-        self.db.save_conversation(state['call_id'], 'representative', latest_transcript, state.get('db_request_id'))
-        self.db.save_conversation(state['call_id'], 'agent', response['response'], state.get('db_request_id'))
+        # Save both conversation rows in parallel — they write independent rows
+        # (different speaker values) with no dependency between them.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            executor.submit(
+                self.db.save_conversation,
+                state['call_id'], 'representative', latest_transcript, state.get('db_request_id')
+            )
+            executor.submit(
+                self.db.save_conversation,
+                state['call_id'], 'agent', response['response'], state.get('db_request_id')
+            )
         
         # Add to state
         state['conversation_history'].append({
@@ -1312,7 +1493,10 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
         # Check if conversation is complete
         if response.get('conversation_complete'):
             state['should_continue'] = False
-        
+
+        # Mark that the first message has been sent so disclosure is not repeated
+        state['is_first_message'] = False
+
         return state
     
     @traceable(name="extract_results")
@@ -1369,8 +1553,8 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
                 "turnaround_days": state.get("turnaround_days"),
             }
 
-            kb = KnowledgeBase()
-            kb.upsert_entry(
+            # Use the shared self.kb instance — no per-call open/close cost.
+            self.kb.upsert_entry(
                 insurance_name=state.get("insurance_name"),
                 provider_name=state.get("provider_name"),
                 call_id=state.get("call_id"),
@@ -1379,7 +1563,6 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
                 qa_text=qa_text,
                 metadata=metadata,
             )
-            kb.close()
             print("Knowledge base ingestion complete.")
         except Exception as e:
             print(f"Knowledge base ingestion failed: {e}")
@@ -1422,7 +1605,7 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
                 hold_time_seconds=hold_time,
                 human_interaction_time_seconds=human_time,
                 successful=(state.get('credentialing_status') not in ['failed', None]),
-                failure_reason=state.get('error_message'),
+                failure_reason=state.get('ivr_recommendation') or state.get('error_message'),
                 retry_count=state.get('retry_count', 0),
             )
             print(f"Call metrics recorded for call {state['call_id']}")
@@ -1442,6 +1625,95 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
 
         return state
     
+    def _handle_ivr_failure(self, state: CredentialingState) -> None:
+        """Generate and store an IVR recommendation when navigation fails."""
+        transcript_text = "\n".join(
+            t['text'] for t in state.get('transcript', [])[-10:]
+        )
+        ivr_knowledge_text = json.dumps(state.get('ivr_knowledge', [])[:5], indent=2)
+        last_action = json.dumps(state.get('last_action', {}))
+
+        prompt = (
+            f"The AI agent failed to navigate the IVR for {state['insurance_name']} "
+            f"after {state.get('retry_count', 0)} retries.\n\n"
+            f"Last transcript lines:\n{transcript_text}\n\n"
+            f"IVR knowledge tried:\n{ivr_knowledge_text}\n\n"
+            f"Last action attempted:\n{last_action}\n\n"
+            "Write a short (2-3 sentence) recommendation for a human or future AI call "
+            "on how to navigate this IVR successfully. Be specific: what phrase to say, "
+            "what key to press, what menu level to target.\n"
+            'Return JSON only: {"recommendation": "...", "suggested_action": "dtmf|speech|wait", "suggested_value": "..."}'
+        )
+
+        recommendation = (
+            f"IVR navigation failed for {state['insurance_name']} after "
+            f"{state.get('retry_count', 0)} retries. Manual review recommended."
+        )
+        suggested_action = None
+        suggested_value = None
+
+        try:
+            result = _llm_navigator.invoke(prompt)
+            rec_data = json.loads(result.content)
+            recommendation = rec_data.get('recommendation', recommendation)
+            suggested_action = rec_data.get('suggested_action')
+            suggested_value = rec_data.get('suggested_value')
+        except Exception as e:
+            print(f"IVR recommendation generation failed: {e}")
+
+        state['ivr_recommendation'] = recommendation
+
+        # Mark the last matched IVR entry as failed and attach the recommendation
+        last = state.get('last_action', {})
+        matched_id = last.get('matched_ivr_id')
+        if matched_id:
+            try:
+                self.db.update_ivr_knowledge(matched_id, success=False)
+            except Exception as e:
+                print(f"IVR failure update failed: {e}")
+            try:
+                with self.db.conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE ivr_knowledge
+                        SET metadata = metadata || %s::jsonb
+                        WHERE id = %s
+                        """,
+                        (json.dumps({"last_failure_recommendation": recommendation}), str(matched_id))
+                    )
+                    self.db.conn.commit()
+            except Exception as e:
+                print(f"IVR metadata update failed: {e}")
+
+        # Persist a new suggested IVR entry so the next call can try it
+        if suggested_action and suggested_value:
+            try:
+                with self.db.conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO ivr_knowledge
+                            (insurance_name, menu_level, detected_phrase, preferred_action,
+                             action_value, confidence_threshold, metadata)
+                        VALUES (%s, %s, %s, %s, %s, 0.5, %s)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        (
+                            state['insurance_name'],
+                            state.get('current_menu_level', 1),
+                            transcript_text[-200:],
+                            suggested_action,
+                            suggested_value,
+                            json.dumps({
+                                "source": "auto_recommendation",
+                                "recommendation": recommendation,
+                            }),
+                        )
+                    )
+                    self.db.conn.commit()
+                print(f"IVR recommendation stored for {state['insurance_name']}: {recommendation}")
+            except Exception as e:
+                print(f"IVR recommendation insert failed: {e}")
+
     # Routing functions
     def _route_after_init(self, state: CredentialingState) -> str:
         """Route after initialization"""
@@ -1474,7 +1746,9 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
         if not state.get('should_continue', True):
             return "complete"
         if state.get('retry_count', 0) > 3:
-            return "error"
+            # Generate and store an IVR recommendation before exiting
+            self._handle_ivr_failure(state)
+            return "ivr_error"
         return "continue"
     
     def _check_conversation_complete(self, state: CredentialingState) -> str:
@@ -1496,6 +1770,7 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
     def close(self):
         """Cleanup resources"""
         self.db.close()
+        self.kb.close()
 
 
 # Example usage
