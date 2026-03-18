@@ -9,6 +9,7 @@ import os
 import json
 import asyncio
 import concurrent.futures
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Literal, TypedDict, Annotated, Any
 from enum import Enum
@@ -52,13 +53,18 @@ load_dotenv()
 # minconn=5 / maxconn=20 mirrors the approved plan.
 # ---------------------------------------------------------------------------
 _db_pool = psycopg2.pool.ThreadedConnectionPool(
-    minconn=5,
+    minconn=1,
     maxconn=20,
     host=os.getenv("SUPABASE_HOST"),
     database="postgres",
     user=os.getenv("SUPABASE_USER", "postgres"),
     password=os.getenv("SUPABASE_PASSWORD"),
     port=5432,
+    keepalives=1,
+    keepalives_idle=30,
+    keepalives_interval=10,
+    keepalives_count=5,
+    connect_timeout=10,
 )
 
 # Local knowledge base (pgvector)
@@ -220,7 +226,31 @@ class DatabaseManager:
         # Acquire from the module-level pool rather than opening a new TCP
         # connection.  This makes CredentialingAgent instantiation ~10× faster
         # once the pool is warmed up.
-        self.conn = _db_pool.getconn()
+        self._conn = _db_pool.getconn()
+        self._last_pinged: float = 0.0
+
+    @property
+    def conn(self):
+        """Return a live connection, pinging and reconnecting if idle > 30 s."""
+        if time.monotonic() - self._last_pinged > 30:
+            self._ensure_connection()
+        return self._conn
+
+    def _ensure_connection(self) -> None:
+        """Verify the connection is alive; replace with a fresh pool connection if not."""
+        try:
+            if self._conn.closed:
+                raise psycopg2.OperationalError("connection is closed")
+            with self._conn.cursor() as _c:
+                _c.execute("SELECT 1")
+            self._last_pinged = time.monotonic()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            try:
+                _db_pool.putconn(self._conn)
+            except Exception:
+                pass
+            self._conn = _db_pool.getconn()
+            self._last_pinged = time.monotonic()
     
     def save_credentialing_request(self, state: CredentialingState) -> str:
         """Save initial credentialing request"""
@@ -253,12 +283,11 @@ class DatabaseManager:
         The cache key is the lower-cased insurance name to mirror the
         case-insensitive ILIKE query.
         """
-        import time as _time
         cache_key = insurance_name.lower()
         cached = _ivr_knowledge_cache.get(cache_key)
         if cached is not None:
             data, fetched_at = cached
-            if _time.monotonic() - fetched_at < _IVR_CACHE_TTL_SECONDS:
+            if time.monotonic() - fetched_at < _IVR_CACHE_TTL_SECONDS:
                 return data
 
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -269,7 +298,7 @@ class DatabaseManager:
             """, (f"%{insurance_name}%",))
             data = [dict(row) for row in cur.fetchall()]
 
-        _ivr_knowledge_cache[cache_key] = (data, _time.monotonic())
+        _ivr_knowledge_cache[cache_key] = (data, time.monotonic())
         return data
     
     def log_call_event(self, call_id: str, event_type: str, data: Dict):
@@ -777,9 +806,9 @@ class DatabaseManager:
 
     def close(self):
         """Return database connection to the pool (does not close the TCP connection)."""
-        if self.conn:
-            _db_pool.putconn(self.conn)
-            self.conn = None
+        if self._conn:
+            _db_pool.putconn(self._conn)
+            self._conn = None
 
 
 class ConfigManager:
@@ -917,12 +946,12 @@ class SpeechProcessor:
     
     def generate_speech(self, text: str) -> bytes:
         """Generate speech using ElevenLabs"""
-        audio = self.elevenlabs.generate(
+        audio_generator = self.elevenlabs.text_to_speech.convert(
+            voice_id=self.voice_id,
             text=text,
-            voice=self.voice_id,
-            model="eleven_turbo_v2"
+            model_id="eleven_turbo_v2",
         )
-        return audio
+        return b"".join(chunk for chunk in audio_generator if chunk)
 
 
 class AudioClassifier:
