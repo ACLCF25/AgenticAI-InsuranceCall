@@ -211,6 +211,15 @@ class APIClient {
     });
     return data;
   }
+
+  // Transfer an active AI call to a real human agent
+  async transferToAgent(callId: string, agentPhone: string): Promise<APIResponse> {
+    const { data } = await this.client.post('/transfer-to-agent', {
+      call_id: callId,
+      agent_phone: agentPhone,
+    });
+    return data;
+  }
 }
 
 export const api = new APIClient();

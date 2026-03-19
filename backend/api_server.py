@@ -576,6 +576,14 @@ def start_credentialing_call():
         # Generate call_id upfront so we can track immediately
         call_id = str(uuid.uuid4())
 
+        # Extract call mode and agent phone (for AI vs real-agent routing)
+        call_mode = data.get('call_mode', 'ai')
+        if call_mode not in ('ai', 'agent'):
+            call_mode = 'ai'
+        agent_phone = data.get('agent_phone')
+        if call_mode == 'agent' and not agent_phone:
+            return jsonify({'success': False, 'error': 'agent_phone is required when call_mode is agent'}), 400
+
         # Create initial state
         initial_state: CredentialingState = {
             'insurance_name': data['insurance_name'],
@@ -606,7 +614,12 @@ def start_credentialing_call():
             'notes': '',
             'should_continue': True,
             'disclosure_acknowledged': False,
-            'error_message': None
+            'error_message': None,
+            # AI vs real-agent mode fields
+            'call_mode': call_mode,
+            'agent_phone': agent_phone,
+            'conference_sid': None,
+            'transfer_to_agent': False,
         }
 
         # Create DB record up front so answers can be stored during the call
@@ -614,6 +627,17 @@ def start_credentialing_call():
             from credentialing_agent import DatabaseManager
             db = DatabaseManager()
             request_id = db.save_credentialing_request(initial_state)
+            # Persist call_mode and agent_phone into the DB record
+            with db.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE credentialing_requests
+                    SET call_mode = %s, agent_phone = %s
+                    WHERE id = %s
+                    """,
+                    (call_mode, agent_phone, request_id)
+                )
+                db.conn.commit()
             db.close()
             initial_state['db_request_id'] = request_id
             print(f"INFO: Saved credentialing request to DB with id {request_id}")
@@ -759,6 +783,67 @@ def voice_webhook():
         provider_name = "a healthcare provider"
         if call_info:
             provider_name = call_info['state'].get('provider_name', provider_name)
+
+        # ── Real-Agent Mode ──────────────────────────────────────────────────────
+        # If the call was started with call_mode='agent', skip the AI entirely.
+        # Put the inbound call leg into a Twilio Conference and immediately dial
+        # the agent_phone into the same conference room so they join live.
+        if call_info and call_info['state'].get('call_mode') == 'agent':
+            call_state_obj = call_info['state']
+            conf_name = call_info['call_id']
+            agent_phone_number = call_state_obj.get('agent_phone')
+
+            logger.info(f"[voice_webhook] Real-agent mode for call_id={conf_name}, agent_phone={agent_phone_number}")
+
+            # Build Dial+Conference TwiML for the inbound (insurance) leg.
+            # endConferenceOnExit=true so the conference closes when insurance hangs up.
+            conference_twiml = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<Response>'
+                '<Dial>'
+                f'<Conference waitUrl="" startConferenceOnEnter="true" endConferenceOnExit="true">'
+                f'{conf_name}'
+                '</Conference>'
+                '</Dial>'
+                '</Response>'
+            )
+
+            # Bail out if no agent phone — call_mode='agent' requires it
+            if not agent_phone_number:
+                logger.error(f"[voice_webhook] Real-agent mode requested but agent_phone is missing for call_id={conf_name}")
+                error_twiml = (
+                    '<?xml version="1.0" encoding="UTF-8"?>'
+                    '<Response>'
+                    '<Say>We are sorry, this call cannot be connected. No agent phone number was configured.</Say>'
+                    '</Response>'
+                )
+                return Response(error_twiml, mimetype='text/xml')
+
+            # Dial the real agent into the same conference (fire-and-forget)
+            try:
+                from_number = os.getenv("TWILIO_PHONE_NUMBER")
+                agent_conference_twiml = (
+                    '<Response>'
+                    '<Dial>'
+                    f'<Conference waitUrl="" startConferenceOnEnter="true" endConferenceOnExit="false">'
+                    f'{conf_name}'
+                    '</Conference>'
+                    '</Dial>'
+                    '</Response>'
+                )
+                agent_call = twilio_client.calls.create(
+                    to=agent_phone_number,
+                    from_=from_number,
+                    twiml=agent_conference_twiml,
+                )
+                # Note: conference_sid stores the agent call SID, not a Twilio Conference SID
+                call_state_obj['conference_sid'] = agent_call.sid
+                logger.info(f"[voice_webhook] Dialed agent {agent_phone_number} into conference {conf_name}, agent call SID={agent_call.sid}")
+            except Exception as dial_err:
+                logger.error(f"[voice_webhook] Failed to dial agent into conference: {dial_err}")
+
+            return Response(conference_twiml, mimetype='text/xml')
+        # ── End Real-Agent Mode ──────────────────────────────────────────────────
 
         # If IVR patterns exist, we need to navigate through them first
         if ivr_patterns and len(ivr_patterns) > 0:
@@ -923,11 +1008,11 @@ def ivr_navigate_webhook():
 
             if ivr_asks_npi or ivr_asks_tax_id:
                 npi_keywords = ['npi', 'national provider', 'provider number', 'provider identification']
-                tax_keywords = ['tax id', 'tax identification', 'ein', 'employer identification',
+                tax_keywords = ['tax id', 'tax identification', r'\bein\b', 'employer identification',
                                 'federal tax', 'tax number', 'taxpayer']
 
-                npi_detected = ivr_asks_npi and any(kw in speech_lower for kw in npi_keywords)
-                tax_detected = ivr_asks_tax_id and any(kw in speech_lower for kw in tax_keywords)
+                npi_detected = ivr_asks_npi and any(re.search(kw, speech_lower) for kw in npi_keywords)
+                tax_detected = ivr_asks_tax_id and any(re.search(kw, speech_lower) for kw in tax_keywords)
 
                 if npi_detected or tax_detected:
                     print(f"📋 IVR requesting credentials - NPI: {npi_detected}, Tax ID: {tax_detected}")
@@ -2546,7 +2631,7 @@ def get_recent_calls():
                 SELECT id, insurance_name, provider_name, npi, tax_id,
                        address, insurance_phone, status, reference_number,
                        missing_documents, turnaround_days, notes,
-                       created_at, completed_at
+                       created_at, completed_at, call_mode, agent_phone
                 FROM credentialing_requests
                 ORDER BY created_at DESC
                 LIMIT %s
@@ -2568,7 +2653,9 @@ def get_recent_calls():
                     'turnaround_days': row[10],
                     'notes': row[11],
                     'created_at': row[12].isoformat() if row[12] else None,
-                    'completed_at': row[13].isoformat() if row[13] else None
+                    'completed_at': row[13].isoformat() if row[13] else None,
+                    'call_mode': row[14] or 'ai',
+                    'agent_phone': row[15],
                 })
 
         db.close()
@@ -3474,6 +3561,149 @@ def create_audit_log():
         }), 201
     except Exception as e:
         logger.error(f"Error creating audit log: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ============================================================================
+# AI vs Real-Agent Transfer Endpoint
+# ============================================================================
+
+@app.route('/api/transfer-to-agent', methods=['POST'])
+@jwt_required()
+def transfer_to_agent():
+    """
+    Mid-call transfer from AI to a real human agent using Twilio Conference.
+
+    Request body:
+    {
+        "call_id": "<runtime call UUID>",
+        "agent_phone": "+15551234567"
+    }
+
+    Behaviour:
+    1. Looks up the active call by call_id.
+    2. Redirects the live Twilio call into a Conference room (named by call_id).
+    3. Dials agent_phone into the same Conference.
+    4. Sets transfer_to_agent=True in call_states so the AI polling loop exits.
+    5. Persists call_mode='agent', agent_phone, and conference_sid to the DB.
+    """
+    try:
+        data = request.json or {}
+        call_id = data.get('call_id')
+        agent_phone = data.get('agent_phone')
+
+        if not call_id:
+            return jsonify({'success': False, 'error': 'call_id is required'}), 400
+        if not agent_phone:
+            return jsonify({'success': False, 'error': 'agent_phone is required'}), 400
+
+        # Fetch in-memory call state — try runtime call_id first, then fall back
+        # to matching by DB request ID (the UI sends the DB UUID from /api/calls)
+        call_state = call_states.get(call_id)
+        if not call_state:
+            call_state = next(
+                (s for s in call_states.values() if s.get('db_request_id') == call_id),
+                None
+            )
+        if not call_state:
+            return jsonify({'success': False, 'error': 'Call not found or already ended'}), 404
+
+        call_sid = call_state.get('call_sid')
+        if not call_sid:
+            return jsonify({'success': False, 'error': 'Call SID not yet available; call may still be connecting'}), 400
+
+        from_number = os.getenv("TWILIO_PHONE_NUMBER")
+        conf_name = call_id  # Conference room name = call_id for uniqueness
+
+        # TwiML to redirect the insurance-side call into the conference
+        insurance_leg_twiml = (
+            '<Response>'
+            '<Dial>'
+            f'<Conference waitUrl="" startConferenceOnEnter="true" endConferenceOnExit="true">'
+            f'{conf_name}'
+            '</Conference>'
+            '</Dial>'
+            '</Response>'
+        )
+
+        # TwiML for the agent leg (does not end conference when agent hangs up)
+        agent_leg_twiml = (
+            '<Response>'
+            '<Dial>'
+            f'<Conference waitUrl="" startConferenceOnEnter="true" endConferenceOnExit="false">'
+            f'{conf_name}'
+            '</Conference>'
+            '</Dial>'
+            '</Response>'
+        )
+
+        # Dial the real agent first — if this fails, the insurance call is untouched
+        try:
+            agent_call = twilio_client.calls.create(
+                to=agent_phone,
+                from_=from_number,
+                twiml=agent_leg_twiml,
+            )
+        except Exception as dial_err:
+            logger.error(f"[transfer-to-agent] Failed to dial agent {agent_phone}: {dial_err}")
+            return jsonify({'success': False, 'error': f'Failed to dial agent: {dial_err}'}), 500
+
+        conference_sid = agent_call.sid  # Note: this is agent call SID, not a Twilio Conference SID
+        logger.info(f"[transfer-to-agent] Dialed agent {agent_phone} into conference={conf_name}, agent_call_sid={conference_sid}")
+
+        # Only redirect the insurance call after the agent dial succeeds
+        try:
+            twilio_client.calls(call_sid).update(twiml=insurance_leg_twiml)
+            logger.info(f"[transfer-to-agent] Redirected call_sid={call_sid} into conference={conf_name}")
+        except Exception as redirect_err:
+            logger.error(f"[transfer-to-agent] Failed to redirect insurance call: {redirect_err}")
+            # Cancel the agent call we just placed so it doesn't ring forever
+            try:
+                twilio_client.calls(agent_call.sid).update(status='canceled')
+            except Exception:
+                pass
+            return jsonify({'success': False, 'error': f'Failed to redirect insurance call: {redirect_err}'}), 500
+
+        # Signal the AI agent loop to stop gracefully
+        call_state['transfer_to_agent'] = True
+        call_state['call_mode'] = 'agent'
+        call_state['agent_phone'] = agent_phone
+        call_state['conference_sid'] = conference_sid  # Note: this is agent call SID, not a Twilio Conference SID
+
+        # Persist the transfer in the DB
+        try:
+            from credentialing_agent import DatabaseManager
+            db = DatabaseManager()
+            request_id = call_state.get('db_request_id')
+            if request_id:
+                with db.conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE credentialing_requests
+                        SET call_mode = 'agent',
+                            agent_phone = %s,
+                            conference_sid = %s,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (agent_phone, conference_sid, request_id)
+                    )
+                    db.conn.commit()
+            db.close()
+        except Exception as db_err:
+            logger.warning(f"[transfer-to-agent] Could not persist transfer to DB: {db_err}")
+
+        return jsonify({
+            'success': True,
+            'message': 'Call transferred to real agent',
+            'conference_name': conf_name,
+            'agent_call_sid': conference_sid,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"[transfer-to-agent] Error: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
 

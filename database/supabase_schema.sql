@@ -22,6 +22,9 @@ CREATE TABLE credentialing_requests (
     missing_documents JSONB DEFAULT '[]'::jsonb,
     turnaround_days INTEGER,
     notes TEXT,
+    call_mode VARCHAR(10) DEFAULT 'ai' CHECK (call_mode IN ('ai', 'agent')),
+    agent_phone VARCHAR(20),
+    conference_sid VARCHAR(100),
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
     completed_at TIMESTAMP,
@@ -241,6 +244,12 @@ CREATE TABLE call_knowledge (
 
 -- Migration: Add provider_phone column if table already exists
 -- ALTER TABLE credentialing_requests ADD COLUMN IF NOT EXISTS provider_phone VARCHAR(20);
+
+-- Migration: Add call mode and agent transfer columns
+-- Run these on existing databases that already have the credentialing_requests table.
+-- ALTER TABLE credentialing_requests ADD COLUMN IF NOT EXISTS call_mode VARCHAR(10) DEFAULT 'ai' CHECK (call_mode IN ('ai', 'agent'));
+-- ALTER TABLE credentialing_requests ADD COLUMN IF NOT EXISTS agent_phone VARCHAR(20);
+-- ALTER TABLE credentialing_requests ADD COLUMN IF NOT EXISTS conference_sid VARCHAR(100);
 
 -- Indexes for fast search
 CREATE INDEX IF NOT EXISTS call_knowledge_insurance_idx ON call_knowledge (insurance_name);
