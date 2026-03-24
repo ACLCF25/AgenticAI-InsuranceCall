@@ -198,6 +198,12 @@ class CredentialingState(TypedDict):
     error_message: Optional[str]
     ivr_recommendation: Optional[str]
 
+    # Real-agent mode
+    call_mode: str
+    agent_phone: Optional[str]
+    conference_sid: Optional[str]
+    transfer_to_agent: bool
+
     # Timing metrics (optional)
     call_start_time: Optional[datetime]
     ivr_end_time: Optional[datetime]
