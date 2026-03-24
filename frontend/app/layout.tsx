@@ -18,7 +18,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body className={`${manrope.className} antialiased`}>
+      <body className={`${manrope.className} antialiased`} suppressHydrationWarning>
         <Providers>
           {children}
           <Toaster />

@@ -1472,6 +1472,16 @@ def wait_for_human_webhook():
             return Response(str(response), mimetype='text/xml')
         # ── End NPI / Tax ID auto-response ───────────────────────────────────────
 
+        # Track total wait time (needed by both AI classification and keyword logic)
+        if 'wait_start_time' not in state:
+            from datetime import datetime
+            state['wait_start_time'] = datetime.now().isoformat()
+
+        # Calculate how long we've been waiting
+        from datetime import datetime
+        wait_start = datetime.fromisoformat(state['wait_start_time'])
+        wait_duration_minutes = (datetime.now() - wait_start).total_seconds() / 60
+
         # ── AI-assisted classification (agent mode only) ──────────────────────────
         # Uses gpt-4o-mini to classify each speech chunk as human/IVR/hold/silence.
         # Only runs for agent-transfer calls — adds ~0.5-1s latency per webhook but
@@ -1577,16 +1587,6 @@ def wait_for_human_webhook():
             any(indicator in speech_lower for indicator in human_indicators) or
             (any(greeting in speech_lower for greeting in simple_greetings) and len(speech_result) < 50)
         )
-
-        # Track total wait time
-        if 'wait_start_time' not in state:
-            from datetime import datetime
-            state['wait_start_time'] = datetime.now().isoformat()
-
-        # Calculate how long we've been waiting
-        from datetime import datetime
-        wait_start = datetime.fromisoformat(state['wait_start_time'])
-        wait_duration_minutes = (datetime.now() - wait_start).total_seconds() / 60
 
         # DECISION LOGIC - Priority order matters!
 
