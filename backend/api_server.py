@@ -170,11 +170,14 @@ def ensure_environment_ready():
 
 
 def register_call_state(call_id: str, state: CredentialingState):
-    """Store call state by call_id and call_sid (if present) with a light lock."""
+    """Store call state by call_id and call_sid (if present) with a light lock.
+    Merges with any existing state so fields not returned by LangGraph are preserved."""
     with call_state_lock:
-        call_states[call_id] = state
-        if state.get('call_sid'):
-            call_states_by_sid[state['call_sid']] = state
+        existing = call_states.get(call_id, {})
+        merged = {**existing, **state}
+        call_states[call_id] = merged
+        if merged.get('call_sid'):
+            call_states_by_sid[merged['call_sid']] = merged
 
 
 def bind_call_sid(call_id: str, call_sid: str):
@@ -264,6 +267,44 @@ def speak_with_tts(response, text: str, gather=None):
         # Fallback to Polly
         target.say(text, voice='Polly.Joanna')
         logger.warning(f"Falling back to Polly TTS for: {text[:50]}...")
+
+
+def _ai_classify_speech(speech_text: str, context: str = ''):
+    """
+    Use gpt-4o-mini to classify a speech chunk during the wait-for-human phase.
+    Returns {"type": "human_speech|ivr_menu|hold_music|silence", "confidence": float, "reasoning": str}
+    or None if the AI call fails.
+    Only called for agent-mode calls — not on every webhook to control cost/latency.
+    """
+    try:
+        from langchain_openai import ChatOpenAI
+        from langchain_core.prompts import ChatPromptTemplate
+        from langchain_core.output_parsers import JsonOutputParser
+
+        llm = ChatOpenAI(model='gpt-4o-mini', temperature=0.1,
+                         api_key=os.getenv('OPENAI_API_KEY'))
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are classifying live phone call audio for an insurance credentialing system.
+Classify the speech transcript into exactly one of:
+- human_speech: A real person speaking (agent, representative, or staff member)
+- ivr_menu: Automated IVR menu with navigation options
+- hold_music: Hold messages, queue announcements, or wait music descriptions
+- silence: No meaningful speech
+
+Key signals for human_speech: introduces themselves by name ("my name is"), asks how they can help,
+responds naturally to context, uses conversational language.
+Key signals for ivr_menu: "press 1", "press 2", numbered options, "say provider", "for billing".
+Key signals for hold_music: "all representatives are busy", "estimated wait time", "your call is important",
+"please hold", "thank you for your patience".
+
+Return ONLY valid JSON: {{"type": "...", "confidence": 0.0-1.0, "reasoning": "one sentence"}}"""),
+            ("user", "Context: {context}\n\nSpeech: {speech}")
+        ])
+        chain = prompt | llm | JsonOutputParser()
+        return chain.invoke({"context": context, "speech": speech_text})
+    except Exception as e:
+        logger.warning(f"[ai_classify_speech] AI classification failed: {e}")
+        return None
 
 
 def cleanup_old_audio():
@@ -387,7 +428,9 @@ Respond ONLY with this JSON (no other text):
 
 === ACTION RULES ===
 - action="continue" - Use for normal conversation
-- action="end_call" - ONLY use when stage="wrapping_up" AND you've said goodbye
+- action="end_call" - Use when:
+  * stage="wrapping_up" AND you've said goodbye, OR
+  * Human explicitly refuses to work with AI / says they cannot help AI callers (end politely immediately)
 - action="request_transfer" - Use ONLY when:
   * All questions have been asked/answered (stage="wrapping_up"), OR
   * Human explicitly refuses to answer after multiple attempts
@@ -576,6 +619,14 @@ def start_credentialing_call():
         # Generate call_id upfront so we can track immediately
         call_id = str(uuid.uuid4())
 
+        # Extract call mode and agent phone (for AI vs real-agent routing)
+        call_mode = data.get('call_mode', 'ai')
+        if call_mode not in ('ai', 'agent'):
+            call_mode = 'ai'
+        agent_phone = data.get('agent_phone')
+        if call_mode == 'agent' and not agent_phone:
+            return jsonify({'success': False, 'error': 'agent_phone is required when call_mode is agent'}), 400
+
         # Create initial state
         initial_state: CredentialingState = {
             'insurance_name': data['insurance_name'],
@@ -606,7 +657,12 @@ def start_credentialing_call():
             'notes': '',
             'should_continue': True,
             'disclosure_acknowledged': False,
-            'error_message': None
+            'error_message': None,
+            # AI vs real-agent mode fields
+            'call_mode': call_mode,
+            'agent_phone': agent_phone,
+            'conference_sid': None,
+            'transfer_to_agent': False,
         }
 
         # Create DB record up front so answers can be stored during the call
@@ -614,6 +670,17 @@ def start_credentialing_call():
             from credentialing_agent import DatabaseManager
             db = DatabaseManager()
             request_id = db.save_credentialing_request(initial_state)
+            # Persist call_mode and agent_phone into the DB record
+            with db.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE credentialing_requests
+                    SET call_mode = %s, agent_phone = %s
+                    WHERE id = %s
+                    """,
+                    (call_mode, agent_phone, request_id)
+                )
+                db.conn.commit()
             db.close()
             initial_state['db_request_id'] = request_id
             print(f"INFO: Saved credentialing request to DB with id {request_id}")
@@ -639,8 +706,16 @@ def start_credentialing_call():
                 final_state = loop.run_until_complete(agent.process_call(initial_state))
                 loop.close()
 
+                # Preserve call_mode and agent_phone from initial_state regardless of
+                # what LangGraph returned — these are not part of the graph logic and
+                # must survive the state replacement so webhooks can check them.
+                final_state['call_mode'] = initial_state.get('call_mode', 'ai')
+                final_state['agent_phone'] = initial_state.get('agent_phone')
+                final_state['transfer_to_agent'] = initial_state.get('transfer_to_agent', False)
+
                 # Update stored state with final state
                 register_call_state(call_id, final_state)
+                print(f"📊 call_mode preserved in state: {final_state.get('call_mode')}")
                 print(f"✅ Call completed: {call_id}")
                 print(f"📊 Final status: {final_state.get('call_state')}")
             except Exception as thread_error:
@@ -672,6 +747,67 @@ def start_credentialing_call():
             'success': False,
             'error': str(e)
         }), 500
+
+
+def _bridge_to_agent(call_info, callback_base):
+    """
+    Bridge the insurance call into a Twilio Conference and dial the real human agent in.
+    Returns a Flask Response with conference TwiML for the insurance leg.
+    Called when call_mode='agent' and a human has been detected (or no IVR to navigate).
+    """
+    call_state_obj = call_info['state']
+    conf_name = call_info['call_id']
+    agent_phone_number = call_state_obj.get('agent_phone')
+
+    logger.info(f"[bridge_to_agent] Bridging call_id={conf_name} to agent_phone={agent_phone_number}")
+
+    if not agent_phone_number:
+        logger.error(f"[bridge_to_agent] agent_phone missing for call_id={conf_name}")
+        error_twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Response>'
+            '<Say>We are sorry, no agent phone number was configured for this call.</Say>'
+            '</Response>'
+        )
+        return Response(error_twiml, mimetype='text/xml')
+
+    # TwiML for the insurance leg — enters the conference and closes it when insurance hangs up
+    conference_twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Response>'
+        '<Dial>'
+        f'<Conference waitUrl="" startConferenceOnEnter="true" endConferenceOnExit="true">'
+        f'{conf_name}'
+        '</Conference>'
+        '</Dial>'
+        '</Response>'
+    )
+
+    # TwiML for the agent leg — enters the same conference
+    agent_conference_twiml = (
+        '<Response>'
+        '<Dial>'
+        f'<Conference waitUrl="" startConferenceOnEnter="true" endConferenceOnExit="false">'
+        f'{conf_name}'
+        '</Conference>'
+        '</Dial>'
+        '</Response>'
+    )
+
+    try:
+        from_number = os.getenv("TWILIO_PHONE_NUMBER")
+        agent_call = twilio_client.calls.create(
+            to=agent_phone_number,
+            from_=from_number,
+            twiml=agent_conference_twiml,
+        )
+        call_state_obj['conference_sid'] = agent_call.sid
+        call_state_obj['call_state'] = CallState.SPEAKING_WITH_HUMAN
+        logger.info(f"[bridge_to_agent] Dialed agent {agent_phone_number} into conference {conf_name}, agent call SID={agent_call.sid}")
+    except Exception as dial_err:
+        logger.error(f"[bridge_to_agent] Failed to dial agent into conference: {dial_err}")
+
+    return Response(conference_twiml, mimetype='text/xml')
 
 
 @app.route('/webhook/voice', methods=['POST'])
@@ -780,8 +916,14 @@ def voice_webhook():
             )
             response.append(gather)
         else:
-            # No IVR patterns - go straight to human conversation
+            # No IVR patterns - go straight to human conversation (or bridge agent)
             print(f"📞 Direct Human Mode - No IVR patterns configured")
+
+            # If real human agent mode, bridge agent immediately (no IVR to navigate)
+            if call_info['state'].get('call_mode') == 'agent':
+                print(f"🔀 Real Human Agent mode - bridging agent directly (no IVR)")
+                return _bridge_to_agent(call_info, callback_base)
+
             call_info['state']['call_state'] = CallState.SPEAKING_WITH_HUMAN
 
             # AI Disclosure message (required for automated calls)
@@ -871,6 +1013,44 @@ def voice_human_webhook():
         return Response(str(response), mimetype='text/xml')
 
 
+@app.route('/webhook/bridge-agent', methods=['POST'])
+def bridge_agent_webhook():
+    """
+    Called by Twilio (via redirect) after a human is detected on an agent-mode call.
+    Moves the insurance call into a Twilio Conference and dials the real human agent in.
+    """
+    try:
+        call_sid = request.values.get('CallSid')
+        callback_base = get_callback_base(request)
+        logger.info(f"[bridge_agent_webhook] CallSID={call_sid}")
+
+        call_info = None
+        for call_id, state in list(call_states.items()):
+            if state.get('call_sid') == call_sid:
+                call_info = {'call_id': call_id, 'state': state}
+                break
+
+        if not call_info:
+            logger.error(f"[bridge_agent_webhook] No call state found for CallSID={call_sid}")
+            error_twiml = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<Response><Say>Sorry, there was a technical error. Goodbye.</Say></Response>'
+            )
+            return Response(error_twiml, mimetype='text/xml')
+
+        return _bridge_to_agent(call_info, callback_base)
+
+    except Exception as e:
+        logger.error(f"[bridge_agent_webhook] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        error_twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Response><Say>Sorry, there was a technical error. Goodbye.</Say></Response>'
+        )
+        return Response(error_twiml, mimetype='text/xml')
+
+
 @app.route('/webhook/ivr-navigate', methods=['POST'])
 def ivr_navigate_webhook():
     """
@@ -923,11 +1103,11 @@ def ivr_navigate_webhook():
 
             if ivr_asks_npi or ivr_asks_tax_id:
                 npi_keywords = ['npi', 'national provider', 'provider number', 'provider identification']
-                tax_keywords = ['tax id', 'tax identification', 'ein', 'employer identification',
+                tax_keywords = ['tax id', 'tax identification', r'\bein\b', 'employer identification',
                                 'federal tax', 'tax number', 'taxpayer']
 
-                npi_detected = ivr_asks_npi and any(kw in speech_lower for kw in npi_keywords)
-                tax_detected = ivr_asks_tax_id and any(kw in speech_lower for kw in tax_keywords)
+                npi_detected = ivr_asks_npi and any(re.search(kw, speech_lower) for kw in npi_keywords)
+                tax_detected = ivr_asks_tax_id and any(re.search(kw, speech_lower) for kw in tax_keywords)
 
                 if npi_detected or tax_detected:
                     print(f"📋 IVR requesting credentials - NPI: {npi_detected}, Tax ID: {tax_detected}")
@@ -1159,12 +1339,20 @@ def ivr_navigate_webhook():
                     # threshold=1 is safe — waiting longer just causes the agent to hang up.
                     print(f"👤 Human detected (clear indicators, attempt {state['ivr_unmatched_count']}) - starting conversation")
                     state['call_state'] = CallState.SPEAKING_WITH_HUMAN
-                    response.redirect(f'{callback_base}/webhook/voice/human')
+                    if state.get('call_mode') == 'agent':
+                        print(f"🔀 Real Human Agent mode - redirecting to bridge-agent")
+                        response.redirect(f'{callback_base}/webhook/bridge-agent')
+                    else:
+                        response.redirect(f'{callback_base}/webhook/voice/human')
                 elif state['ivr_unmatched_count'] >= 8:
                     # Many unmatched attempts with no IVR counter-signal — assume human or unknown system
                     print(f"👤 Switching to human mode after {state['ivr_unmatched_count']} unmatched attempts")
                     state['call_state'] = CallState.SPEAKING_WITH_HUMAN
-                    response.redirect(f'{callback_base}/webhook/voice/human')
+                    if state.get('call_mode') == 'agent':
+                        print(f"🔀 Real Human Agent mode - redirecting to bridge-agent")
+                        response.redirect(f'{callback_base}/webhook/bridge-agent')
+                    else:
+                        response.redirect(f'{callback_base}/webhook/voice/human')
                 else:
                     # Unrecognised speech — keep listening for the IVR menu
                     print(f"🔄 Continuing to listen for IVR menu options...")
@@ -1235,7 +1423,104 @@ def wait_for_human_webhook():
         state['wait_attempts'] += 1
 
         # Empty/very short speech might be hold music blips or IVR fragments
-        is_very_short = len(speech_result.strip()) < 10
+        # Threshold < 4 so single words like "Hello" (5 chars) still pass
+        is_very_short = len(speech_result.strip()) < 4
+
+        # ── NPI / Tax ID auto-response during wait phase ─────────────────────────
+        # Some IVRs ask for NPI after routing to the provider queue. Respond with
+        # DTMF and continue listening rather than treating it as a human signal.
+        npi_keywords = ['npi', 'national provider', 'provider number', 'provider identification']
+        tax_keywords = ['tax id', 'tax identification', r'\bein\b', 'employer identification',
+                        'federal tax', 'tax number', 'taxpayer']
+        npi_detected_wait = any(re.search(kw, speech_lower) for kw in npi_keywords)
+        tax_detected_wait = any(re.search(kw, speech_lower) for kw in tax_keywords)
+
+        if (npi_detected_wait or tax_detected_wait) and speech_lower:
+            print(f"📋 IVR credential prompt detected during wait phase - NPI: {npi_detected_wait}, Tax ID: {tax_detected_wait}")
+            response.pause(length=1)
+            if npi_detected_wait and state.get('npi'):
+                npi_method = state.get('ivr_npi_method', 'dtmf')
+                if npi_method == 'dtmf':
+                    response.play(digits=state['npi'])
+                    print(f"🔢 Sent NPI via DTMF during wait: {state['npi']}")
+                else:
+                    npi_spoken = format_npi_for_speech(state['npi'])
+                    speak_with_tts(response, npi_spoken)
+                    print(f"🗣️ Spoke NPI during wait: {npi_spoken}")
+            if tax_detected_wait and state.get('tax_id'):
+                tax_method = state.get('ivr_tax_id_method', 'dtmf')
+                clean_tax = re.sub(r'\D', '', state['tax_id'])
+                digits_to_send = state.get('ivr_tax_id_digits_to_send')
+                selected_tax = clean_tax[-digits_to_send:] if isinstance(digits_to_send, int) and 1 <= digits_to_send <= len(clean_tax) else clean_tax
+                if tax_method == 'dtmf':
+                    response.play(digits=selected_tax)
+                    print(f"🔢 Sent Tax ID via DTMF during wait: {selected_tax}")
+                else:
+                    speak_with_tts(response, '. '.join(list(selected_tax)) + '.')
+                    print(f"🗣️ Spoke Tax ID during wait: {selected_tax}")
+            response.pause(length=1)
+            gather = Gather(
+                input='speech dtmf',
+                action=f'{callback_base}/webhook/wait-for-human',
+                method='POST',
+                speech_timeout='2',
+                timeout=30,
+                language='en-US'
+            )
+            response.append(gather)
+            response.redirect(f'{callback_base}/webhook/wait-for-human')
+            return Response(str(response), mimetype='text/xml')
+        # ── End NPI / Tax ID auto-response ───────────────────────────────────────
+
+        # ── AI-assisted classification (agent mode only) ──────────────────────────
+        # Uses gpt-4o-mini to classify each speech chunk as human/IVR/hold/silence.
+        # Only runs for agent-transfer calls — adds ~0.5-1s latency per webhook but
+        # catches edge cases that keyword lists miss (e.g. "Thank you for calling…
+        # My name is Mary" which previously scored as queue/automated).
+        if state.get('call_mode') == 'agent' and speech_result and not is_very_short:
+            ai_context = (
+                f"Insurance: {state.get('insurance_name', 'unknown')}. "
+                f"We just navigated the IVR and are waiting for a live provider services representative."
+            )
+            ai_result = _ai_classify_speech(speech_result, ai_context)
+            if ai_result:
+                ai_type = ai_result.get('type', '')
+                ai_conf = float(ai_result.get('confidence', 0.0))
+                print(f"🤖 AI classification: {ai_type} (confidence={ai_conf:.2f}) — {ai_result.get('reasoning', '')}")
+
+                if ai_type == 'human_speech' and ai_conf >= 0.65:
+                    print(f"✅ AI confirmed human after {wait_duration_minutes:.1f} min — bridging to agent")
+                    state['call_state'] = CallState.SPEAKING_WITH_HUMAN
+                    response.redirect(f'{callback_base}/webhook/bridge-agent')
+                    return Response(str(response), mimetype='text/xml')
+
+                elif ai_type in ('ivr_menu', 'hold_music') and ai_conf >= 0.65:
+                    print(f"📞 AI confirmed automated system ({ai_type}) — continuing to wait")
+                    gather = Gather(
+                        input='speech',
+                        action=f'{callback_base}/webhook/wait-for-human',
+                        method='POST',
+                        speech_timeout='2',
+                        timeout=30,
+                        language='en-US'
+                    )
+                    response.append(gather)
+                    response.redirect(f'{callback_base}/webhook/voice/human')
+                    return Response(str(response), mimetype='text/xml')
+                # Low confidence or 'silence' → fall through to keyword logic below
+        # ── End AI classification ─────────────────────────────────────────────────
+
+        # PRIORITY 0 (strong human override): Phrases that only a live person says.
+        # These beat queue/hold detection because automated systems never introduce
+        # themselves by name or offer direct personal assistance mid-recording.
+        strong_human_indicators = [
+            'my name is',
+            'i can help you',
+            'how can i assist',
+            'may i have your',
+            'can i have your',
+        ]
+        is_strong_human = any(ind in speech_lower for ind in strong_human_indicators)
 
         # PRIORITY 1: Detect automated queue/hold systems (check FIRST before human detection)
         # These are definitive indicators that it's NOT a human
@@ -1305,8 +1590,20 @@ def wait_for_human_webhook():
 
         # DECISION LOGIC - Priority order matters!
 
+        # PRIORITY 0: Strong human override — beats queue/hold detection.
+        # "My name is Mary" + "thank you for calling" → still a human.
+        if is_strong_human and not is_very_short:
+            print(f"✅ Strong human signal detected after {wait_duration_minutes:.1f} minutes!")
+            print(f"   Heard: {speech_result[:100]}...")
+            state['call_state'] = CallState.SPEAKING_WITH_HUMAN
+            if state.get('call_mode') == 'agent':
+                print(f"🔀 Real Human Agent mode - redirecting to bridge-agent")
+                response.redirect(f'{callback_base}/webhook/bridge-agent')
+            else:
+                response.redirect(f'{callback_base}/webhook/voice/human')
+
         # PRIORITY 1: Detected queue system or transfer - definitely NOT human yet
-        if is_queue_system or is_transfer_message:
+        elif is_queue_system or is_transfer_message:
             if wait_duration_minutes < 10:
                 # Still within acceptable wait time - keep waiting
                 print(f"📞 Queue/automated system detected (attempt {state['wait_attempts']}, {wait_duration_minutes:.1f} min)")
@@ -1332,11 +1629,15 @@ def wait_for_human_webhook():
 
         # PRIORITY 2: Detected human (and NO queue/transfer indicators)
         elif is_human and not is_very_short:
-            # Confident this is a real human - proceed with disclosure
+            # Confident this is a real human - proceed with disclosure (or bridge agent)
             print(f"✅ Human detected after {wait_duration_minutes:.1f} minutes! Starting conversation")
             print(f"   Heard: {speech_result[:100]}...")
             state['call_state'] = CallState.SPEAKING_WITH_HUMAN
-            response.redirect(f'{callback_base}/webhook/voice/human')
+            if state.get('call_mode') == 'agent':
+                print(f"🔀 Real Human Agent mode - redirecting to bridge-agent")
+                response.redirect(f'{callback_base}/webhook/bridge-agent')
+            else:
+                response.redirect(f'{callback_base}/webhook/voice/human')
 
         # PRIORITY 3: Timeout checks (no clear human or queue detected)
         elif wait_duration_minutes >= 10:
@@ -1471,10 +1772,30 @@ def speech_webhook():
             # Detect if human acknowledged the disclosure
             if not state.get('disclosure_acknowledged', False):
                 speech_lower = speech_result.lower()
-                confirmation_keywords = ['yes', 'correct', 'speaking', 'this is', 'how can', 'what']
+                confirmation_keywords = ['yes', 'correct', 'speaking', 'speak', 'this is', 'how can', 'what', 'help', 'thank', 'my name']
                 if any(keyword in speech_lower for keyword in confirmation_keywords):
                     state['disclosure_acknowledged'] = True
                     print(f"✅ Disclosure acknowledged by human")
+
+            # Server-side refusal detection — override AI action to end_call
+            # Catches cases where the human explicitly refuses to work with AI
+            ai_refusal_phrases = [
+                'do not work with ai', 'don\'t work with ai', 'cannot work with ai',
+                'can\'t work with ai', 'not work with ai', 'we don\'t work with',
+                'we do not work with', 'not able to work with ai', 'refuse to work',
+                'cannot assist ai', 'can\'t assist ai', 'policy not to',
+                'we don\'t speak with ai', 'we do not speak with ai',
+            ]
+            if any(phrase in speech_lower for phrase in ai_refusal_phrases):
+                state['refusal_count'] = state.get('refusal_count', 0) + 1
+                print(f"⛔ AI refusal detected (count: {state['refusal_count']})")
+            # Also increment if AI itself keeps repeating (question_asked=True) with no progress
+            if state.get('questions_asked_count', 0) > len(questions) + 3:
+                state['refusal_count'] = state.get('refusal_count', 0) + 1
+            if state.get('refusal_count', 0) >= 1:
+                print(f"⛔ Forcing end_call due to refusal")
+                ai_response['action'] = 'end_call'
+                ai_response['response'] = "I understand. I apologize for the inconvenience. I'll have our team follow up another way. Thank you for your time. Goodbye."
 
             # Update questions asked count if a question was asked
             if ai_response.get('question_asked'):
@@ -1689,10 +2010,28 @@ def speech_followup_webhook():
             # Detect if human acknowledged the disclosure
             if not state.get('disclosure_acknowledged', False):
                 speech_lower = speech_result.lower()
-                confirmation_keywords = ['yes', 'correct', 'speaking', 'this is', 'how can', 'what']
+                confirmation_keywords = ['yes', 'correct', 'speaking', 'speak', 'this is', 'how can', 'what', 'help', 'thank', 'my name']
                 if any(keyword in speech_lower for keyword in confirmation_keywords):
                     state['disclosure_acknowledged'] = True
                     print(f"✅ Disclosure acknowledged by human")
+
+            # Server-side refusal detection — override AI action to end_call
+            ai_refusal_phrases = [
+                'do not work with ai', 'don\'t work with ai', 'cannot work with ai',
+                'can\'t work with ai', 'not work with ai', 'we don\'t work with',
+                'we do not work with', 'not able to work with ai', 'refuse to work',
+                'cannot assist ai', 'can\'t assist ai', 'policy not to',
+                'we don\'t speak with ai', 'we do not speak with ai',
+            ]
+            if any(phrase in speech_lower for phrase in ai_refusal_phrases):
+                state['refusal_count'] = state.get('refusal_count', 0) + 1
+                print(f"⛔ AI refusal detected (count: {state['refusal_count']})")
+            if state.get('questions_asked_count', 0) > len(questions) + 3:
+                state['refusal_count'] = state.get('refusal_count', 0) + 1
+            if state.get('refusal_count', 0) >= 1:
+                print(f"⛔ Forcing end_call due to refusal")
+                ai_response['action'] = 'end_call'
+                ai_response['response'] = "I understand. I apologize for the inconvenience. I'll have our team follow up another way. Thank you for your time. Goodbye."
 
             # Update questions asked count if a question was asked
             if ai_response.get('question_asked'):
@@ -2546,7 +2885,7 @@ def get_recent_calls():
                 SELECT id, insurance_name, provider_name, npi, tax_id,
                        address, insurance_phone, status, reference_number,
                        missing_documents, turnaround_days, notes,
-                       created_at, completed_at
+                       created_at, completed_at, call_mode, agent_phone
                 FROM credentialing_requests
                 ORDER BY created_at DESC
                 LIMIT %s
@@ -2568,7 +2907,9 @@ def get_recent_calls():
                     'turnaround_days': row[10],
                     'notes': row[11],
                     'created_at': row[12].isoformat() if row[12] else None,
-                    'completed_at': row[13].isoformat() if row[13] else None
+                    'completed_at': row[13].isoformat() if row[13] else None,
+                    'call_mode': row[14] or 'ai',
+                    'agent_phone': row[15],
                 })
 
         db.close()
@@ -3474,6 +3815,149 @@ def create_audit_log():
         }), 201
     except Exception as e:
         logger.error(f"Error creating audit log: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ============================================================================
+# AI vs Real-Agent Transfer Endpoint
+# ============================================================================
+
+@app.route('/api/transfer-to-agent', methods=['POST'])
+@jwt_required()
+def transfer_to_agent():
+    """
+    Mid-call transfer from AI to a real human agent using Twilio Conference.
+
+    Request body:
+    {
+        "call_id": "<runtime call UUID>",
+        "agent_phone": "+15551234567"
+    }
+
+    Behaviour:
+    1. Looks up the active call by call_id.
+    2. Redirects the live Twilio call into a Conference room (named by call_id).
+    3. Dials agent_phone into the same Conference.
+    4. Sets transfer_to_agent=True in call_states so the AI polling loop exits.
+    5. Persists call_mode='agent', agent_phone, and conference_sid to the DB.
+    """
+    try:
+        data = request.json or {}
+        call_id = data.get('call_id')
+        agent_phone = data.get('agent_phone')
+
+        if not call_id:
+            return jsonify({'success': False, 'error': 'call_id is required'}), 400
+        if not agent_phone:
+            return jsonify({'success': False, 'error': 'agent_phone is required'}), 400
+
+        # Fetch in-memory call state — try runtime call_id first, then fall back
+        # to matching by DB request ID (the UI sends the DB UUID from /api/calls)
+        call_state = call_states.get(call_id)
+        if not call_state:
+            call_state = next(
+                (s for s in call_states.values() if s.get('db_request_id') == call_id),
+                None
+            )
+        if not call_state:
+            return jsonify({'success': False, 'error': 'Call not found or already ended'}), 404
+
+        call_sid = call_state.get('call_sid')
+        if not call_sid:
+            return jsonify({'success': False, 'error': 'Call SID not yet available; call may still be connecting'}), 400
+
+        from_number = os.getenv("TWILIO_PHONE_NUMBER")
+        conf_name = call_id  # Conference room name = call_id for uniqueness
+
+        # TwiML to redirect the insurance-side call into the conference
+        insurance_leg_twiml = (
+            '<Response>'
+            '<Dial>'
+            f'<Conference waitUrl="" startConferenceOnEnter="true" endConferenceOnExit="true">'
+            f'{conf_name}'
+            '</Conference>'
+            '</Dial>'
+            '</Response>'
+        )
+
+        # TwiML for the agent leg (does not end conference when agent hangs up)
+        agent_leg_twiml = (
+            '<Response>'
+            '<Dial>'
+            f'<Conference waitUrl="" startConferenceOnEnter="true" endConferenceOnExit="false">'
+            f'{conf_name}'
+            '</Conference>'
+            '</Dial>'
+            '</Response>'
+        )
+
+        # Dial the real agent first — if this fails, the insurance call is untouched
+        try:
+            agent_call = twilio_client.calls.create(
+                to=agent_phone,
+                from_=from_number,
+                twiml=agent_leg_twiml,
+            )
+        except Exception as dial_err:
+            logger.error(f"[transfer-to-agent] Failed to dial agent {agent_phone}: {dial_err}")
+            return jsonify({'success': False, 'error': f'Failed to dial agent: {dial_err}'}), 500
+
+        conference_sid = agent_call.sid  # Note: this is agent call SID, not a Twilio Conference SID
+        logger.info(f"[transfer-to-agent] Dialed agent {agent_phone} into conference={conf_name}, agent_call_sid={conference_sid}")
+
+        # Only redirect the insurance call after the agent dial succeeds
+        try:
+            twilio_client.calls(call_sid).update(twiml=insurance_leg_twiml)
+            logger.info(f"[transfer-to-agent] Redirected call_sid={call_sid} into conference={conf_name}")
+        except Exception as redirect_err:
+            logger.error(f"[transfer-to-agent] Failed to redirect insurance call: {redirect_err}")
+            # Cancel the agent call we just placed so it doesn't ring forever
+            try:
+                twilio_client.calls(agent_call.sid).update(status='canceled')
+            except Exception:
+                pass
+            return jsonify({'success': False, 'error': f'Failed to redirect insurance call: {redirect_err}'}), 500
+
+        # Signal the AI agent loop to stop gracefully
+        call_state['transfer_to_agent'] = True
+        call_state['call_mode'] = 'agent'
+        call_state['agent_phone'] = agent_phone
+        call_state['conference_sid'] = conference_sid  # Note: this is agent call SID, not a Twilio Conference SID
+
+        # Persist the transfer in the DB
+        try:
+            from credentialing_agent import DatabaseManager
+            db = DatabaseManager()
+            request_id = call_state.get('db_request_id')
+            if request_id:
+                with db.conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE credentialing_requests
+                        SET call_mode = 'agent',
+                            agent_phone = %s,
+                            conference_sid = %s,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (agent_phone, conference_sid, request_id)
+                    )
+                    db.conn.commit()
+            db.close()
+        except Exception as db_err:
+            logger.warning(f"[transfer-to-agent] Could not persist transfer to DB: {db_err}")
+
+        return jsonify({
+            'success': True,
+            'message': 'Call transferred to real agent',
+            'conference_name': conf_name,
+            'agent_call_sid': conference_sid,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"[transfer-to-agent] Error: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
 

@@ -5,7 +5,7 @@ import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import * as z from 'zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Loader2, ChevronDown, Check, Phone, Hash, Play } from 'lucide-react'
+import { Loader2, ChevronDown, Check, Phone, Hash, Play, Bot, User } from 'lucide-react'
 import { api } from '@/lib/api'
 import {
   Form,
@@ -57,6 +57,8 @@ export function StartCallForm({
   const [showDropdown, setShowDropdown] = useState(false)
   const [searchTerm, setSearchTerm] = useState('')
   const [selectedInsurance, setSelectedInsurance] = useState<InsuranceProvider | null>(null)
+  const [callMode, setCallMode] = useState<'ai' | 'agent'>('ai')
+  const [agentPhone, setAgentPhone] = useState('')
 
   const form = useForm<CallFormValues>({
     resolver: zodResolver(callFormSchema),
@@ -91,6 +93,8 @@ export function StartCallForm({
       setSelectedInsurance(null)
       setSearchTerm('')
       setShowDropdown(false)
+      setCallMode('ai')
+      setAgentPhone('')
     }
   }, [isActive, form])
 
@@ -131,6 +135,8 @@ export function StartCallForm({
       return api.startCall({
         ...values,
         questions: questionsArray,
+        call_mode: callMode,
+        ...(callMode === 'agent' && agentPhone ? { agent_phone: agentPhone } : {}),
       })
     },
     onSuccess: (response) => {
@@ -356,6 +362,51 @@ export function StartCallForm({
             )}
           </div>
         )}
+
+        <div className="rounded-lg border bg-muted/30 p-4">
+          <div className="mb-3 flex items-center gap-2">
+            <Bot className="h-4 w-4 text-primary" />
+            <h4 className="text-sm font-medium">Call Mode</h4>
+          </div>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setCallMode('ai')}
+              className={`flex flex-1 items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
+                callMode === 'ai'
+                  ? 'border-primary bg-primary text-primary-foreground'
+                  : 'border-border bg-background text-muted-foreground hover:bg-muted'
+              }`}
+            >
+              <Bot className="h-4 w-4" />
+              AI Agent
+            </button>
+            <button
+              type="button"
+              onClick={() => setCallMode('agent')}
+              className={`flex flex-1 items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
+                callMode === 'agent'
+                  ? 'border-primary bg-primary text-primary-foreground'
+                  : 'border-border bg-background text-muted-foreground hover:bg-muted'
+              }`}
+            >
+              <User className="h-4 w-4" />
+              Real Human Agent
+            </button>
+          </div>
+          {callMode === 'agent' && (
+            <div className="mt-3">
+              <label className="mb-1.5 block text-sm font-medium">
+                Agent Phone Number
+              </label>
+              <Input
+                placeholder="+1 (555) 000-0000"
+                value={agentPhone}
+                onChange={(e) => setAgentPhone(e.target.value)}
+              />
+            </div>
+          )}
+        </div>
 
         <FormField
           control={form.control}

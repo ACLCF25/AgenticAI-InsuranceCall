@@ -36,6 +36,8 @@ export interface CredentialingRequest {
   notes?: string;
   created_at?: string;
   completed_at?: string;
+  call_mode?: string;
+  agent_phone?: string;
 }
 
 export interface CallStatus {

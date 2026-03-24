@@ -198,6 +198,12 @@ class CredentialingState(TypedDict):
     error_message: Optional[str]
     ivr_recommendation: Optional[str]
 
+    # Real-agent mode
+    call_mode: str
+    agent_phone: Optional[str]
+    conference_sid: Optional[str]
+    transfer_to_agent: bool
+
     # Timing metrics (optional)
     call_start_time: Optional[datetime]
     ivr_end_time: Optional[datetime]
@@ -1723,6 +1729,11 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
     
     def _route_by_audio_type(self, state: CredentialingState) -> str:
         """Route based on audio classification"""
+        # Exit cleanly when a mid-call transfer to a real agent was requested
+        if state.get('transfer_to_agent'):
+            print(f"[credentialing_agent] Transfer-to-agent flag detected in _route_by_audio_type; stopping AI loop for call {state.get('call_id')}")
+            state['should_continue'] = False
+            return "error"
         if state.get('error_message') or not state.get('should_continue', True):
             return "error"
 
@@ -1743,6 +1754,11 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
         """Check if should continue or complete"""
         if state.get('error_message'):
             return "error"
+        # A mid-call transfer to a real agent was requested — stop the AI loop
+        if state.get('transfer_to_agent'):
+            print(f"[credentialing_agent] Transfer-to-agent flag detected in _check_continue; stopping AI loop for call {state.get('call_id')}")
+            state['should_continue'] = False
+            return "complete"
         if not state.get('should_continue', True):
             return "complete"
         if state.get('retry_count', 0) > 3:
@@ -1750,11 +1766,16 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
             self._handle_ivr_failure(state)
             return "ivr_error"
         return "continue"
-    
+
     def _check_conversation_complete(self, state: CredentialingState) -> str:
         """Check if conversation is complete"""
         if state.get('error_message'):
             return "error"
+        # A mid-call transfer to a real agent was requested — stop the AI loop
+        if state.get('transfer_to_agent'):
+            print(f"[credentialing_agent] Transfer-to-agent flag detected in _check_conversation_complete; stopping AI loop for call {state.get('call_id')}")
+            state['should_continue'] = False
+            return "complete"
         if not state.get('should_continue', True):
             return "complete"
         return "continue"

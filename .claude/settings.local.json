@@ -6,7 +6,11 @@
       "Bash(git -C \"c:/Users/AaronCarlCladoLibago/Desktop/monolith\" diff main...HEAD -- backend/credentialing_agent.py)",
       "Bash(git -C \"c:/Users/AaronCarlCladoLibago/Desktop/monolith\" diff main...HEAD -- backend/auth.py)",
       "Bash(git -C \"c:/Users/AaronCarlCladoLibago/Desktop/monolith\" diff main...HEAD -- backend/knowledge_base.py)",
-      "Bash(git -C \"c:/Users/AaronCarlCladoLibago/Desktop/monolith\" diff main...HEAD -- backend/api_server.py)"
+      "Bash(git -C \"c:/Users/AaronCarlCladoLibago/Desktop/monolith\" diff main...HEAD -- backend/api_server.py)",
+      "Bash(npx tsc:*)",
+      "Bash(find /c/Users/AaronCarlCladoLibago/Desktop/monolith/frontend/src -type f -name *.tsx -o -type f -name *.ts -o -type f -name *.jsx)",
+      "WebFetch(domain:api.trello.com)",
+      "Bash(curl:*)"
     ]
   }
 }
