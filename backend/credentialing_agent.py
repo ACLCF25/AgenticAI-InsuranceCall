@@ -975,12 +975,15 @@ class AudioClassifier:
         self.langsmith = langsmith_config
         
         self.classifier_prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are an audio classification expert. Classify the transcript into one of these types:
+            ("system", """You are a call transcript classification expert. Classify the transcript into one of these types:
             - ivr_menu: Automated menu with options (e.g., "Press 1 for...", "Say provider for...")
-            - hold_music: Hold music or "please wait" messages
+            - hold_music: Hold music or "please wait" / "please hold" messages
             - human_speech: Natural human conversation
             - silence: No meaningful audio
-            
+
+            If the transcript is empty, very short (under 5 words), or contains only filler sounds, classify as silence.
+            If the transcript mentions waiting, holding, or background music with no menu options, classify as hold_music.
+
             Return JSON: {{"type": "...", "confidence": 0.0-1.0, "reasoning": "..."}}"""),
             ("user", "Transcript: {transcript}\n\nPrevious context: {context}")
         ])
@@ -1006,13 +1009,17 @@ class IVRNavigator:
         self.langsmith = langsmith_config
         
         self.navigator_prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are an expert IVR navigation agent. Your goal is to reach the credentialing department.
-            
+            ("system", """You are an expert IVR navigation agent. Your goal is to reach the provider credentialing department.
+
             Given the IVR menu transcript and known patterns, decide the best action:
             - dtmf: Press digits (return digit to press)
             - speech: Say a word/phrase (return what to say)
             - wait: Wait for more information
-            
+
+            If no known patterns match the transcript, use a universal escape:
+            - Try pressing "0" (zero) to reach an operator, or say "representative" or "credentialing".
+            - If you are at the same menu level multiple times, try a different action than before.
+
             Return JSON: {{
                 "action": "dtmf|speech|wait",
                 "value": "digit or phrase or null",
@@ -1020,12 +1027,11 @@ class IVRNavigator:
                 "reasoning": "why this action"
             }}"""),
             ("user", """IVR Transcript: {transcript}
-            
+
             Known IVR Patterns for this insurance:
             {ivr_knowledge}
-            
-            Current Menu Level: {menu_level}
-            Goal: Reach provider credentialing department""")
+
+            Current Menu Level: {menu_level}""")
         ])
     
     @traceable(name="navigate_ivr")
@@ -1091,7 +1097,13 @@ Prior knowledge from similar calls:
 Return ONLY valid JSON — no extra text:
 {{
   "response": "what to say to the representative",
-  "information_extracted": {{}},
+  "information_extracted": {{
+    "credentialing_status": "active|pending|terminated|unknown or null if not mentioned",
+    "effective_date": "date string or null",
+    "provider_id": "provider/group ID given by the insurer or null",
+    "reference_number": "call reference number or null",
+    "notes": "any other relevant information or null"
+  }},
   "conversation_complete": false
 }}"""),
             MessagesPlaceholder(variable_name="conversation_history"),
@@ -1377,7 +1389,7 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
         state['current_audio_type'] = AudioType(classification['type'])
         state['confidence'] = classification['confidence']
         state['retry_count'] = 0
-        
+
         # Log event
         self.db.log_call_event(
             state['call_id'],
@@ -1400,7 +1412,7 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
             state['ivr_knowledge'],
             state['current_menu_level']
         )
-        
+
         # Execute action
         if action['action'] == ActionType.DTMF:
             self.telephony.send_dtmf(state['call_sid'], action['value'])
@@ -1469,7 +1481,7 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
         latest_transcript = state['transcript'][-1]['text']
         
         response = self.conversation_agent.generate_response(state, latest_transcript)
-        
+
         # Save both conversation rows in parallel — they write independent rows
         # (different speaker values) with no dependency between them.
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:

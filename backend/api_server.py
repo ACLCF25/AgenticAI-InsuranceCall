@@ -48,6 +48,21 @@ BASE_URL = os.getenv("BASE_URL", "http://localhost:5000").rstrip("/")
 ENABLE_ELEVENLABS_TTS = os.getenv("ENABLE_ELEVENLABS_TTS", "true").lower() == "true"
 CHECK_CALLBACK_REACHABLE = os.getenv("CHECK_CALLBACK_REACHABLE", "false").lower() == "true"
 
+# IVR menu detection phrases — used in both human-speech webhook handlers
+IVR_MENU_INDICATORS = [
+    'press 1', 'press 2', 'press 3', 'press 4', 'press 5',
+    'press 6', 'press 7', 'press 8', 'press 9', 'press 0',
+    'press zero', 'press star', 'press pound',
+    'dial 1', 'dial 2', 'dial 3', 'dial 4', 'dial 5',
+    'option 1', 'option 2', 'option 3', 'option 4', 'option 5',
+    'say 1', 'say 2', 'press or say',
+    'for english', 'para español',
+    'please listen carefully', 'menu options have changed',
+    'if you are calling about', 'if you need',
+    'to repeat these options', 'to hear these options again',
+    'for more options', 'you have reached', 'please enter',
+]
+
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes (Bearer token auth doesn't require restricted origins)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
@@ -1703,8 +1718,10 @@ def speech_webhook():
         if not callback_base:
             callback_base = f"https://{request.host}"
 
-        print(f"🎤 Speech received - CallSID: {call_sid}")
-        print(f"📝 Transcript: {speech_result}")
+        print(f"\n{'='*60}")
+        print(f"🎤 [SPEECH] CallSID: {call_sid}")
+        print(f"👤 REP SAID: \"{speech_result}\"")
+        print(f"{'='*60}")
 
         # Find the call state
         call_info = None
@@ -1726,17 +1743,7 @@ def speech_webhook():
             # Check if we're hearing IVR menu options instead of human speech
             # This can happen if we switched to human mode too early
             speech_lower = speech_result.lower()
-            ivr_menu_indicators = [
-                'press 1', 'press 2', 'press 3', 'press 4', 'press 5',
-                'dial 1', 'dial 2', 'dial 3',
-                'option 1', 'option 2', 'option 3',
-                'say 1', 'say 2',
-                'for english', 'para español',
-                'please listen carefully', 'menu options have changed',
-                'if you are calling about', 'if you need'
-            ]
-
-            is_ivr_menu = any(indicator in speech_lower for indicator in ivr_menu_indicators)
+            is_ivr_menu = any(indicator in speech_lower for indicator in IVR_MENU_INDICATORS)
 
             if is_ivr_menu:
                 print(f"⚠️ Detected IVR menu in human mode - switching back to IVR navigation")
@@ -1766,8 +1773,11 @@ def speech_webhook():
                 current_question_index=questions_asked_count
             )
 
-            print(f"🤖 AI Response: {ai_response}")
-            print(f"📋 Stage: {stage}, Questions Asked: {questions_asked_count}/{len(questions)}")
+            print(f"🤖 AGENT SAID: \"{ai_response.get('response', '')}\"")
+            print(f"   Action: {ai_response.get('action')} | Stage: {stage} | Questions: {questions_asked_count}/{len(questions)}")
+            extracted = ai_response.get('extracted_info', {})
+            if any(v for v in extracted.values() if v):
+                print(f"   📋 Extracted: {extracted}")
 
             # Detect if human acknowledged the disclosure
             if not state.get('disclosure_acknowledged', False):
@@ -1941,8 +1951,10 @@ def speech_followup_webhook():
         if not callback_base:
             callback_base = f"https://{request.host}"
 
-        print(f"🎤 Follow-up speech - CallSID: {call_sid}")
-        print(f"📝 Transcript: {speech_result}")
+        print(f"\n{'='*60}")
+        print(f"🎤 [FOLLOW-UP] CallSID: {call_sid}")
+        print(f"👤 REP SAID: \"{speech_result}\"")
+        print(f"{'='*60}")
 
         # Find the call state
         call_info = None
@@ -1963,17 +1975,7 @@ def speech_followup_webhook():
             # Check if we're hearing IVR menu options instead of human speech
             # This can happen if we switched to human mode too early
             speech_lower = speech_result.lower()
-            ivr_menu_indicators = [
-                'press 1', 'press 2', 'press 3', 'press 4', 'press 5',
-                'dial 1', 'dial 2', 'dial 3',
-                'option 1', 'option 2', 'option 3',
-                'say 1', 'say 2',
-                'for english', 'para español',
-                'please listen carefully', 'menu options have changed',
-                'if you are calling about', 'if you need'
-            ]
-
-            is_ivr_menu = any(indicator in speech_lower for indicator in ivr_menu_indicators)
+            is_ivr_menu = any(indicator in speech_lower for indicator in IVR_MENU_INDICATORS)
 
             if is_ivr_menu:
                 print(f"⚠️ Detected IVR menu in human mode - switching back to IVR navigation")
@@ -1995,8 +1997,6 @@ def speech_followup_webhook():
             else:
                 stage = f"asking_question_{questions_asked_count + 1}_of_{len(questions)}"
 
-            print(f"📋 Follow-up stage: {stage}, Questions Asked: {questions_asked_count}/{len(questions)}")
-
             # Use GPT-4 to generate intelligent response
             ai_response = smart_agent.generate_response(
                 speech=speech_result,
@@ -2005,7 +2005,11 @@ def speech_followup_webhook():
                 current_question_index=questions_asked_count
             )
 
-            print(f"🤖 AI Response: {ai_response}")
+            print(f"🤖 AGENT SAID: \"{ai_response.get('response', '')}\"")
+            print(f"   Action: {ai_response.get('action')} | Stage: {stage} | Questions: {questions_asked_count}/{len(questions)}")
+            extracted = ai_response.get('extracted_info', {})
+            if any(v for v in extracted.values() if v):
+                print(f"   📋 Extracted: {extracted}")
 
             # Detect if human acknowledged the disclosure
             if not state.get('disclosure_acknowledged', False):
@@ -2266,7 +2270,8 @@ def transcription_webhook():
                 'timestamp': datetime.now().isoformat(),
                 'confidence': confidence
             })
-            
+            print(f"📡 DEEPGRAM [{confidence:.2f}]: \"{transcript}\"")
+
             # Trigger state graph to process new transcript
             # This would involve resuming the agent's state machine
             # Implementation depends on your LangGraph checkpoint strategy
