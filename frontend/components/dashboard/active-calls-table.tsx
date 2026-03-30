@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { useRouter } from 'next/navigation'
-import { Phone, Loader2, UserCheck } from 'lucide-react'
+import { Phone, Loader2, UserCheck, Bot, User } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -109,6 +109,7 @@ export function ActiveCallsTable() {
                 <TableRow>
                   <TableHead>Provider</TableHead>
                   <TableHead>Insurance</TableHead>
+                  <TableHead>Mode</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead>Started</TableHead>
                   <TableHead />
@@ -130,6 +131,19 @@ export function ActiveCallsTable() {
                         {call.provider_name}
                       </TableCell>
                       <TableCell>{call.insurance_name}</TableCell>
+                      <TableCell>
+                        {isAiMode ? (
+                          <Badge variant="outline" className="gap-1 text-xs font-normal">
+                            <Bot className="h-3 w-3" />
+                            AI
+                          </Badge>
+                        ) : (
+                          <Badge variant="outline" className="gap-1 text-xs font-normal text-blue-600 border-blue-300">
+                            <User className="h-3 w-3" />
+                            Agent
+                          </Badge>
+                        )}
+                      </TableCell>
                       <TableCell>
                         {isAgentConnected ? (
                           <Badge className="bg-green-500/15 text-green-600 hover:bg-green-500/20">

@@ -707,6 +707,7 @@ def start_credentialing_call():
         register_call_state(call_id, initial_state)
         print(f"✅ Call ID generated: {call_id}")
         print(f"📊 Call state stored, status: {CallState.INITIATING.value}")
+        logger.info(f"[{call_id}] Call initiated | mode: {call_mode}" + (f" | agent_phone: {agent_phone}" if call_mode == 'agent' else ""))
 
         # Create agent
         agent = CredentialingAgent()
@@ -718,6 +719,7 @@ def start_credentialing_call():
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 print(f"📞 Initiating Twilio call to: {data['insurance_phone']}")
+                print(f"[{call_id}] Call mode: {initial_state.get('call_mode', 'ai').upper()}")
                 final_state = loop.run_until_complete(agent.process_call(initial_state))
                 loop.close()
 

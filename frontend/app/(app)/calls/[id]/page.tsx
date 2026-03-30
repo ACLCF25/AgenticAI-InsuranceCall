@@ -16,6 +16,8 @@ import {
   AlertTriangle,
   Loader2,
   CheckCircle2,
+  Bot,
+  User,
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -150,6 +152,17 @@ export default function CallDetailPage() {
                 <div>
                   <p className="text-xs text-muted-foreground">Insurance Phone</p>
                   <p className="text-sm">{formatPhoneNumber(call.insurance_phone)}</p>
+                </div>
+              </div>
+              <div className="flex items-start gap-2">
+                {call.call_mode === 'agent' ? (
+                  <User className="h-4 w-4 mt-0.5 text-muted-foreground" />
+                ) : (
+                  <Bot className="h-4 w-4 mt-0.5 text-muted-foreground" />
+                )}
+                <div>
+                  <p className="text-xs text-muted-foreground">Call Mode</p>
+                  <p className="text-sm capitalize">{call.call_mode === 'agent' ? 'Human Agent' : 'AI Agent'}</p>
                 </div>
               </div>
               {call.reference_number && (
