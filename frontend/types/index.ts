@@ -19,6 +19,9 @@ export type CredentialingStatus =
   | 'office_closed'
   | 'failed';
 
+export type UserRole = 'super_admin' | 'admin' | 'agent';
+export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
+
 export interface CredentialingRequest {
   id?: string;
   insurance_name: string;
@@ -38,6 +41,7 @@ export interface CredentialingRequest {
   completed_at?: string;
   call_mode?: string;
   agent_phone?: string;
+  initiated_by?: string | null;
 }
 
 export interface CallStatus {
@@ -191,6 +195,7 @@ export interface CallDetail {
   completed_at?: string;
   call_mode?: string;
   agent_phone?: string;
+  initiated_by?: string | null;
   conversation: ConversationMessage[];
   events: CallDetailEvent[];
   ivr_patterns?: Array<{
@@ -203,6 +208,7 @@ export interface CallDetail {
     available: boolean;
     url: string;
     duration?: number;
+    recording_type?: 'ai' | 'agent' | 'both';
     status?: 'completed' | 'failed' | 'pending' | 'processing';
     created_at?: string;
   };
@@ -239,12 +245,30 @@ export interface HumanDetectionFeedbackResponse {
 
 export interface AdminUser {
   id: string;
-  username: string;
+  username: string | null;
   email: string;
-  role: 'admin' | 'user';
-  is_active: boolean;
-  created_at: string;
-  last_login: string | null;
+  role: UserRole | null;
+  approval_status: ApprovalStatus;
+  email_confirmed: boolean;
+  approved_by?: string | null;
+  approved_by_username?: string | null;
+  approved_at?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  profile_missing?: boolean;
+}
+
+export interface AuthUser extends AdminUser {}
+
+export interface AuditLogEntry {
+  id: string;
+  user_id?: string | null;
+  action: string;
+  resource_type?: string | null;
+  resource_id?: string | null;
+  details?: Record<string, any> | null;
+  ip_address?: string | null;
+  timestamp: string;
 }
 
 export interface TwilioNumber {

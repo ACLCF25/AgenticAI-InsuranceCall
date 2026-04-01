@@ -13,12 +13,11 @@ load_dotenv()
 import asyncio
 import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Optional
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
-from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity
 from twilio.twiml.voice_response import VoiceResponse, Stream, Connect
 from twilio.rest import Client as TwilioClient
 import threading
@@ -32,7 +31,8 @@ from credentialing_agent import (
     CredentialingAgent,
     CredentialingState,
     CallState,
-    AudioType
+    AudioType,
+    ingest_call_knowledge,
 )
 from knowledge_base import KnowledgeBase, redact_text, EmbeddingError, SearchError, KnowledgeBaseError
 from loguru import logger
@@ -68,19 +68,15 @@ IVR_MENU_INDICATORS = [
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes (Bearer token auth doesn't require restricted origins)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
-
-# JWT Configuration
-app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", os.getenv("SECRET_KEY", "change-me-in-production"))
-app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)
-app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=30)
-
-jwt_manager = JWTManager(app)
-
-from auth import auth_bp, check_token_blacklist, admin_required  # noqa: E402
-
-@jwt_manager.token_in_blocklist_loader
-def check_blocklist(jwt_header, jwt_payload):
-    return check_token_blacklist(jwt_payload)
+from auth import (  # noqa: E402
+    admin_or_above,
+    admin_required,
+    agent_or_above,
+    auth_bp,
+    get_current_user,
+    get_current_user_id,
+    super_admin_required,
+)
 
 app.register_blueprint(auth_bp)
 
@@ -90,6 +86,19 @@ call_states: Dict[str, CredentialingState] = {}
 call_states_by_sid: Dict[str, CredentialingState] = {}
 call_state_lock = threading.Lock()
 audio_queues: Dict[str, Queue] = {}
+
+
+def _is_admin_like(user: Optional[dict]) -> bool:
+    return bool(user and user.get("role") in {"admin", "super_admin"})
+
+
+def _deny_if_call_not_owned(owner_user_id: Optional[str]):
+    user = get_current_user()
+    if _is_admin_like(user):
+        return None
+    if owner_user_id and user and str(owner_user_id) == str(user.get("id")):
+        return None
+    return jsonify({"success": False, "error": "Call not found"}), 404
 
 # Twilio client
 twilio_client = TwilioClient(
@@ -345,6 +354,8 @@ def validate_environment() -> bool:
         "TWILIO_AUTH_TOKEN",
         "SUPABASE_HOST",
         "SUPABASE_PASSWORD",
+        "SUPABASE_URL",
+        "SUPABASE_ANON_KEY",
         "ELEVENLABS_API_KEY",
     ]
 
@@ -571,6 +582,154 @@ def persist_call_progress(state: CredentialingState, finalize: bool = False):
         print(f"INFO: Persisted call progress for request {request_id}")
     except Exception as e:
         print(f"WARN: Could not persist call progress: {e}")
+
+
+def _enqueue_call_knowledge_ingestion(
+    call_id: Optional[str],
+    request_id: Optional[str] = None,
+    state: Optional[CredentialingState] = None,
+):
+    """Summarize a completed AI call and save it to the pgvector knowledge base."""
+    def _worker():
+        db = None
+        try:
+            if state and state.get('_knowledge_ingested'):
+                return
+
+            canonical_call_id = call_id or (state.get('call_id') if state else None)
+            resolved_request_id = request_id or (state.get('db_request_id') if state else None)
+
+            from credentialing_agent import DatabaseManager
+            db = DatabaseManager()
+
+            with db.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                if canonical_call_id:
+                    cur.execute(
+                        "SELECT 1 FROM call_knowledge WHERE call_id = %s LIMIT 1",
+                        (canonical_call_id,),
+                    )
+                    if cur.fetchone():
+                        if state is not None:
+                            state['_knowledge_ingested'] = True
+                        return
+                elif resolved_request_id:
+                    cur.execute(
+                        "SELECT 1 FROM call_knowledge WHERE request_id = %s LIMIT 1",
+                        (resolved_request_id,),
+                    )
+                    if cur.fetchone():
+                        if state is not None:
+                            state['_knowledge_ingested'] = True
+                        return
+
+                request_row = None
+                if resolved_request_id:
+                    cur.execute(
+                        """
+                        SELECT insurance_name, provider_name, status, reference_number,
+                               missing_documents, turnaround_days
+                        FROM credentialing_requests
+                        WHERE id = %s
+                        """,
+                        (resolved_request_id,),
+                    )
+                    request_row = cur.fetchone()
+
+                if canonical_call_id and resolved_request_id:
+                    cur.execute(
+                        """
+                        SELECT speaker, message, timestamp
+                        FROM conversation_history
+                        WHERE call_id = %s OR request_id = %s
+                        ORDER BY timestamp ASC
+                        """,
+                        (canonical_call_id, resolved_request_id),
+                    )
+                elif canonical_call_id:
+                    cur.execute(
+                        """
+                        SELECT speaker, message, timestamp
+                        FROM conversation_history
+                        WHERE call_id = %s
+                        ORDER BY timestamp ASC
+                        """,
+                        (canonical_call_id,),
+                    )
+                elif resolved_request_id:
+                    cur.execute(
+                        """
+                        SELECT speaker, message, timestamp
+                        FROM conversation_history
+                        WHERE request_id = %s
+                        ORDER BY timestamp ASC
+                        """,
+                        (resolved_request_id,),
+                    )
+                else:
+                    return
+
+                conversation = [
+                    {"speaker": row["speaker"], "message": row["message"], "timestamp": row["timestamp"]}
+                    for row in cur.fetchall()
+                ]
+
+            insurance_name = (
+                (request_row and request_row["insurance_name"])
+                or (state.get('insurance_name') if state else None)
+            )
+            provider_name = (
+                (request_row and request_row["provider_name"])
+                or (state.get('provider_name') if state else None)
+            )
+            metadata = {
+                "status": (
+                    (state.get('credentialing_status') if state else None)
+                    or (request_row["status"] if request_row else None)
+                ),
+                "reference_number": (
+                    (state.get('reference_number') if state else None)
+                    or (request_row["reference_number"] if request_row else None)
+                ),
+                "missing_documents": (
+                    (state.get('missing_documents') if state else None)
+                    or (request_row["missing_documents"] if request_row else [])
+                    or []
+                ),
+                "turnaround_days": (
+                    (state.get('turnaround_days') if state else None)
+                    or (request_row["turnaround_days"] if request_row else None)
+                ),
+            }
+            transcript = state.get('transcript', []) if state else []
+
+            if not insurance_name:
+                logger.warning(
+                    f"Skipping knowledge ingestion for call {canonical_call_id or resolved_request_id}: "
+                    "missing insurance_name"
+                )
+                return
+
+            inserted = ingest_call_knowledge(
+                insurance_name=insurance_name,
+                provider_name=provider_name,
+                call_id=canonical_call_id,
+                request_id=resolved_request_id,
+                conversation=conversation,
+                transcript=transcript,
+                metadata=metadata,
+            )
+            if inserted and state is not None:
+                state['_knowledge_ingested'] = True
+        except Exception as e:
+            logger.error(f"Knowledge ingestion worker failed for call {call_id or request_id}: {e}")
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 def _log_ivr_event(call_id: str, event_type: str, transcript: str = None,
                     action_taken: str = None, confidence: float = None, metadata: dict = None):
@@ -899,7 +1058,7 @@ def serve_audio(filename):
 
 
 @app.route('/api/start-call', methods=['POST'])
-@jwt_required()
+@agent_or_above
 def start_credentialing_call():
     """
     API endpoint to start a new credentialing call
@@ -967,6 +1126,7 @@ def start_credentialing_call():
             }), 503
 
         # Create initial state
+        initiated_by = get_current_user_id()
         initial_state: CredentialingState = {
             'insurance_name': data['insurance_name'],
             'provider_name': data['provider_name'],
@@ -980,6 +1140,7 @@ def start_credentialing_call():
             'call_id': call_id,
             'call_sid': None,
             'db_request_id': None,
+            'initiated_by': initiated_by,
             'call_state': CallState.INITIATING,
             'transcript': [],
             'conversation_history': [],
@@ -2252,12 +2413,12 @@ def speech_webhook():
             # Determine next action based on AI decision
             action = ai_response.get('action', 'continue')
             finalize = action == 'end_call'
+            request_id = state.get('db_request_id') or state.get('call_id')
 
             # Persist conversation + progress in a single DB connection
             try:
                 from credentialing_agent import DatabaseManager
                 db = DatabaseManager()
-                request_id = state.get('db_request_id') or state.get('call_id')
                 db.save_conversation(call_info['call_id'], 'representative', speech_result, state.get('db_request_id'))
                 db.save_conversation(call_info['call_id'], 'agent', ai_response.get('response', ''), state.get('db_request_id'))
                 if request_id:
@@ -2268,6 +2429,13 @@ def speech_webhook():
                 db.close()
             except Exception as db_err:
                 print(f"WARN: Could not persist conversation/progress: {db_err}")
+
+            if finalize:
+                _enqueue_call_knowledge_ingestion(
+                    call_id=call_info['call_id'],
+                    request_id=request_id,
+                    state=state,
+                )
 
             if action == 'end_call':
                 speak_with_tts(response, ai_response.get('response', 'Thank you for your time. Goodbye.'))
@@ -2485,6 +2653,7 @@ def speech_followup_webhook():
             # Determine next action - only end when AI explicitly decides to
             action = ai_response.get('action', 'continue')
             finalize = action == 'end_call'
+            request_id = state.get('db_request_id') or state.get('call_id')
 
             if finalize:
                 state['call_state'] = CallState.COMPLETING
@@ -2493,7 +2662,6 @@ def speech_followup_webhook():
             try:
                 from credentialing_agent import DatabaseManager
                 db = DatabaseManager()
-                request_id = state.get('db_request_id') or state.get('call_id')
                 db.save_conversation(call_info['call_id'], 'representative', speech_result, state.get('db_request_id'))
                 db.save_conversation(call_info['call_id'], 'agent', ai_response.get('response', ''), state.get('db_request_id'))
                 if request_id:
@@ -2504,6 +2672,13 @@ def speech_followup_webhook():
                 db.close()
             except Exception as db_err:
                 print(f"WARN: Could not persist conversation/progress: {db_err}")
+
+            if finalize:
+                _enqueue_call_knowledge_ingestion(
+                    call_id=call_info['call_id'],
+                    request_id=request_id,
+                    state=state,
+                )
 
             if action == 'end_call':
                 speak_with_tts(response, ai_response.get('response', 'Thank you very much for your help. Have a great day. Goodbye.'))
@@ -2789,8 +2964,21 @@ def recording_status_webhook():
             # pass call_id here — it resolves request_id itself via a DB JOIN.
             if normalized_recording_status == 'completed':
                 from qa_extractor import extract_qa_async
-                threading.Thread(target=extract_qa_async, args=(call_id,), daemon=True).start()
+                threading.Thread(
+                    target=extract_qa_async,
+                    args=(call_id,),
+                    kwargs={'request_id': request_id},
+                    daemon=True,
+                ).start()
                 logger.info(f"Triggered Q&A extraction for call {call_id}")
+
+                if recording_type == 'ai':
+                    _enqueue_call_knowledge_ingestion(
+                        call_id=call_id,
+                        request_id=request_id,
+                        state=state,
+                    )
+                    logger.info(f"Triggered knowledge ingestion for call {call_id}")
 
                 # Transcribe agent-transferred recordings via Whisper
                 if recording_type == 'agent' and recording_url:
@@ -2815,7 +3003,7 @@ def recording_status_webhook():
 
 
 @app.route('/api/call-recording/<call_id>', methods=['GET'])
-@admin_required
+@agent_or_above
 def get_call_recording(call_id: str):
     """
     Get recording metadata for a call.
@@ -2823,6 +3011,16 @@ def get_call_recording(call_id: str):
     try:
         from credentialing_agent import DatabaseManager
         db = DatabaseManager()
+        with db.conn.cursor() as cur:
+            cur.execute(
+                "SELECT initiated_by::text FROM credentialing_requests WHERE id = %s",
+                (call_id,),
+            )
+            owner_row = cur.fetchone()
+        denial = _deny_if_call_not_owned(owner_row[0] if owner_row else None)
+        if denial:
+            db.close()
+            return denial
         recording = db.get_recording(call_id=call_id)
         db.close()
 
@@ -2854,7 +3052,7 @@ def get_call_recording(call_id: str):
 
 
 @app.route('/api/call-recording/<call_id>/stream', methods=['GET'])
-@admin_required
+@agent_or_above
 def stream_call_recording(call_id: str):
     """
     Stream call recording audio.
@@ -2863,6 +3061,16 @@ def stream_call_recording(call_id: str):
     try:
         from credentialing_agent import DatabaseManager
         db = DatabaseManager()
+        with db.conn.cursor() as cur:
+            cur.execute(
+                "SELECT initiated_by::text FROM credentialing_requests WHERE id = %s",
+                (call_id,),
+            )
+            owner_row = cur.fetchone()
+        denial = _deny_if_call_not_owned(owner_row[0] if owner_row else None)
+        if denial:
+            db.close()
+            return denial
         recording = db.get_recording(call_id=call_id)
         db.close()
 
@@ -3046,7 +3254,7 @@ def get_call_qa(call_id: str):
 
 
 @app.route('/api/call-detail/<call_id>', methods=['GET'])
-@admin_required
+@agent_or_above
 def get_call_detail(call_id: str):
     """
     Get full call details from the database (persists across server restarts).
@@ -3088,7 +3296,7 @@ def get_call_detail(call_id: str):
                        address, insurance_phone, questions, status, reference_number,
                        missing_documents, turnaround_days, notes,
                        created_at, updated_at, completed_at,
-                       call_mode, agent_phone,
+                       call_mode, agent_phone, initiated_by::text,
                        human_detection_correct
                 FROM credentialing_requests
                 WHERE id = %s
@@ -3098,6 +3306,11 @@ def get_call_detail(call_id: str):
         if not row:
             db.close()
             return jsonify({'success': False, 'error': 'Call not found'}), 404
+
+        denial = _deny_if_call_not_owned(row[18] if len(row) > 18 else None)
+        if denial:
+            db.close()
+            return denial
 
         call_data = {
             'id': str(row[0]),
@@ -3118,7 +3331,8 @@ def get_call_detail(call_id: str):
             'completed_at': row[15].isoformat() if row[15] else None,
             'call_mode': row[16] or 'ai',
             'agent_phone': row[17],
-            'human_detection_correct': row[18],
+            'initiated_by': row[18],
+            'human_detection_correct': row[19],
         }
 
         # Fetch conversation history
@@ -3744,7 +3958,7 @@ def add_ivr_knowledge():
 
 
 @app.route('/api/calls', methods=['GET'])
-@admin_required
+@agent_or_above
 def get_recent_calls():
     """
     Get recent credentialing calls
@@ -3753,18 +3967,31 @@ def get_recent_calls():
         from credentialing_agent import DatabaseManager
 
         limit = request.args.get('limit', 20, type=int)
+        current_user = get_current_user()
         db = DatabaseManager()
 
         with db.conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, insurance_name, provider_name, npi, tax_id,
-                       address, insurance_phone, status, reference_number,
-                       missing_documents, turnaround_days, notes,
-                       created_at, completed_at, call_mode, agent_phone
-                FROM credentialing_requests
-                ORDER BY created_at DESC
-                LIMIT %s
-            """, (limit,))
+            if _is_admin_like(current_user):
+                cur.execute("""
+                    SELECT id, insurance_name, provider_name, npi, tax_id,
+                           address, insurance_phone, status, reference_number,
+                           missing_documents, turnaround_days, notes,
+                           created_at, completed_at, call_mode, agent_phone, initiated_by::text
+                    FROM credentialing_requests
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, (limit,))
+            else:
+                cur.execute("""
+                    SELECT id, insurance_name, provider_name, npi, tax_id,
+                           address, insurance_phone, status, reference_number,
+                           missing_documents, turnaround_days, notes,
+                           created_at, completed_at, call_mode, agent_phone, initiated_by::text
+                    FROM credentialing_requests
+                    WHERE initiated_by = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, (current_user["id"], limit))
 
             calls = []
             for row in cur.fetchall():
@@ -3785,6 +4012,7 @@ def get_recent_calls():
                     'completed_at': row[13].isoformat() if row[13] else None,
                     'call_mode': row[14] or 'ai',
                     'agent_phone': row[15],
+                    'initiated_by': row[16],
                 })
 
         db.close()
@@ -4016,7 +4244,7 @@ def cancel_call(call_id: str):
 
 
 @app.route('/api/ivr-knowledge/<insurance_name>', methods=['GET'])
-@admin_required
+@agent_or_above
 def get_ivr_knowledge(insurance_name: str):
     """
     Get IVR knowledge for a specific insurance provider
@@ -4069,7 +4297,7 @@ def get_ivr_knowledge(insurance_name: str):
 # ============================================================================
 
 @app.route('/api/insurance-providers', methods=['GET'])
-@admin_required
+@agent_or_above
 def get_insurance_providers():
     """
     Get all insurance providers
@@ -4583,7 +4811,7 @@ def delete_config_value(config_key: str):
 # ============================================================================
 
 @app.route('/api/audit-logs', methods=['GET'])
-@admin_required
+@super_admin_required
 def get_audit_logs_endpoint():
     """
     Get audit logs with filtering and pagination.
@@ -4653,7 +4881,7 @@ def get_audit_logs_endpoint():
 
 
 @app.route('/api/audit-logs', methods=['POST'])
-@admin_required
+@super_admin_required
 def create_audit_log():
     """
     Manually create an audit log entry.
@@ -4703,7 +4931,7 @@ def create_audit_log():
 # ============================================================================
 
 @app.route('/api/transfer-to-agent', methods=['POST'])
-@jwt_required()
+@admin_or_above
 def transfer_to_agent():
     """
     Mid-call transfer from AI to a real human agent using Twilio Conference.
@@ -4989,7 +5217,7 @@ def add_twilio_number():
 
     conn = _tp_get_conn()
     try:
-        user_id = get_jwt_identity()
+        user_id = get_current_user_id()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 "INSERT INTO twilio_numbers (phone_number, friendly_name, added_by) "

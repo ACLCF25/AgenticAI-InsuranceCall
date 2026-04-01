@@ -33,6 +33,34 @@ import { api } from '@/lib/api'
 import { getStatusColor, formatStatus, formatDate, formatPhoneNumber, formatRelativeTime } from '@/lib/utils'
 import Link from 'next/link'
 
+function splitTranscriptParagraphs(text: string): string[] {
+  const normalized = text.replace(/\s+/g, ' ').trim()
+  if (!normalized) return []
+
+  const sentences = normalized.split(/(?<=[.!?])\s+(?=[A-Z0-9])/)
+  const paragraphs: string[] = []
+  let current = ''
+  let sentenceCount = 0
+
+  for (const sentence of sentences) {
+    const trimmed = sentence.trim()
+    if (!trimmed) continue
+
+    const next = current ? `${current} ${trimmed}` : trimmed
+    if (current && (next.length > 420 || sentenceCount >= 3)) {
+      paragraphs.push(current)
+      current = trimmed
+      sentenceCount = 1
+    } else {
+      current = next
+      sentenceCount += 1
+    }
+  }
+
+  if (current) paragraphs.push(current)
+  return paragraphs.length > 0 ? paragraphs : [normalized]
+}
+
 export default function CallDetailPage() {
   const params = useParams()
   const router = useRouter()
@@ -487,6 +515,13 @@ export default function CallDetailPage() {
                       is_answer?: boolean
                       related_qa_id?: string
                     }, i: number) => (
+                      (() => {
+                        const isAgentTranscript = msg.speaker === 'agent_transcript'
+                        const transcriptParagraphs = isAgentTranscript
+                          ? splitTranscriptParagraphs(msg.message)
+                          : []
+
+                        return (
                       <div
                         key={i}
                         className={`flex gap-3 ${
@@ -494,7 +529,11 @@ export default function CallDetailPage() {
                         }`}
                       >
                         <div
-                          className={`max-w-[80%] rounded-lg px-4 py-2 ${
+                          className={`rounded-lg px-4 py-2 ${
+                            isAgentTranscript
+                              ? 'max-w-full border bg-sky-50/60'
+                              : 'max-w-[80%]'
+                          } ${
                             msg.speaker === 'agent'
                               ? 'bg-primary text-primary-foreground'
                               : 'bg-muted'
@@ -506,12 +545,23 @@ export default function CallDetailPage() {
                         >
                           <div className="flex items-center gap-2 mb-1 flex-wrap">
                             <span className="text-xs font-medium opacity-80">
-                              {msg.speaker === 'agent' ? 'AI Agent' : msg.speaker === 'ivr' ? 'IVR System' : msg.speaker === 'agent_transcript' ? 'Agent Call Transcript' : 'Representative'}
+                              {msg.speaker === 'agent'
+                                ? 'AI Agent'
+                                : msg.speaker === 'ivr'
+                                  ? 'IVR System'
+                                  : msg.speaker === 'agent_transcript'
+                                    ? 'Recorded Agent Call'
+                                    : 'Representative'}
                             </span>
                             {msg.timestamp && (
                               <span className="text-xs opacity-60">
                                 {formatRelativeTime(msg.timestamp)}
                               </span>
+                            )}
+                            {isAgentTranscript && (
+                              <Badge variant="outline" className="text-xs h-5">
+                                Auto Transcript
+                              </Badge>
                             )}
                             {msg.is_question && (
                               <Badge variant="outline" className="text-xs h-5">
@@ -524,9 +574,24 @@ export default function CallDetailPage() {
                               </Badge>
                             )}
                           </div>
-                          <p className="text-sm">{msg.message}</p>
+                          {isAgentTranscript ? (
+                            <div className="space-y-3">
+                              {transcriptParagraphs.map((paragraph, paragraphIndex) => (
+                                <p
+                                  key={paragraphIndex}
+                                  className="text-sm leading-6 text-foreground whitespace-pre-wrap"
+                                >
+                                  {paragraph}
+                                </p>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="text-sm">{msg.message}</p>
+                          )}
                         </div>
                       </div>
+                        )
+                      })()
                     )
                   )}
                 </div>

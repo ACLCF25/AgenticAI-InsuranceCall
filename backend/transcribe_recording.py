@@ -10,6 +10,7 @@ saves the transcript to conversation_history so it appears in the call detail UI
 import io
 import logging
 import os
+import re
 import tempfile
 
 import requests
@@ -17,6 +18,37 @@ from requests.auth import HTTPBasicAuth
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
+
+
+def _chunk_transcript(text: str, max_chars: int = 420, max_sentences: int = 4) -> list[str]:
+    """Split a long Whisper transcript into readable conversation blocks."""
+    normalized = re.sub(r"\s+", " ", (text or "").strip())
+    if not normalized:
+        return []
+
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", normalized)
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+
+        projected_len = current_len + len(sentence) + (1 if current else 0)
+        if current and (projected_len > max_chars or len(current) >= max_sentences):
+            chunks.append(" ".join(current).strip())
+            current = [sentence]
+            current_len = len(sentence)
+        else:
+            current.append(sentence)
+            current_len = projected_len
+
+    if current:
+        chunks.append(" ".join(current).strip())
+
+    return chunks or [normalized]
 
 
 def transcribe_agent_recording(call_id: str, recording_url: str, request_id: str = None):
@@ -90,17 +122,23 @@ def transcribe_agent_recording(call_id: str, recording_url: str, request_id: str
             f"[transcribe] Transcribed {len(transcript_text)} chars for call_id={call_id}"
         )
 
+        transcript_chunks = _chunk_transcript(transcript_text)
+
         # Save to conversation_history
         from credentialing_agent import DatabaseManager
         db = DatabaseManager()
         try:
-            db.save_conversation(
-                call_id=call_id,
-                speaker='agent_transcript',
-                message=transcript_text,
-                request_id=request_id,
+            for chunk in transcript_chunks:
+                db.save_conversation(
+                    call_id=call_id,
+                    speaker='agent_transcript',
+                    message=chunk,
+                    request_id=request_id,
+                )
+            logger.info(
+                f"[transcribe] Saved {len(transcript_chunks)} transcript chunk(s) "
+                f"to conversation_history for call_id={call_id}"
             )
-            logger.info(f"[transcribe] Saved transcript to conversation_history for call_id={call_id}")
         finally:
             db.close()
 

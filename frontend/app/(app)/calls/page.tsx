@@ -19,10 +19,12 @@ import {
 import { api } from '@/lib/api'
 import { formatStatus, getStatusColor, formatRelativeTime, formatPhoneNumber } from '@/lib/utils'
 import { useState } from 'react'
+import { useAuth } from '@/lib/auth-context'
 
 export default function CallsPage() {
   const router = useRouter()
   const [search, setSearch] = useState('')
+  const { user } = useAuth()
 
   const { data, isLoading } = useQuery({
     queryKey: ['recent-calls', 100],
@@ -47,7 +49,9 @@ export default function CallsPage() {
       <Card>
         <CardHeader>
           <div className="flex items-center justify-between">
-            <CardTitle className="text-base font-semibold">Call History</CardTitle>
+            <CardTitle className="text-base font-semibold">
+              {user?.role === 'agent' ? 'My Calls' : 'Call History'}
+            </CardTitle>
             <Phone className="h-4 w-4 text-muted-foreground" />
           </div>
           <div className="relative mt-3">

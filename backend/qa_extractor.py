@@ -156,7 +156,7 @@ Extract all Q&A pairs and return as JSON array:""",
             db.close()
 
 
-def extract_qa_async(call_id: str):
+def extract_qa_async(call_id: str, request_id: Optional[str] = None):
     """
     Background job to extract Q&A pairs for a completed call.
 
@@ -178,14 +178,18 @@ def extract_qa_async(call_id: str):
                 FROM conversation_history ch
                 JOIN credentialing_requests r ON r.id = ch.request_id
                 WHERE ch.call_id = %s
+                   OR (%s IS NOT NULL AND ch.request_id = %s)
                 LIMIT 1
                 """,
-                (call_id,),
+                (call_id, request_id, request_id),
             )
 
             row = cur.fetchone()
             if not row:
-                logger.warning(f"No conversation found for call {call_id}")
+                logger.warning(
+                    f"No conversation found for call {call_id}"
+                    + (f" (request_id={request_id})" if request_id else "")
+                )
                 db.close()
                 return
 
@@ -198,9 +202,10 @@ def extract_qa_async(call_id: str):
                 SELECT speaker, message, timestamp
                 FROM conversation_history
                 WHERE call_id = %s
+                   OR (%s IS NOT NULL AND request_id = %s)
                 ORDER BY timestamp ASC
                 """,
-                (call_id,),
+                (call_id, request_id, request_id),
             )
 
             conversation = [

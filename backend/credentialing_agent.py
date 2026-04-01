@@ -98,6 +98,24 @@ _llm_extractor = ChatOpenAI(
     temperature=0.1,
     api_key=os.getenv("OPENAI_API_KEY"),
 )
+_llm_kb_summarizer = ChatOpenAI(
+    model=os.getenv("OPENAI_MODEL_KB_SUMMARY", "gpt-4"),
+    temperature=0.2,
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
+_kb_summary_prompt = ChatPromptTemplate.from_messages([
+    ("system", """Summarize the credentialing phone call for future reuse.
+Return JSON:
+{
+  "summary": "2-4 bullet summary (concise)",
+  "qa": [
+    {"q": "...", "a": "..."},
+    ...
+  ]
+}
+Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
+    ("user", "Conversation:\n{conversation}")
+])
 
 # ---------------------------------------------------------------------------
 # Module-level compiled LangGraph cache.
@@ -116,6 +134,73 @@ _compiled_graph = None
 # ---------------------------------------------------------------------------
 _ivr_knowledge_cache: dict = {}
 _IVR_CACHE_TTL_SECONDS: int = 1800  # 30 minutes
+
+
+def ingest_call_knowledge(
+    insurance_name: str,
+    provider_name: Optional[str],
+    call_id: Optional[str],
+    request_id: Optional[str],
+    conversation: Optional[List[Dict[str, Any]]] = None,
+    transcript: Optional[List[Dict[str, Any]]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Summarize a completed call and store it in the pgvector knowledge base."""
+    conversation = conversation or []
+    transcript = transcript or []
+
+    if conversation:
+        conversation_text = "\n".join(
+            f"{msg.get('speaker', 'unknown')}: {msg.get('message', '')}"
+            for msg in conversation
+            if msg.get('message')
+        )
+    else:
+        conversation_text = "\n".join(
+            f"{msg.get('speaker', 'unknown')}: {msg.get('text', '')}"
+            for msg in transcript
+            if msg.get('text')
+        )
+
+    if not conversation_text.strip():
+        print(f"Knowledge ingestion skipped: no conversation text for call {call_id or request_id}")
+        return False
+
+    try:
+        chain = _kb_summary_prompt | _llm_kb_summarizer | JsonOutputParser()
+        kb_data = chain.invoke({"conversation": conversation_text})
+    except Exception as e:
+        print(f"KB summary failed for call {call_id or request_id}: {e}")
+        kb_data = {
+            "summary": "Credentialing call completed; summary unavailable.",
+            "qa": [],
+        }
+
+    summary = redact_text(kb_data.get("summary", ""))
+    qa_pairs = kb_data.get("qa", []) or []
+    qa_lines = []
+    for pair in qa_pairs[:5]:
+        question = redact_text(pair.get("q", ""))
+        answer = redact_text(pair.get("a", ""))
+        if question or answer:
+            qa_lines.append(f"- Q: {question}\n  A: {answer}")
+    qa_text = "\n".join(qa_lines) if qa_lines else ""
+
+    kb = KnowledgeBase()
+    try:
+        kb.upsert_entry(
+            insurance_name=insurance_name,
+            provider_name=provider_name,
+            call_id=call_id,
+            request_id=request_id,
+            summary=summary,
+            qa_text=qa_text,
+            metadata=metadata or {},
+        )
+        print(f"Knowledge base ingestion complete for call {call_id or request_id}.")
+        return True
+    finally:
+        kb.close()
 
 
 class CallState(str, Enum):
@@ -167,6 +252,7 @@ class CredentialingState(TypedDict):
     call_id: Optional[str]
     call_sid: Optional[str]
     db_request_id: Optional[str]
+    initiated_by: Optional[str]
     call_state: CallState
     
     # Real-time conversation
@@ -269,8 +355,8 @@ class DatabaseManager:
         with self.conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO credentialing_requests
-                (insurance_name, provider_name, npi, tax_id, address, insurance_phone, provider_phone, questions, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (insurance_name, provider_name, npi, tax_id, address, insurance_phone, provider_phone, questions, status, initiated_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 state['insurance_name'],
@@ -281,7 +367,8 @@ class DatabaseManager:
                 state.get('insurance_phone'),
                 state.get('provider_phone'),
                 json.dumps(state['questions']),
-                'initiated'
+                'initiated',
+                state.get('initiated_by'),
             ))
             request_id = cur.fetchone()[0]
             self.conn.commit()

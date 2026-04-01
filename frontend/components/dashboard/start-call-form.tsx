@@ -143,7 +143,7 @@ export function StartCallForm({
       toast.success('Call started successfully!', {
         description: `Call ID: ${response.call_id || 'N/A'} - The credentialing call has been initiated.`,
       })
-      queryClient.invalidateQueries({ queryKey: ['calls'] })
+      queryClient.invalidateQueries({ queryKey: ['recent-calls'] })
       queryClient.invalidateQueries({ queryKey: ['metrics'] })
       onSuccess?.(response)
       if (!onSuccess) {

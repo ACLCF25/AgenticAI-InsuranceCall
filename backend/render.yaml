@@ -19,6 +19,12 @@ services:
         sync: false
       - key: SUPABASE_PASSWORD
         sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
       - key: TWILIO_ACCOUNT_SID
         sync: false
       - key: TWILIO_AUTH_TOKEN
@@ -32,8 +38,6 @@ services:
       - key: ELEVENLABS_API_KEY
         sync: false
       - key: ELEVENLABS_VOICE_ID
-        sync: false
-      - key: JWT_SECRET_KEY
         sync: false
       - key: BASE_URL
         sync: false

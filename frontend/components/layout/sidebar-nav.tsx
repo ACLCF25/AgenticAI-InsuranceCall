@@ -32,17 +32,30 @@ const adminNavItems: NavItem[] = [
   { href: '/settings/phone-numbers', label: 'Phone Lines', icon: PhoneCall },
 ]
 
-const userNavItems: NavItem[] = [
-  { href: '/calls/new', label: 'New Call', icon: Phone },
+const superAdminNavItems: NavItem[] = [
+  ...adminNavItems,
+  { href: '/settings/audit', label: 'Audit Trail', icon: BarChart3 },
+]
+
+const agentNavItems: NavItem[] = [
+  { href: '/calls', label: 'My Calls', icon: Phone },
+  { href: '/calls/new', label: 'New Call', icon: PhoneCall },
 ]
 
 export function SidebarNav() {
   const pathname = usePathname()
   const { user } = useAuth()
-  const navItems = user?.role === 'admin' ? adminNavItems : userNavItems
+  const navItems =
+    user?.role === 'super_admin'
+      ? superAdminNavItems
+      : user?.role === 'admin'
+        ? adminNavItems
+        : agentNavItems
 
   const isActive = (href: string) => {
     if (href === '/') return pathname === '/'
+    if (href === '/settings') return pathname === '/settings'
+    if (href === '/calls') return pathname === '/calls' || (pathname.startsWith('/calls/') && pathname !== '/calls/new')
     return pathname.startsWith(href)
   }
 

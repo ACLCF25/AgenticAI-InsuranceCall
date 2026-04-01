@@ -15,6 +15,9 @@ const pageTitles: Record<string, string> = {
   '/insurance': 'Insurance Providers',
   '/analytics': 'Analytics',
   '/settings': 'Settings',
+  '/settings/users': 'User Access',
+  '/settings/phone-numbers': 'Phone Lines',
+  '/settings/audit': 'Audit Trail',
 }
 
 export function Header() {
@@ -52,7 +55,7 @@ export function Header() {
 
         <div className="flex-1" />
 
-        {user?.role === 'admin' && (
+        {user && user.approval_status === 'approved' && (
           <Button asChild size="sm" className="gap-1.5 rounded-full px-4">
             <Link href="/calls/new">
               <Plus className="h-4 w-4" />

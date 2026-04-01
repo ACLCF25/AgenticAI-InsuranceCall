@@ -3,6 +3,7 @@
 import { useEffect } from 'react'
 import { useRouter, usePathname } from 'next/navigation'
 import { useAuth } from '@/lib/auth-context'
+import { getStoredSession } from '@/lib/supabase-auth'
 
 interface ProtectedRouteProps {
   children: React.ReactNode
@@ -12,6 +13,7 @@ export function ProtectedRoute({ children }: ProtectedRouteProps) {
   const { user, isLoading } = useAuth()
   const router = useRouter()
   const pathname = usePathname()
+  const hasStoredSession = typeof window !== 'undefined' && !!getStoredSession()
 
   useEffect(() => {
     if (isLoading) return
@@ -19,9 +21,18 @@ export function ProtectedRoute({ children }: ProtectedRouteProps) {
       router.replace('/login')
       return
     }
-    // role=user can only access /calls/new
-    if (user.role === 'user' && pathname !== '/calls/new') {
-      router.replace('/calls/new')
+    if (!user.email_confirmed || user.approval_status !== 'approved') {
+      router.replace('/pending-approval')
+      return
+    }
+
+    if (user.role === 'agent' && !pathname.startsWith('/calls')) {
+      router.replace('/calls')
+      return
+    }
+
+    if (pathname.startsWith('/settings/audit') && user.role !== 'super_admin') {
+      router.replace('/')
     }
   }, [user, isLoading, router, pathname])
 
@@ -36,16 +47,16 @@ export function ProtectedRoute({ children }: ProtectedRouteProps) {
 
   if (isLoading) return spinner
 
-  // Token exists in localStorage but AuthProvider hasn't propagated user state yet
-  // (race condition right after login). Hold on loading instead of redirecting.
   if (!user) {
-    if (typeof window !== 'undefined' && localStorage.getItem('auth_token')) {
+    if (hasStoredSession) {
       return spinner
     }
     return null
   }
 
-  if (user.role === 'user' && pathname !== '/calls/new') return null
+  if (!user.email_confirmed || user.approval_status !== 'approved') return null
+  if (user.role === 'agent' && !pathname.startsWith('/calls')) return null
+  if (pathname.startsWith('/settings/audit') && user.role !== 'super_admin') return null
 
   return <>{children}</>
 }
