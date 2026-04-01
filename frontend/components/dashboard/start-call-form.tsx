@@ -143,7 +143,7 @@ export function StartCallForm({
       toast.success('Call started successfully!', {
         description: `Call ID: ${response.call_id || 'N/A'} - The credentialing call has been initiated.`,
       })
-      queryClient.invalidateQueries({ queryKey: ['calls'] })
+      queryClient.invalidateQueries({ queryKey: ['recent-calls'] })
       queryClient.invalidateQueries({ queryKey: ['metrics'] })
       onSuccess?.(response)
       if (!onSuccess) {
@@ -151,9 +151,17 @@ export function StartCallForm({
       }
     },
     onError: (error: any) => {
-      toast.error('Failed to start call', {
-        description: error.response?.data?.error || error.message,
-      })
+      const status = error.response?.status
+      const message = error.response?.data?.error || error.message
+      if (status === 503) {
+        toast.error('All phone lines are currently busy', {
+          description: 'Please try again in a few minutes.',
+        })
+      } else {
+        toast.error('Failed to start call', {
+          description: message,
+        })
+      }
     },
   })
 
@@ -324,7 +332,7 @@ export function StartCallForm({
 
             {loadingIVR ? (
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
+                <Loader2 className="h-4 w-4 animate-spin" aria-label="Loading IVR configuration" />
                 Loading IVR configuration...
               </div>
             ) : ivrKnowledge?.data && ivrKnowledge.data.length > 0 ? (

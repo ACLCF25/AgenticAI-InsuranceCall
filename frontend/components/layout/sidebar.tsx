@@ -28,7 +28,9 @@ export function Sidebar() {
         <div className="flex items-center justify-between">
           <div className="flex flex-col">
             <span className="text-xs font-medium">{user?.username}</span>
-            <span className="text-[11px] capitalize text-muted-foreground">{user?.role}</span>
+            <span className="text-[11px] text-muted-foreground">
+              {user?.role ? user.role.replace('_', ' ') : 'Pending'}
+            </span>
           </div>
           <ThemeSwitcher />
         </div>

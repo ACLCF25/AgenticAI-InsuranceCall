@@ -13,6 +13,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Literal, TypedDict, Annotated, Any
 from enum import Enum
+from urllib.parse import urlencode
 
 # LangChain imports
 from langchain_openai import ChatOpenAI
@@ -97,6 +98,24 @@ _llm_extractor = ChatOpenAI(
     temperature=0.1,
     api_key=os.getenv("OPENAI_API_KEY"),
 )
+_llm_kb_summarizer = ChatOpenAI(
+    model=os.getenv("OPENAI_MODEL_KB_SUMMARY", "gpt-4"),
+    temperature=0.2,
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
+_kb_summary_prompt = ChatPromptTemplate.from_messages([
+    ("system", """Summarize the credentialing phone call for future reuse.
+Return JSON:
+{
+  "summary": "2-4 bullet summary (concise)",
+  "qa": [
+    {"q": "...", "a": "..."},
+    ...
+  ]
+}
+Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
+    ("user", "Conversation:\n{conversation}")
+])
 
 # ---------------------------------------------------------------------------
 # Module-level compiled LangGraph cache.
@@ -115,6 +134,73 @@ _compiled_graph = None
 # ---------------------------------------------------------------------------
 _ivr_knowledge_cache: dict = {}
 _IVR_CACHE_TTL_SECONDS: int = 1800  # 30 minutes
+
+
+def ingest_call_knowledge(
+    insurance_name: str,
+    provider_name: Optional[str],
+    call_id: Optional[str],
+    request_id: Optional[str],
+    conversation: Optional[List[Dict[str, Any]]] = None,
+    transcript: Optional[List[Dict[str, Any]]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Summarize a completed call and store it in the pgvector knowledge base."""
+    conversation = conversation or []
+    transcript = transcript or []
+
+    if conversation:
+        conversation_text = "\n".join(
+            f"{msg.get('speaker', 'unknown')}: {msg.get('message', '')}"
+            for msg in conversation
+            if msg.get('message')
+        )
+    else:
+        conversation_text = "\n".join(
+            f"{msg.get('speaker', 'unknown')}: {msg.get('text', '')}"
+            for msg in transcript
+            if msg.get('text')
+        )
+
+    if not conversation_text.strip():
+        print(f"Knowledge ingestion skipped: no conversation text for call {call_id or request_id}")
+        return False
+
+    try:
+        chain = _kb_summary_prompt | _llm_kb_summarizer | JsonOutputParser()
+        kb_data = chain.invoke({"conversation": conversation_text})
+    except Exception as e:
+        print(f"KB summary failed for call {call_id or request_id}: {e}")
+        kb_data = {
+            "summary": "Credentialing call completed; summary unavailable.",
+            "qa": [],
+        }
+
+    summary = redact_text(kb_data.get("summary", ""))
+    qa_pairs = kb_data.get("qa", []) or []
+    qa_lines = []
+    for pair in qa_pairs[:5]:
+        question = redact_text(pair.get("q", ""))
+        answer = redact_text(pair.get("a", ""))
+        if question or answer:
+            qa_lines.append(f"- Q: {question}\n  A: {answer}")
+    qa_text = "\n".join(qa_lines) if qa_lines else ""
+
+    kb = KnowledgeBase()
+    try:
+        kb.upsert_entry(
+            insurance_name=insurance_name,
+            provider_name=provider_name,
+            call_id=call_id,
+            request_id=request_id,
+            summary=summary,
+            qa_text=qa_text,
+            metadata=metadata or {},
+        )
+        print(f"Knowledge base ingestion complete for call {call_id or request_id}.")
+        return True
+    finally:
+        kb.close()
 
 
 class CallState(str, Enum):
@@ -166,6 +252,7 @@ class CredentialingState(TypedDict):
     call_id: Optional[str]
     call_sid: Optional[str]
     db_request_id: Optional[str]
+    initiated_by: Optional[str]
     call_state: CallState
     
     # Real-time conversation
@@ -268,8 +355,8 @@ class DatabaseManager:
         with self.conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO credentialing_requests
-                (insurance_name, provider_name, npi, tax_id, address, insurance_phone, provider_phone, questions, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (insurance_name, provider_name, npi, tax_id, address, insurance_phone, provider_phone, questions, status, initiated_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 state['insurance_name'],
@@ -280,7 +367,8 @@ class DatabaseManager:
                 state.get('insurance_phone'),
                 state.get('provider_phone'),
                 json.dumps(state['questions']),
-                'initiated'
+                'initiated',
+                state.get('initiated_by'),
             ))
             request_id = cur.fetchone()[0]
             self.conn.commit()
@@ -656,6 +744,7 @@ class DatabaseManager:
         recording_duration: int,
         recording_status: str,
         request_id: Optional[str] = None,
+        recording_type: str = 'ai',
     ) -> str:
         """Save or update call recording metadata."""
         with self.conn.cursor() as cur:
@@ -663,12 +752,13 @@ class DatabaseManager:
                 """
                 INSERT INTO call_recordings
                 (call_id, call_sid, recording_sid, recording_url,
-                 recording_duration, recording_status, request_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                 recording_duration, recording_status, request_id, recording_type)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (recording_sid) DO UPDATE SET
                     recording_url = EXCLUDED.recording_url,
                     recording_status = EXCLUDED.recording_status,
                     recording_duration = EXCLUDED.recording_duration,
+                    recording_type = EXCLUDED.recording_type,
                     updated_at = NOW()
                 RETURNING id
                 """,
@@ -680,6 +770,7 @@ class DatabaseManager:
                     recording_duration,
                     recording_status,
                     request_id,
+                    recording_type,
                 ),
             )
             result = cur.fetchone()
@@ -905,15 +996,31 @@ class TelephonyManager:
         )
         self.phone_number = os.getenv("TWILIO_PHONE_NUMBER")
     
-    def initiate_call(self, to_number: str, callback_url: str) -> str:
-        """Initiate outbound call with recording"""
+    def initiate_call(
+        self,
+        to_number: str,
+        callback_url: str,
+        from_number: str = None,
+        call_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> str:
+        """Initiate outbound call with recording.
+        Uses from_number if provided (from number pool), else falls back to env."""
+        actual_from = from_number or self.phone_number
         # Extract base URL from callback URL to construct recording status callback
         base_url = callback_url.replace('/webhook/voice', '')
         recording_status_callback = f"{base_url}/webhook/recording-status"
+        callback_params = {}
+        if call_id:
+            callback_params["call_id"] = call_id
+        if request_id:
+            callback_params["request_id"] = request_id
+        if callback_params:
+            recording_status_callback = f"{recording_status_callback}?{urlencode(callback_params)}"
 
         call = self.client.calls.create(
             to=to_number,
-            from_=self.phone_number,
+            from_=actual_from,
             url=callback_url,
             status_callback=f"{callback_url}/status",
             record=True,
@@ -1343,7 +1450,10 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
         callback_url = os.getenv("CALLBACK_URL")
         call_sid = self.telephony.initiate_call(
             state['insurance_phone'],
-            callback_url
+            callback_url,
+            from_number=state.get('from_number'),
+            call_id=state.get('call_id'),
+            request_id=request_id,
         )
         
         state['call_sid'] = call_sid

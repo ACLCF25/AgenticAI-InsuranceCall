@@ -57,8 +57,10 @@ const insuranceFormSchema = z.object({
   average_wait_time_minutes: z.string().optional().transform(val => val ? parseInt(val, 10) : undefined),
   ivr_asks_npi: z.boolean().default(false),
   ivr_npi_method: z.enum(['speech', 'dtmf']).default('speech'),
+  ivr_npi_suffix: z.enum(['', '*', '#']).default(''),
   ivr_asks_tax_id: z.boolean().default(false),
   ivr_tax_id_method: z.enum(['speech', 'dtmf']).default('speech'),
+  ivr_tax_id_suffix: z.enum(['', '*', '#']).default(''),
   ivr_tax_id_digits_mode: z.enum(['full', 'last_n']).default('full'),
   ivr_tax_id_digits_to_send: z.string().optional(),
   notes: z.string().optional(),
@@ -104,8 +106,10 @@ export function AddInsuranceDialog({ open, onOpenChange, editingProvider }: AddI
       average_wait_time_minutes: '',
       ivr_asks_npi: false,
       ivr_npi_method: 'speech',
+      ivr_npi_suffix: '',
       ivr_asks_tax_id: false,
       ivr_tax_id_method: 'speech',
+      ivr_tax_id_suffix: '',
       ivr_tax_id_digits_mode: 'full',
       ivr_tax_id_digits_to_send: '',
       notes: '',
@@ -135,8 +139,10 @@ export function AddInsuranceDialog({ open, onOpenChange, editingProvider }: AddI
           average_wait_time_minutes: editingProvider.average_wait_time_minutes?.toString() || '',
           ivr_asks_npi: editingProvider.ivr_asks_npi ?? false,
           ivr_npi_method: editingProvider.ivr_npi_method ?? 'speech',
+          ivr_npi_suffix: (['*', '#'].includes(editingProvider.ivr_npi_suffix || '') ? editingProvider.ivr_npi_suffix as '*' | '#' : ''),
           ivr_asks_tax_id: editingProvider.ivr_asks_tax_id ?? false,
           ivr_tax_id_method: editingProvider.ivr_tax_id_method ?? 'speech',
+          ivr_tax_id_suffix: (['*', '#'].includes(editingProvider.ivr_tax_id_suffix || '') ? editingProvider.ivr_tax_id_suffix as '*' | '#' : ''),
           ivr_tax_id_digits_mode: editingProvider.ivr_tax_id_digits_to_send ? 'last_n' : 'full',
           ivr_tax_id_digits_to_send: editingProvider.ivr_tax_id_digits_to_send?.toString() || '',
           notes: editingProvider.notes || '',
@@ -171,8 +177,10 @@ export function AddInsuranceDialog({ open, onOpenChange, editingProvider }: AddI
           average_wait_time_minutes: '',
           ivr_asks_npi: false,
           ivr_npi_method: 'speech',
+          ivr_npi_suffix: '',
           ivr_asks_tax_id: false,
           ivr_tax_id_method: 'speech',
+          ivr_tax_id_suffix: '',
           ivr_tax_id_digits_mode: 'full',
           ivr_tax_id_digits_to_send: '',
           notes: '',
@@ -289,8 +297,10 @@ export function AddInsuranceDialog({ open, onOpenChange, editingProvider }: AddI
         average_wait_time_minutes: values.average_wait_time_minutes ? parseInt(values.average_wait_time_minutes, 10) : undefined,
         ivr_asks_npi: values.ivr_asks_npi,
         ivr_npi_method: values.ivr_asks_npi ? values.ivr_npi_method : 'speech',
+        ivr_npi_suffix: values.ivr_asks_npi && values.ivr_npi_method === 'dtmf' ? (values.ivr_npi_suffix || null) : null,
         ivr_asks_tax_id: values.ivr_asks_tax_id,
         ivr_tax_id_method: values.ivr_asks_tax_id ? values.ivr_tax_id_method : 'speech',
+        ivr_tax_id_suffix: values.ivr_asks_tax_id && values.ivr_tax_id_method === 'dtmf' ? (values.ivr_tax_id_suffix || null) : null,
         ivr_tax_id_digits_to_send: taxDigitsToSend,
         notes: values.notes || undefined,
       }
@@ -349,8 +359,10 @@ export function AddInsuranceDialog({ open, onOpenChange, editingProvider }: AddI
         average_wait_time_minutes: values.average_wait_time_minutes ? parseInt(values.average_wait_time_minutes, 10) : undefined,
         ivr_asks_npi: values.ivr_asks_npi,
         ivr_npi_method: values.ivr_asks_npi ? values.ivr_npi_method : 'speech',
+        ivr_npi_suffix: values.ivr_asks_npi && values.ivr_npi_method === 'dtmf' ? (values.ivr_npi_suffix || null) : null,
         ivr_asks_tax_id: values.ivr_asks_tax_id,
         ivr_tax_id_method: values.ivr_asks_tax_id ? values.ivr_tax_id_method : 'speech',
+        ivr_tax_id_suffix: values.ivr_asks_tax_id && values.ivr_tax_id_method === 'dtmf' ? (values.ivr_tax_id_suffix || null) : null,
         ivr_tax_id_digits_to_send: taxDigitsToSend,
         notes: values.notes || undefined,
       }
@@ -427,8 +439,17 @@ export function AddInsuranceDialog({ open, onOpenChange, editingProvider }: AddI
 
   const isPending = addMutation.isPending || updateMutation.isPending
 
+  const handleOpenChange = (nextOpen: boolean) => {
+    if (!nextOpen && form.formState.isDirty) {
+      if (!window.confirm('You have unsaved changes. Are you sure you want to close?')) {
+        return
+      }
+    }
+    onOpenChange(nextOpen)
+  }
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="max-w-2xl max-h-[85vh] flex flex-col">
         <DialogHeader>
           <DialogTitle>{isEditing ? 'Edit Insurance Provider' : 'Add Insurance Provider'}</DialogTitle>
@@ -543,6 +564,31 @@ export function AddInsuranceDialog({ open, onOpenChange, editingProvider }: AddI
                   )}
                 />
               )}
+              {form.watch('ivr_asks_npi') && form.watch('ivr_npi_method') === 'dtmf' && (
+                <FormField
+                  control={form.control}
+                  name="ivr_npi_suffix"
+                  render={({ field }) => (
+                    <FormItem className="ml-6">
+                      <FormLabel className="text-xs text-muted-foreground">Termination key after NPI</FormLabel>
+                      <div className="flex items-center gap-4">
+                        <label className="flex items-center gap-1.5 text-sm">
+                          <input type="radio" value="" checked={!field.value} onChange={() => field.onChange('')} className="accent-primary" />
+                          None
+                        </label>
+                        <label className="flex items-center gap-1.5 text-sm">
+                          <input type="radio" value="*" checked={field.value === '*'} onChange={() => field.onChange('*')} className="accent-primary" />
+                          Star (*)
+                        </label>
+                        <label className="flex items-center gap-1.5 text-sm">
+                          <input type="radio" value="#" checked={field.value === '#'} onChange={() => field.onChange('#')} className="accent-primary" />
+                          Pound (#)
+                        </label>
+                      </div>
+                    </FormItem>
+                  )}
+                />
+              )}
 
               {/* Tax ID Checkbox + Method */}
               <FormField
@@ -596,6 +642,32 @@ export function AddInsuranceDialog({ open, onOpenChange, editingProvider }: AddI
                       </FormItem>
                     )}
                   />
+
+                  {form.watch('ivr_tax_id_method') === 'dtmf' && (
+                    <FormField
+                      control={form.control}
+                      name="ivr_tax_id_suffix"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel className="text-xs text-muted-foreground">Termination key after Tax ID</FormLabel>
+                          <div className="flex items-center gap-4">
+                            <label className="flex items-center gap-1.5 text-sm">
+                              <input type="radio" value="" checked={!field.value} onChange={() => field.onChange('')} className="accent-primary" />
+                              None
+                            </label>
+                            <label className="flex items-center gap-1.5 text-sm">
+                              <input type="radio" value="*" checked={field.value === '*'} onChange={() => field.onChange('*')} className="accent-primary" />
+                              Star (*)
+                            </label>
+                            <label className="flex items-center gap-1.5 text-sm">
+                              <input type="radio" value="#" checked={field.value === '#'} onChange={() => field.onChange('#')} className="accent-primary" />
+                              Pound (#)
+                            </label>
+                          </div>
+                        </FormItem>
+                      )}
+                    />
+                  )}
 
                   <FormField
                     control={form.control}

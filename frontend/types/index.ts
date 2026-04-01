@@ -19,6 +19,9 @@ export type CredentialingStatus =
   | 'office_closed'
   | 'failed';
 
+export type UserRole = 'super_admin' | 'admin' | 'agent';
+export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
+
 export interface CredentialingRequest {
   id?: string;
   insurance_name: string;
@@ -38,6 +41,7 @@ export interface CredentialingRequest {
   completed_at?: string;
   call_mode?: string;
   agent_phone?: string;
+  initiated_by?: string | null;
 }
 
 export interface CallStatus {
@@ -105,6 +109,8 @@ export interface InsuranceProvider {
   ivr_asks_tax_id?: boolean;
   ivr_tax_id_method?: 'speech' | 'dtmf';
   ivr_tax_id_digits_to_send?: number;
+  ivr_npi_suffix?: string | null;       // '*', '#', or null
+  ivr_tax_id_suffix?: string | null;    // '*', '#', or null
   notes?: string;
   last_updated?: string;
 }
@@ -161,6 +167,14 @@ export interface CallDetailEvent {
   metadata?: Record<string, any>;
 }
 
+export interface QAPair {
+  id: string;
+  question_index: number;
+  question_text: string;
+  answer_text?: string;
+  confidence: number;
+}
+
 export interface CallDetail {
   id: string;
   insurance_name: string;
@@ -179,16 +193,94 @@ export interface CallDetail {
   created_at?: string;
   updated_at?: string;
   completed_at?: string;
+  call_mode?: string;
+  agent_phone?: string;
+  initiated_by?: string | null;
   conversation: ConversationMessage[];
   events: CallDetailEvent[];
+  ivr_patterns?: Array<{
+    menu_level: number;
+    detected_phrase: string;
+    preferred_action: string;
+    action_value: string;
+  }>;
   recording?: {
     available: boolean;
     url: string;
     duration?: number;
-    status?: string;
+    recording_type?: 'ai' | 'agent' | 'both';
+    status?: 'completed' | 'failed' | 'pending' | 'processing';
     created_at?: string;
   };
-  qa_pairs?: any[];
+  qa_pairs?: QAPair[];
+  human_detection_correct?: boolean | null;
+}
+
+export interface HumanDetectionPhrase {
+  id: string;
+  phrase: string;
+  phrase_type: 'human' | 'ivr_definitive' | 'ivr_passive' | 'simple_greeting';
+  insurance_name: string | null;
+  source: 'manual' | 'auto_review' | 'feedback';
+  confidence: number;
+  times_seen: number;
+  times_correct: number;
+  is_active: boolean;
+  source_call_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface HumanDetectionFeedbackResponse {
+  success: boolean;
+  correct: boolean;
+  new_phrases: Array<{
+    phrase: string;
+    phrase_type: string;
+    confidence: number;
+  }>;
+  analysis?: string;
+  analysis_error?: string;
+}
+
+export interface AdminUser {
+  id: string;
+  username: string | null;
+  email: string;
+  role: UserRole | null;
+  approval_status: ApprovalStatus;
+  email_confirmed: boolean;
+  approved_by?: string | null;
+  approved_by_username?: string | null;
+  approved_at?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  profile_missing?: boolean;
+}
+
+export interface AuthUser extends AdminUser {}
+
+export interface AuditLogEntry {
+  id: string;
+  user_id?: string | null;
+  action: string;
+  resource_type?: string | null;
+  resource_id?: string | null;
+  details?: Record<string, any> | null;
+  ip_address?: string | null;
+  timestamp: string;
+}
+
+export interface TwilioNumber {
+  id: string;
+  phone_number: string;
+  friendly_name: string | null;
+  is_active: boolean;
+  current_call_id: string | null;
+  current_call_sid: string | null;
+  in_use_since: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface LangSmithTrace {

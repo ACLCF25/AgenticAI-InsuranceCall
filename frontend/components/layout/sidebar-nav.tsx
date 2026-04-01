@@ -9,6 +9,8 @@ import {
   Building2,
   BarChart3,
   Settings,
+  Users,
+  PhoneCall,
   type LucideIcon,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -26,19 +28,34 @@ const adminNavItems: NavItem[] = [
   { href: '/insurance', label: 'Insurance', icon: Building2 },
   { href: '/analytics', label: 'Analytics', icon: BarChart3 },
   { href: '/settings', label: 'Settings', icon: Settings },
+  { href: '/settings/users', label: 'Users', icon: Users },
+  { href: '/settings/phone-numbers', label: 'Phone Lines', icon: PhoneCall },
 ]
 
-const userNavItems: NavItem[] = [
-  { href: '/calls/new', label: 'New Call', icon: Phone },
+const superAdminNavItems: NavItem[] = [
+  ...adminNavItems,
+  { href: '/settings/audit', label: 'Audit Trail', icon: BarChart3 },
+]
+
+const agentNavItems: NavItem[] = [
+  { href: '/calls', label: 'My Calls', icon: Phone },
+  { href: '/calls/new', label: 'New Call', icon: PhoneCall },
 ]
 
 export function SidebarNav() {
   const pathname = usePathname()
   const { user } = useAuth()
-  const navItems = user?.role === 'admin' ? adminNavItems : userNavItems
+  const navItems =
+    user?.role === 'super_admin'
+      ? superAdminNavItems
+      : user?.role === 'admin'
+        ? adminNavItems
+        : agentNavItems
 
   const isActive = (href: string) => {
     if (href === '/') return pathname === '/'
+    if (href === '/settings') return pathname === '/settings'
+    if (href === '/calls') return pathname === '/calls' || (pathname.startsWith('/calls/') && pathname !== '/calls/new')
     return pathname.startsWith(href)
   }
 

@@ -9,6 +9,7 @@ CREATE EXTENSION IF NOT EXISTS "vector";
 -- Credentialing Requests Table
 CREATE TABLE credentialing_requests (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    initiated_by UUID REFERENCES auth.users(id) ON DELETE SET NULL,
     insurance_name VARCHAR(255) NOT NULL,
     provider_name VARCHAR(255) NOT NULL,
     npi VARCHAR(10) NOT NULL,
@@ -129,8 +130,14 @@ CREATE TABLE insurance_providers (
     ivr_asks_tax_id BOOLEAN DEFAULT FALSE,
     ivr_tax_id_method VARCHAR(10) DEFAULT 'speech',  -- 'speech' or 'dtmf'
     ivr_tax_id_digits_to_send INTEGER,
+    ivr_npi_suffix VARCHAR(5) DEFAULT NULL,      -- NULL, '*', '#' — termination key after NPI DTMF
+    ivr_tax_id_suffix VARCHAR(5) DEFAULT NULL,   -- NULL, '*', '#' — termination key after Tax ID DTMF
     CONSTRAINT chk_ivr_tax_id_digits_to_send
         CHECK (ivr_tax_id_digits_to_send IS NULL OR ivr_tax_id_digits_to_send BETWEEN 1 AND 9),
+    CONSTRAINT chk_ivr_npi_suffix
+        CHECK (ivr_npi_suffix IS NULL OR ivr_npi_suffix IN ('*', '#')),
+    CONSTRAINT chk_ivr_tax_id_suffix
+        CHECK (ivr_tax_id_suffix IS NULL OR ivr_tax_id_suffix IN ('*', '#')),
     last_updated TIMESTAMP DEFAULT NOW(),
     INDEX idx_insurance_name (insurance_name)
 );
@@ -140,6 +147,8 @@ CREATE TABLE insurance_providers (
 -- ALTER TABLE insurance_providers
 --   ADD CONSTRAINT chk_ivr_tax_id_digits_to_send
 --   CHECK (ivr_tax_id_digits_to_send IS NULL OR ivr_tax_id_digits_to_send BETWEEN 1 AND 9);
+-- ALTER TABLE insurance_providers ADD COLUMN IF NOT EXISTS ivr_npi_suffix VARCHAR(5) DEFAULT NULL;
+-- ALTER TABLE insurance_providers ADD COLUMN IF NOT EXISTS ivr_tax_id_suffix VARCHAR(5) DEFAULT NULL;
 
 -- System Configuration Table
 CREATE TABLE system_config (
@@ -205,7 +214,10 @@ INSERT INTO system_config (config_key, config_value, description) VALUES
 ('ai_temperature', '0.3', 'OpenAI temperature for call decision making'),
 ('disclosure_message', '"Hello, this is an automated assistant calling on behalf of [provider_name]."', 'Initial disclosure message');
 
--- Create Row Level Security Policies (Optional - enable if multi-tenant)
+-- Row Level Security is enabled on these tables for future multi-tenant support.
+-- Currently no RLS policies are defined — this is intentional for the single-tenant
+-- deployment. All authenticated users can access all rows via the GRANT statements below.
+-- When multi-tenant isolation is needed, add CREATE POLICY statements here.
 ALTER TABLE credentialing_requests ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ivr_knowledge ENABLE ROW LEVEL SECURITY;
 ALTER TABLE call_events ENABLE ROW LEVEL SECURITY;
@@ -244,6 +256,7 @@ CREATE TABLE call_knowledge (
 
 -- Migration: Add provider_phone column if table already exists
 -- ALTER TABLE credentialing_requests ADD COLUMN IF NOT EXISTS provider_phone VARCHAR(20);
+-- ALTER TABLE credentialing_requests ADD COLUMN IF NOT EXISTS initiated_by UUID REFERENCES auth.users(id) ON DELETE SET NULL;
 
 -- Migration: Add call mode and agent transfer columns
 -- Run these on existing databases that already have the credentialing_requests table.
@@ -294,17 +307,60 @@ FOR EACH ROW
 EXECUTE FUNCTION log_audit_event();
 
 -- =============================================================================
--- Authentication Tables
+-- Supabase Auth Profile Tables
 -- =============================================================================
 
-CREATE TYPE user_role AS ENUM ('admin', 'user');
+CREATE TYPE user_role AS ENUM ('super_admin', 'admin', 'agent');
+CREATE TYPE approval_status AS ENUM ('pending', 'approved', 'rejected');
+
+CREATE TABLE user_profiles (
+    user_id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+    username VARCHAR(50) NOT NULL UNIQUE,
+    role user_role NOT NULL DEFAULT 'agent',
+    approval_status approval_status NOT NULL DEFAULT 'pending',
+    approved_by UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+    approved_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_user_profiles_role ON user_profiles(role);
+CREATE INDEX idx_user_profiles_approval_status ON user_profiles(approval_status);
+
+CREATE OR REPLACE FUNCTION public.handle_new_auth_user()
+RETURNS TRIGGER AS $$
+DECLARE
+    requested_username TEXT;
+BEGIN
+    requested_username := NULLIF(TRIM(COALESCE(NEW.raw_user_meta_data ->> 'username', '')), '');
+    IF requested_username IS NULL THEN
+        requested_username := split_part(NEW.email, '@', 1);
+    END IF;
+
+    INSERT INTO public.user_profiles (user_id, username, role, approval_status)
+    VALUES (NEW.id, requested_username, 'agent', 'pending');
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE TRIGGER on_auth_user_created
+AFTER INSERT ON auth.users
+FOR EACH ROW
+EXECUTE FUNCTION public.handle_new_auth_user();
+
+GRANT ALL ON user_profiles TO authenticated;
+
+-- =============================================================================
+-- Legacy Custom Auth Tables (deprecated)
+-- =============================================================================
 
 CREATE TABLE users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     username VARCHAR(50) NOT NULL UNIQUE,
     email VARCHAR(255) NOT NULL UNIQUE,
     password_hash VARCHAR(255) NOT NULL,
-    role user_role NOT NULL DEFAULT 'user',
+    role user_role NOT NULL DEFAULT 'agent',
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMP DEFAULT NOW(),
     last_login TIMESTAMP
@@ -328,6 +384,29 @@ GRANT ALL ON users TO authenticated;
 GRANT ALL ON token_blacklist TO authenticated;
 
 -- =============================================================================
+-- Twilio Phone Number Pool
+-- =============================================================================
+
+CREATE TABLE twilio_numbers (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    phone_number VARCHAR(20) NOT NULL UNIQUE,
+    friendly_name VARCHAR(100),
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    current_call_id VARCHAR(100),
+    current_call_sid VARCHAR(100),
+    in_use_since TIMESTAMP,
+    added_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_twilio_numbers_available ON twilio_numbers(is_active, current_call_id);
+CREATE INDEX idx_twilio_numbers_call_id ON twilio_numbers(current_call_id) WHERE current_call_id IS NOT NULL;
+CREATE INDEX idx_twilio_numbers_call_sid ON twilio_numbers(current_call_sid) WHERE current_call_sid IS NOT NULL;
+
+GRANT ALL ON twilio_numbers TO authenticated;
+
+-- =============================================================================
 -- Call Recording and Q&A Tables
 -- =============================================================================
 
@@ -343,6 +422,7 @@ CREATE TABLE call_recordings (
     recording_status VARCHAR(50) DEFAULT 'processing',  -- 'processing', 'completed', 'failed', 'expired'
     recording_format VARCHAR(10) DEFAULT 'mp3',  -- 'mp3', 'wav'
     file_size INTEGER,  -- Size in bytes
+    recording_type VARCHAR(20) DEFAULT 'ai',  -- 'ai', 'agent', or 'both'
     downloaded BOOLEAN DEFAULT FALSE,  -- If stored locally/S3
     local_path TEXT,  -- Optional: local/S3 storage path
     retention_until TIMESTAMP,  -- For automatic cleanup
@@ -409,3 +489,33 @@ CREATE TRIGGER trigger_update_call_recording_timestamp
 BEFORE UPDATE ON call_recordings
 FOR EACH ROW
 EXECUTE FUNCTION update_call_recording_timestamp();
+
+-- =============================================================================
+-- Self-Learning Human Detection Phrases
+-- =============================================================================
+
+CREATE TABLE human_detection_phrases (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    phrase TEXT NOT NULL,
+    phrase_type VARCHAR(20) NOT NULL CHECK (phrase_type IN ('human', 'ivr_definitive', 'ivr_passive', 'simple_greeting')),
+    insurance_name VARCHAR(255),          -- NULL = global, non-null = insurance-specific
+    source VARCHAR(50) NOT NULL DEFAULT 'manual',  -- 'manual', 'auto_review', 'feedback'
+    confidence FLOAT DEFAULT 0.8,
+    times_seen INTEGER DEFAULT 1,
+    times_correct INTEGER DEFAULT 1,
+    is_active BOOLEAN DEFAULT TRUE,
+    source_call_id VARCHAR(100),
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX idx_hdp_unique_phrase
+    ON human_detection_phrases(phrase, phrase_type, COALESCE(insurance_name, ''));
+CREATE INDEX idx_hdp_type_active ON human_detection_phrases(phrase_type, is_active);
+CREATE INDEX idx_hdp_insurance ON human_detection_phrases(insurance_name);
+
+GRANT ALL ON human_detection_phrases TO authenticated;
+
+-- Migration: Add human detection feedback columns to credentialing_requests
+-- ALTER TABLE credentialing_requests ADD COLUMN IF NOT EXISTS human_detection_correct BOOLEAN;
+-- ALTER TABLE credentialing_requests ADD COLUMN IF NOT EXISTS human_detection_feedback_at TIMESTAMP;

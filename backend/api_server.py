@@ -13,24 +13,26 @@ load_dotenv()
 import asyncio
 import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Optional
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
-from flask_jwt_extended import JWTManager, jwt_required
 from twilio.twiml.voice_response import VoiceResponse, Stream, Connect
 from twilio.rest import Client as TwilioClient
 import threading
 from queue import Queue
 import base64
 import websockets
+from urllib.parse import urlencode
+from xml.sax.saxutils import escape as xml_escape
 
 from credentialing_agent import (
     CredentialingAgent,
     CredentialingState,
     CallState,
-    AudioType
+    AudioType,
+    ingest_call_knowledge,
 )
 from knowledge_base import KnowledgeBase, redact_text, EmbeddingError, SearchError, KnowledgeBaseError
 from loguru import logger
@@ -66,19 +68,15 @@ IVR_MENU_INDICATORS = [
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes (Bearer token auth doesn't require restricted origins)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
-
-# JWT Configuration
-app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", os.getenv("SECRET_KEY", "change-me-in-production"))
-app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)
-app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(days=30)
-
-jwt_manager = JWTManager(app)
-
-from auth import auth_bp, check_token_blacklist, admin_required  # noqa: E402
-
-@jwt_manager.token_in_blocklist_loader
-def check_blocklist(jwt_header, jwt_payload):
-    return check_token_blacklist(jwt_payload)
+from auth import (  # noqa: E402
+    admin_or_above,
+    admin_required,
+    agent_or_above,
+    auth_bp,
+    get_current_user,
+    get_current_user_id,
+    super_admin_required,
+)
 
 app.register_blueprint(auth_bp)
 
@@ -89,11 +87,196 @@ call_states_by_sid: Dict[str, CredentialingState] = {}
 call_state_lock = threading.Lock()
 audio_queues: Dict[str, Queue] = {}
 
+
+def _is_admin_like(user: Optional[dict]) -> bool:
+    return bool(user and user.get("role") in {"admin", "super_admin"})
+
+
+def _deny_if_call_not_owned(owner_user_id: Optional[str]):
+    user = get_current_user()
+    if _is_admin_like(user):
+        return None
+    if owner_user_id and user and str(owner_user_id) == str(user.get("id")):
+        return None
+    return jsonify({"success": False, "error": "Call not found"}), 404
+
 # Twilio client
 twilio_client = TwilioClient(
     os.getenv("TWILIO_ACCOUNT_SID"),
     os.getenv("TWILIO_AUTH_TOKEN")
 )
+
+# =============================================================================
+# Twilio Number Pool
+# =============================================================================
+
+import psycopg2
+import psycopg2.extras
+import psycopg2.pool
+
+_twilio_pool = psycopg2.pool.ThreadedConnectionPool(
+    minconn=1,
+    maxconn=5,
+    host=os.getenv("SUPABASE_HOST"),
+    database="postgres",
+    user=os.getenv("SUPABASE_USER", "postgres"),
+    password=os.getenv("SUPABASE_PASSWORD"),
+    port=5432,
+)
+
+
+def _tp_get_conn():
+    return _twilio_pool.getconn()
+
+
+def _tp_put_conn(conn):
+    _twilio_pool.putconn(conn)
+
+
+def _seed_twilio_numbers():
+    """Seed Twilio numbers from env vars into the DB on startup."""
+    numbers = set()
+
+    # Single number
+    single = (os.getenv("TWILIO_PHONE_NUMBER") or "").strip()
+    if single:
+        numbers.add(single)
+
+    # Comma-separated list
+    multi = (os.getenv("TWILIO_PHONE_NUMBERS") or "").strip()
+    if multi:
+        for num in multi.split(","):
+            num = num.strip()
+            if num:
+                numbers.add(num)
+
+    if not numbers:
+        return
+
+    conn = _tp_get_conn()
+    try:
+        with conn.cursor() as cur:
+            for phone in numbers:
+                cur.execute(
+                    "INSERT INTO twilio_numbers (phone_number, friendly_name, is_active) "
+                    "VALUES (%s, %s, TRUE) "
+                    "ON CONFLICT (phone_number) DO NOTHING",
+                    (phone, f"ENV: {phone}"),
+                )
+        conn.commit()
+        logger.info(f"Seeded {len(numbers)} Twilio number(s) from env")
+    except Exception as e:
+        logger.warning(f"Could not seed Twilio numbers: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        _tp_put_conn(conn)
+
+
+def _acquire_twilio_number(call_id: str, call_sid: str = None):
+    """Atomically acquire an available Twilio number for a call.
+    Returns the phone number string, or None if all are busy."""
+    conn = _tp_get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, phone_number FROM twilio_numbers "
+                "WHERE is_active = TRUE AND current_call_id IS NULL "
+                "ORDER BY updated_at ASC NULLS FIRST "
+                "LIMIT 1 "
+                "FOR UPDATE SKIP LOCKED"
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            cur.execute(
+                "UPDATE twilio_numbers "
+                "SET current_call_id = %s, current_call_sid = %s, "
+                "    in_use_since = NOW(), updated_at = NOW() "
+                "WHERE id = %s",
+                (call_id, call_sid, row["id"]),
+            )
+        conn.commit()
+        logger.info(f"Acquired Twilio number {row['phone_number']} for call {call_id}")
+        return row["phone_number"]
+    except Exception as e:
+        logger.error(f"Error acquiring Twilio number: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+    finally:
+        _tp_put_conn(conn)
+
+
+def _release_twilio_number(call_id: str = None, call_sid: str = None):
+    """Release a Twilio number back to the pool."""
+    if not call_id and not call_sid:
+        return
+    conn = _tp_get_conn()
+    try:
+        with conn.cursor() as cur:
+            if call_id:
+                cur.execute(
+                    "UPDATE twilio_numbers "
+                    "SET current_call_id = NULL, current_call_sid = NULL, "
+                    "    in_use_since = NULL, updated_at = NOW() "
+                    "WHERE current_call_id = %s",
+                    (call_id,),
+                )
+            elif call_sid:
+                cur.execute(
+                    "UPDATE twilio_numbers "
+                    "SET current_call_id = NULL, current_call_sid = NULL, "
+                    "    in_use_since = NULL, updated_at = NOW() "
+                    "WHERE current_call_sid = %s",
+                    (call_sid,),
+                )
+        conn.commit()
+        logger.info(f"Released Twilio number (call_id={call_id}, call_sid={call_sid})")
+    except Exception as e:
+        logger.warning(f"Error releasing Twilio number: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        _tp_put_conn(conn)
+
+
+def _update_twilio_number_call_sid(call_id: str, call_sid: str):
+    """Persist the Twilio Call SID for an already-acquired phone line."""
+    if not call_id or not call_sid:
+        return
+    conn = _tp_get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE twilio_numbers "
+                "SET current_call_sid = %s, updated_at = NOW() "
+                "WHERE current_call_id = %s",
+                (call_sid, call_id),
+            )
+        conn.commit()
+        logger.info(f"Updated Twilio number Call SID for call {call_id}: {call_sid}")
+    except Exception as e:
+        logger.warning(f"Error updating Twilio number Call SID for call {call_id}: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        _tp_put_conn(conn)
+
+
+# Seed on startup
+try:
+    _seed_twilio_numbers()
+except Exception as e:
+    logger.warning(f"Twilio number seeding skipped: {e}")
 
 # =============================================================================
 # Helper utilities
@@ -121,6 +304,40 @@ def get_callback_base(req) -> str:
     return base.rstrip("/")
 
 
+def build_recording_status_callback(base_url: str, call_id: str = None, request_id: str = None) -> str:
+    """Build a Twilio recording callback URL with stable identifiers."""
+    callback_url = f"{base_url.rstrip('/')}/webhook/recording-status"
+    params = {}
+    if call_id:
+        params["call_id"] = call_id
+    if request_id:
+        params["request_id"] = request_id
+    if params:
+        callback_url = f"{callback_url}?{urlencode(params)}"
+    return callback_url
+
+
+def build_conference_twiml(conference_name: str, recording_callback_url: str, end_on_exit: bool) -> str:
+    """Generate conference TwiML with recording enabled from join."""
+    escaped_callback_url = xml_escape(recording_callback_url, {'"': '&quot;'})
+    escaped_conference_name = xml_escape(conference_name)
+    end_on_exit_value = "true" if end_on_exit else "false"
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Response>'
+        '<Dial>'
+        f'<Conference waitUrl="" startConferenceOnEnter="true" endConferenceOnExit="{end_on_exit_value}" '
+        'record="record-from-start" '
+        f'recordingStatusCallback="{escaped_callback_url}" '
+        'recordingStatusCallbackMethod="POST" '
+        'recordingStatusCallbackEvent="completed absent">'
+        f'{escaped_conference_name}'
+        '</Conference>'
+        '</Dial>'
+        '</Response>'
+    )
+
+
 ENV_VALIDATION_OK: bool = False
 ENV_VALIDATION_ERRORS = []
 
@@ -137,6 +354,8 @@ def validate_environment() -> bool:
         "TWILIO_AUTH_TOKEN",
         "SUPABASE_HOST",
         "SUPABASE_PASSWORD",
+        "SUPABASE_URL",
+        "SUPABASE_ANON_KEY",
         "ELEVENLABS_API_KEY",
     ]
 
@@ -201,6 +420,7 @@ def bind_call_sid(call_id: str, call_sid: str):
         if call_id in call_states:
             call_states[call_id]['call_sid'] = call_sid
             call_states_by_sid[call_sid] = call_states[call_id]
+    _update_twilio_number_call_sid(call_id, call_sid)
 
 
 def get_state_by_sid(call_sid: str) -> Optional[CredentialingState]:
@@ -362,6 +582,259 @@ def persist_call_progress(state: CredentialingState, finalize: bool = False):
         print(f"INFO: Persisted call progress for request {request_id}")
     except Exception as e:
         print(f"WARN: Could not persist call progress: {e}")
+
+
+def _enqueue_call_knowledge_ingestion(
+    call_id: Optional[str],
+    request_id: Optional[str] = None,
+    state: Optional[CredentialingState] = None,
+):
+    """Summarize a completed AI call and save it to the pgvector knowledge base."""
+    def _worker():
+        db = None
+        try:
+            if state and state.get('_knowledge_ingested'):
+                return
+
+            canonical_call_id = call_id or (state.get('call_id') if state else None)
+            resolved_request_id = request_id or (state.get('db_request_id') if state else None)
+
+            from credentialing_agent import DatabaseManager
+            db = DatabaseManager()
+
+            with db.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                if canonical_call_id:
+                    cur.execute(
+                        "SELECT 1 FROM call_knowledge WHERE call_id = %s LIMIT 1",
+                        (canonical_call_id,),
+                    )
+                    if cur.fetchone():
+                        if state is not None:
+                            state['_knowledge_ingested'] = True
+                        return
+                elif resolved_request_id:
+                    cur.execute(
+                        "SELECT 1 FROM call_knowledge WHERE request_id = %s LIMIT 1",
+                        (resolved_request_id,),
+                    )
+                    if cur.fetchone():
+                        if state is not None:
+                            state['_knowledge_ingested'] = True
+                        return
+
+                request_row = None
+                if resolved_request_id:
+                    cur.execute(
+                        """
+                        SELECT insurance_name, provider_name, status, reference_number,
+                               missing_documents, turnaround_days
+                        FROM credentialing_requests
+                        WHERE id = %s
+                        """,
+                        (resolved_request_id,),
+                    )
+                    request_row = cur.fetchone()
+
+                if canonical_call_id and resolved_request_id:
+                    cur.execute(
+                        """
+                        SELECT speaker, message, timestamp
+                        FROM conversation_history
+                        WHERE call_id = %s OR request_id = %s
+                        ORDER BY timestamp ASC
+                        """,
+                        (canonical_call_id, resolved_request_id),
+                    )
+                elif canonical_call_id:
+                    cur.execute(
+                        """
+                        SELECT speaker, message, timestamp
+                        FROM conversation_history
+                        WHERE call_id = %s
+                        ORDER BY timestamp ASC
+                        """,
+                        (canonical_call_id,),
+                    )
+                elif resolved_request_id:
+                    cur.execute(
+                        """
+                        SELECT speaker, message, timestamp
+                        FROM conversation_history
+                        WHERE request_id = %s
+                        ORDER BY timestamp ASC
+                        """,
+                        (resolved_request_id,),
+                    )
+                else:
+                    return
+
+                conversation = [
+                    {"speaker": row["speaker"], "message": row["message"], "timestamp": row["timestamp"]}
+                    for row in cur.fetchall()
+                ]
+
+            insurance_name = (
+                (request_row and request_row["insurance_name"])
+                or (state.get('insurance_name') if state else None)
+            )
+            provider_name = (
+                (request_row and request_row["provider_name"])
+                or (state.get('provider_name') if state else None)
+            )
+            metadata = {
+                "status": (
+                    (state.get('credentialing_status') if state else None)
+                    or (request_row["status"] if request_row else None)
+                ),
+                "reference_number": (
+                    (state.get('reference_number') if state else None)
+                    or (request_row["reference_number"] if request_row else None)
+                ),
+                "missing_documents": (
+                    (state.get('missing_documents') if state else None)
+                    or (request_row["missing_documents"] if request_row else [])
+                    or []
+                ),
+                "turnaround_days": (
+                    (state.get('turnaround_days') if state else None)
+                    or (request_row["turnaround_days"] if request_row else None)
+                ),
+            }
+            transcript = state.get('transcript', []) if state else []
+
+            if not insurance_name:
+                logger.warning(
+                    f"Skipping knowledge ingestion for call {canonical_call_id or resolved_request_id}: "
+                    "missing insurance_name"
+                )
+                return
+
+            inserted = ingest_call_knowledge(
+                insurance_name=insurance_name,
+                provider_name=provider_name,
+                call_id=canonical_call_id,
+                request_id=resolved_request_id,
+                conversation=conversation,
+                transcript=transcript,
+                metadata=metadata,
+            )
+            if inserted and state is not None:
+                state['_knowledge_ingested'] = True
+        except Exception as e:
+            logger.error(f"Knowledge ingestion worker failed for call {call_id or request_id}: {e}")
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+def _log_ivr_event(call_id: str, event_type: str, transcript: str = None,
+                    action_taken: str = None, confidence: float = None, metadata: dict = None):
+    """Log an IVR navigation event to the call_events table (fire-and-forget).
+
+    Runs in a background thread so it never delays the TwiML response to Twilio.
+    """
+    def _do_insert():
+        try:
+            from credentialing_agent import DatabaseManager
+            db = DatabaseManager()
+            with db.conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO call_events (call_id, event_type, transcript, action_taken, confidence, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (call_id, event_type, transcript, action_taken, confidence,
+                      json.dumps(metadata) if metadata else None))
+            db.conn.commit()
+            db.close()
+        except Exception as e:
+            print(f"WARN: Could not log IVR event: {e}")
+
+    threading.Thread(target=_do_insert, daemon=True).start()
+
+
+VALID_PHRASE_TYPES = ('human', 'ivr_definitive', 'ivr_passive', 'simple_greeting')
+
+_DETECTION_DEFAULTS = {
+    'human': [
+        'how can i help', 'how may i help', 'how may i assist',
+        'may i help you', 'who am i speaking with', 'may i ask who',
+        'what is your name', 'can i get your name',
+        'good morning', 'good afternoon', 'good evening',
+        'my name is', 'may i have your', 'i can help you',
+    ],
+    'ivr_definitive': [
+        'press 1', 'press 2', 'press 3', 'press 4', 'press 5',
+        'press 6', 'press 7', 'press 8', 'press 9', 'press 0',
+        'press star', 'press pound', 'press the',
+        'press or say',
+        'say ', 'option 1', 'option 2', 'option 3', 'option 4',
+        'dial ', 'select ',
+        'for billing', 'for claims', 'for provider', 'for member',
+        'for english', 'for spanish',
+        'main menu', 'previous menu', 'return to',
+        'if you are a', 'if you know your',
+        'are you a member', 'are you a provider',
+        'please hang up and dial', 'leave a message', 'voicemail',
+    ],
+    'ivr_passive': [
+        'this call may be monitored', 'this call may be recorded',
+        'for quality assurance', 'quality assurance purposes',
+        'please hold', 'please wait', 'please listen',
+        'your call is important', 'your call will be',
+        'all representatives', 'all agents',
+        'estimated wait time', 'high call volume',
+        'thank you for calling', 'you have reached',
+    ],
+    'simple_greeting': ['hello', 'hi', 'credentialing', 'speaking'],
+}
+
+
+def _get_detection_defaults() -> dict:
+    """Return a fresh copy of hardcoded defaults (no DB query, zero latency)."""
+    import copy
+    return copy.deepcopy(_DETECTION_DEFAULTS)
+
+
+def _get_human_detection_phrases(insurance_name: str = None) -> dict:
+    """Load learned phrases from DB and merge with hardcoded defaults.
+
+    Returns dict with keys: human, ivr_definitive, ivr_passive, simple_greeting.
+    Hardcoded defaults are always included; DB phrases are appended.
+    """
+    # Hardcoded defaults — always present as baseline (single source of truth)
+    defaults = _get_detection_defaults()
+
+    try:
+        from credentialing_agent import DatabaseManager
+        db = DatabaseManager()
+        with db.conn.cursor() as cur:
+            if insurance_name:
+                cur.execute("""
+                    SELECT phrase, phrase_type FROM human_detection_phrases
+                    WHERE is_active = TRUE AND confidence > 0.3
+                      AND (insurance_name IS NULL OR insurance_name ILIKE %s)
+                    ORDER BY confidence DESC
+                """, (f"%{insurance_name}%",))
+            else:
+                cur.execute("""
+                    SELECT phrase, phrase_type FROM human_detection_phrases
+                    WHERE is_active = TRUE AND confidence > 0.3
+                      AND insurance_name IS NULL
+                    ORDER BY confidence DESC
+                """)
+            for row in cur.fetchall():
+                phrase, phrase_type = row[0], row[1]
+                if phrase_type in defaults and phrase not in defaults[phrase_type]:
+                    defaults[phrase_type].append(phrase)
+        db.close()
+    except Exception as e:
+        print(f"WARN: Could not load dynamic detection phrases: {e}")
+
+    return defaults
+
 
 # Helper function to format NPI for speech (digit by digit)
 def format_npi_for_speech(npi: str) -> str:
@@ -585,7 +1058,7 @@ def serve_audio(filename):
 
 
 @app.route('/api/start-call', methods=['POST'])
-@jwt_required()
+@agent_or_above
 def start_credentialing_call():
     """
     API endpoint to start a new credentialing call
@@ -603,6 +1076,7 @@ def start_credentialing_call():
     """
     try:
         data = request.json
+        from_number = None
         print(f"\n{'='*50}")
         print(f"📞 NEW CALL REQUEST RECEIVED")
         print(f"{'='*50}")
@@ -642,7 +1116,17 @@ def start_credentialing_call():
         if call_mode == 'agent' and not agent_phone:
             return jsonify({'success': False, 'error': 'agent_phone is required when call_mode is agent'}), 400
 
+        # Acquire a Twilio number only after request validation that can fail fast.
+        from_number = _acquire_twilio_number(call_id)
+        if not from_number:
+            print(f"❌ All phone lines are currently busy for call: {call_id}")
+            return jsonify({
+                'success': False,
+                'error': 'All phone lines are currently busy. Please try again shortly.'
+            }), 503
+
         # Create initial state
+        initiated_by = get_current_user_id()
         initial_state: CredentialingState = {
             'insurance_name': data['insurance_name'],
             'provider_name': data['provider_name'],
@@ -656,6 +1140,7 @@ def start_credentialing_call():
             'call_id': call_id,
             'call_sid': None,
             'db_request_id': None,
+            'initiated_by': initiated_by,
             'call_state': CallState.INITIATING,
             'transcript': [],
             'conversation_history': [],
@@ -678,6 +1163,9 @@ def start_credentialing_call():
             'agent_phone': agent_phone,
             'conference_sid': None,
             'transfer_to_agent': False,
+            'from_number': from_number,
+            # Pre-load learned detection phrases for this insurance
+            'detection_phrases': _get_human_detection_phrases(data['insurance_name']),
         }
 
         # Create DB record up front so answers can be stored during the call
@@ -739,6 +1227,12 @@ def start_credentialing_call():
                 print(f"❌ Error in call thread: {thread_error}")
                 import traceback
                 traceback.print_exc()
+            finally:
+                latest_state = call_states.get(call_id, {})
+                if latest_state.get('transfer_to_agent'):
+                    logger.info(f"[{call_id}] Transfer to agent active; preserving Twilio number until terminal status callback")
+                else:
+                    _release_twilio_number(call_id=call_id)
 
         thread = threading.Thread(target=run_call)
         thread.start()
@@ -760,6 +1254,8 @@ def start_credentialing_call():
         print(f"❌ Error starting call: {e}")
         import traceback
         traceback.print_exc()
+        if 'call_id' in locals() and from_number:
+            _release_twilio_number(call_id=call_id)
         return jsonify({
             'success': False,
             'error': str(e)
@@ -775,6 +1271,11 @@ def _bridge_to_agent(call_info, callback_base):
     call_state_obj = call_info['state']
     conf_name = call_info['call_id']
     agent_phone_number = call_state_obj.get('agent_phone')
+    recording_callback_url = build_recording_status_callback(
+        callback_base,
+        call_id=conf_name,
+        request_id=call_state_obj.get('db_request_id'),
+    )
 
     logger.info(f"[bridge_to_agent] Bridging call_id={conf_name} to agent_phone={agent_phone_number}")
 
@@ -789,30 +1290,21 @@ def _bridge_to_agent(call_info, callback_base):
         return Response(error_twiml, mimetype='text/xml')
 
     # TwiML for the insurance leg — enters the conference and closes it when insurance hangs up
-    conference_twiml = (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<Response>'
-        '<Dial>'
-        f'<Conference waitUrl="" startConferenceOnEnter="true" endConferenceOnExit="true">'
-        f'{conf_name}'
-        '</Conference>'
-        '</Dial>'
-        '</Response>'
+    conference_twiml = build_conference_twiml(
+        conf_name,
+        recording_callback_url=recording_callback_url,
+        end_on_exit=True,
     )
 
     # TwiML for the agent leg — enters the same conference
-    agent_conference_twiml = (
-        '<Response>'
-        '<Dial>'
-        f'<Conference waitUrl="" startConferenceOnEnter="true" endConferenceOnExit="false">'
-        f'{conf_name}'
-        '</Conference>'
-        '</Dial>'
-        '</Response>'
+    agent_conference_twiml = build_conference_twiml(
+        conf_name,
+        recording_callback_url=recording_callback_url,
+        end_on_exit=False,
     )
 
     try:
-        from_number = os.getenv("TWILIO_PHONE_NUMBER")
+        from_number = call_state_obj.get('from_number') or os.getenv("TWILIO_PHONE_NUMBER")
         agent_call = twilio_client.calls.create(
             to=agent_phone_number,
             from_=from_number,
@@ -889,7 +1381,8 @@ def voice_webhook():
                     # Load IVR auto-response flags (NPI/Tax ID)
                     with db.conn.cursor() as cur:
                         cur.execute("""
-                            SELECT ivr_asks_npi, ivr_npi_method, ivr_asks_tax_id, ivr_tax_id_method, ivr_tax_id_digits_to_send
+                            SELECT ivr_asks_npi, ivr_npi_method, ivr_asks_tax_id, ivr_tax_id_method, ivr_tax_id_digits_to_send,
+                                   ivr_npi_suffix, ivr_tax_id_suffix
                             FROM insurance_providers
                             WHERE insurance_name ILIKE %s
                             LIMIT 1
@@ -901,6 +1394,8 @@ def voice_webhook():
                             call_info['state']['ivr_asks_tax_id'] = provider_row[2] or False
                             call_info['state']['ivr_tax_id_method'] = provider_row[3] or 'speech'
                             call_info['state']['ivr_tax_id_digits_to_send'] = provider_row[4]
+                            call_info['state']['ivr_npi_suffix'] = provider_row[5] or ''
+                            call_info['state']['ivr_tax_id_suffix'] = provider_row[6] or ''
                             print(f"📋 IVR flags - NPI: {provider_row[0]} ({provider_row[1]}), Tax ID: {provider_row[2]} ({provider_row[3]}), Tax Digits: {provider_row[4]}")
 
                     db.close()
@@ -998,6 +1493,11 @@ def voice_human_webhook():
                 call_info = {'call_id': call_id, 'state': state}
                 state['call_state'] = CallState.SPEAKING_WITH_HUMAN
                 break
+
+        # If call_mode is 'agent', bridge to the real human agent instead of AI
+        if call_info and call_info['state'].get('call_mode') == 'agent':
+            print(f"🔀 Real Human Agent mode - redirecting to bridge-agent from voice/human webhook")
+            return _bridge_to_agent(call_info, callback_base)
 
         provider_name = "a healthcare provider"
         provider_phone = ""
@@ -1128,21 +1628,69 @@ def ivr_navigate_webhook():
 
                 if npi_detected or tax_detected:
                     print(f"📋 IVR requesting credentials - NPI: {npi_detected}, Tax ID: {tax_detected}")
+                    cred_types = []
+                    if npi_detected: cred_types.append('NPI')
+                    if tax_detected: cred_types.append('Tax ID')
+                    _log_ivr_event(
+                        state.get('db_request_id') or call_id,
+                        'ivr_credential_sent',
+                        transcript=speech_result,
+                        action_taken=f"sent {'+'.join(cred_types)} via IVR",
+                        metadata={'npi_detected': npi_detected, 'tax_detected': tax_detected}
+                    )
+
+                    # ── Helper: extract "press X" digit for a credential type ──
+                    # When the IVR says "press 1 for NPI, press 2 for provider ID...",
+                    # we need to press the selection digit BEFORE entering the actual number.
+                    def _extract_selection_digit(speech, keywords):
+                        """Find the DTMF digit associated with a keyword in a menu prompt.
+                        Looks for patterns like 'npi number press 1' or 'press 1 for npi'."""
+                        for kw in keywords:
+                            # Pattern: "keyword ... press X" (keyword before press)
+                            m = re.search(rf'{kw}[\w\s,.]{{0,30}}press[\s,]*(\d)', speech)
+                            if m:
+                                return m.group(1)
+                            # Pattern: "press X ... keyword" (press before keyword)
+                            m = re.search(rf'press[\s,]*(\d)[\w\s,.]{{0,30}}{kw}', speech)
+                            if m:
+                                return m.group(1)
+                        return None
+
+                    # Check if this is a multi-option menu (has multiple "press X" options)
+                    press_options = re.findall(r'press[\s,]*\d', speech_lower)
+                    is_selection_menu = len(press_options) > 1
 
                     # Pause 2 seconds before responding
                     response.pause(length=2)
 
                     if npi_detected and state.get('npi'):
+                        # If it's a selection menu, press the digit for NPI first
+                        if is_selection_menu:
+                            select_digit = _extract_selection_digit(speech_lower, npi_keywords)
+                            if select_digit:
+                                response.play(digits=select_digit)
+                                print(f"🔢 Pressed {select_digit} to select NPI entry")
+                                response.pause(length=3)
+
                         method = state.get('ivr_npi_method', 'speech')
                         if method == 'dtmf':
-                            response.play(digits=state['npi'])
-                            print(f"🔢 Sent NPI via DTMF: {state['npi']}")
+                            npi_digits = state['npi'] + state.get('ivr_npi_suffix', '')
+                            response.play(digits=npi_digits)
+                            print(f"🔢 Sent NPI via DTMF: {npi_digits}")
                         else:
                             npi_spoken = format_npi_for_speech(state['npi'])
                             speak_with_tts(response, npi_spoken)
                             print(f"🔢 Spoke NPI: {npi_spoken}")
 
                     if tax_detected and state.get('tax_id'):
+                        # If it's a selection menu, press the digit for Tax ID first
+                        if is_selection_menu:
+                            select_digit = _extract_selection_digit(speech_lower, tax_keywords)
+                            if select_digit:
+                                response.play(digits=select_digit)
+                                print(f"🔢 Pressed {select_digit} to select Tax ID entry")
+                                response.pause(length=3)
+
                         method = state.get('ivr_tax_id_method', 'speech')
                         clean_tax = re.sub(r'\D', '', state['tax_id'])
                         digits_to_send = state.get('ivr_tax_id_digits_to_send')
@@ -1155,8 +1703,9 @@ def ivr_navigate_webhook():
                                 print(f"⚠️ Invalid ivr_tax_id_digits_to_send={digits_to_send}; falling back to full Tax ID")
 
                         if method == 'dtmf':
-                            response.play(digits=selected_tax)
-                            print(f"🔢 Sent Tax ID via DTMF: {selected_tax}")
+                            tax_digits = selected_tax + state.get('ivr_tax_id_suffix', '')
+                            response.play(digits=tax_digits)
+                            print(f"🔢 Sent Tax ID via DTMF: {tax_digits}")
                         else:
                             tax_spoken = '. '.join(list(selected_tax)) + '.'
                             speak_with_tts(response, tax_spoken)
@@ -1180,7 +1729,7 @@ def ivr_navigate_webhook():
             for pattern in ivr_patterns:
                 pattern_level = pattern['menu_level']
                 # Check patterns at current level or next level
-                if pattern_level >= current_level:
+                if pattern_level == current_level + 1:
                     detected_phrase = pattern.get('detected_phrase', '').lower()
                     if detected_phrase and detected_phrase in speech_lower:
                         matched_pattern = pattern
@@ -1191,7 +1740,7 @@ def ivr_navigate_webhook():
             if not matched_pattern and speech_lower:
                 # Check all remaining patterns at or above current level (not just next level)
                 # so same-level patterns aren't skipped when current_level starts at 0.
-                next_level_patterns = [p for p in ivr_patterns if p['menu_level'] >= current_level]
+                next_level_patterns = [p for p in ivr_patterns if p['menu_level'] == current_level + 1]
 
                 for pattern in next_level_patterns:
                     action_value = pattern.get('action_value', '')
@@ -1217,6 +1766,14 @@ def ivr_navigate_webhook():
                 action_value = matched_pattern.get('action_value', '')
 
                 print(f"🎮 Executing IVR action: {action} = {action_value}")
+                _log_ivr_event(
+                    state.get('db_request_id') or call_id,
+                    'ivr_menu_matched',
+                    transcript=speech_result,
+                    action_taken=f"{action}:{action_value}",
+                    metadata={'menu_level': matched_pattern['menu_level'],
+                              'detected_phrase': matched_pattern.get('detected_phrase', '')}
+                )
 
                 # Wait 2 seconds after the menu prompt finishes before responding.
                 # This lets the IVR complete its full prompt before DTMF/speech is sent.
@@ -1276,55 +1833,21 @@ def ivr_navigate_webhook():
 
                 print(f"⚠️ No IVR pattern matched (attempt {state['ivr_unmatched_count']})")
 
-                # Definitive IVR indicators — absolutely prove we are in an IVR.
-                # No human indicator can override these.
-                definitive_ivr_indicators = [
-                    # DTMF prompts
-                    'press 1', 'press 2', 'press 3', 'press 4', 'press 5',
-                    'press 6', 'press 7', 'press 8', 'press 9', 'press 0',
-                    'press star', 'press pound', 'press the',
-                    'press or say',
-                    # Speech prompts
-                    'say ', 'option 1', 'option 2', 'option 3', 'option 4',
-                    'dial ', 'select ',
-                    # Department routing
-                    'for billing', 'for claims', 'for provider', 'for member',
-                    'for english', 'for spanish',
-                    # IVR navigation
-                    'main menu', 'previous menu', 'return to',
-                    'if you are a', 'if you know your',
-                    # Caller type selection
-                    'are you a member', 'are you a provider',
-                    # Definitive non-human actions
-                    'please hang up and dial', 'leave a message', 'voicemail',
-                ]
+                # Load detection phrases from call state (pre-loaded at call start).
+                # If not cached (e.g. server restart), use hardcoded defaults only —
+                # never hit the DB in the webhook hot path to avoid latency.
+                det = state.get('detection_phrases')
+                if not det:
+                    det = _get_detection_defaults()
+                    state['detection_phrases'] = det
+                definitive_ivr_indicators = det['ivr_definitive']
+                passive_ivr_indicators = det['ivr_passive']
+                human_indicators = det['human']
+                simple_greetings = det['simple_greeting']
 
-                # Passive IVR indicators — common in IVR recordings but also said
-                # by humans. A strong human indicator overrides these.
-                passive_ivr_indicators = [
-                    'this call may be monitored', 'this call may be recorded',
-                    'for quality assurance', 'quality assurance purposes',
-                    'please hold', 'please wait', 'please listen',
-                    'your call is important', 'your call will be',
-                    'all representatives', 'all agents',
-                    'estimated wait time', 'high call volume',
-                    'thank you for calling', 'you have reached',
-                ]
-
-                # Strong human indicators (no IVR-ambiguous phrases).
-                # Simple greetings are gated by message length to avoid false
-                # positives from long IVR recordings containing 'hello'.
-                human_indicators = [
-                    'how can i help', 'how may i help', 'how may i assist',
-                    'may i help you', 'who am i speaking with', 'may i ask who',
-                    'what is your name', 'can i get your name',
-                    'good morning', 'good afternoon', 'good evening',
-                ]
-                simple_greetings = ['hello', 'hi', 'credentialing', 'speaking']
-                is_human = (
-                    any(ind in speech_lower for ind in human_indicators) or
-                    (any(g in speech_lower for g in simple_greetings) and len(speech_result) < 50)
-                )
+                matched_human = [ind for ind in human_indicators if ind in speech_lower]
+                matched_greeting = [g for g in simple_greetings if g in speech_lower and len(speech_result) < 50]
+                is_human = bool(matched_human or matched_greeting)
 
                 is_definitive_ivr = any(ind in speech_lower for ind in definitive_ivr_indicators)
                 is_passive_ivr    = any(ind in speech_lower for ind in passive_ivr_indicators)
@@ -1341,6 +1864,12 @@ def ivr_navigate_webhook():
                     state['ivr_unmatched_count'] = max(state['ivr_unmatched_count'] - 1, 0)
                     print(f"🤖 IVR system speech detected (not a human), heard: {speech_result[:80]}...")
                     print(f"🔄 Continuing to listen for IVR menu options...")
+                    _log_ivr_event(
+                        state.get('db_request_id') or call_id,
+                        'ivr_system_speech',
+                        transcript=speech_result,
+                        metadata={'menu_level': current_level}
+                    )
                     gather = Gather(
                         input='speech dtmf',
                         action=f'{callback_base}/webhook/ivr-navigate',
@@ -1355,6 +1884,13 @@ def ivr_navigate_webhook():
                     # IVR counter-indicators already filter out pure IVR speech, so
                     # threshold=1 is safe — waiting longer just causes the agent to hang up.
                     print(f"👤 Human detected (clear indicators, attempt {state['ivr_unmatched_count']}) - starting conversation")
+                    _log_ivr_event(
+                        state.get('db_request_id') or call_id,
+                        'human_detected',
+                        transcript=speech_result,
+                        metadata={'detection': 'clear_indicators', 'attempt': state['ivr_unmatched_count'],
+                                  'matched_phrases': matched_human + matched_greeting}
+                    )
                     state['call_state'] = CallState.SPEAKING_WITH_HUMAN
                     if state.get('call_mode') == 'agent':
                         print(f"🔀 Real Human Agent mode - redirecting to bridge-agent")
@@ -1364,6 +1900,13 @@ def ivr_navigate_webhook():
                 elif state['ivr_unmatched_count'] >= 8:
                     # Many unmatched attempts with no IVR counter-signal — assume human or unknown system
                     print(f"👤 Switching to human mode after {state['ivr_unmatched_count']} unmatched attempts")
+                    _log_ivr_event(
+                        state.get('db_request_id') or call_id,
+                        'human_detected',
+                        transcript=speech_result,
+                        metadata={'detection': 'fallback_threshold', 'attempt': state['ivr_unmatched_count'],
+                                  'matched_phrases': matched_human + matched_greeting}
+                    )
                     state['call_state'] = CallState.SPEAKING_WITH_HUMAN
                     if state.get('call_mode') == 'agent':
                         print(f"🔀 Real Human Agent mode - redirecting to bridge-agent")
@@ -1454,24 +1997,57 @@ def wait_for_human_webhook():
 
         if (npi_detected_wait or tax_detected_wait) and speech_lower:
             print(f"📋 IVR credential prompt detected during wait phase - NPI: {npi_detected_wait}, Tax ID: {tax_detected_wait}")
+
+            # Helper: extract "press X" digit for a credential type from menu speech
+            def _extract_selection_digit_wait(speech, keywords):
+                for kw in keywords:
+                    m = re.search(rf'{kw}[\w\s,.]{{0,30}}press[\s,]*(\d)', speech)
+                    if m:
+                        return m.group(1)
+                    m = re.search(rf'press[\s,]*(\d)[\w\s,.]{{0,30}}{kw}', speech)
+                    if m:
+                        return m.group(1)
+                return None
+
+            press_options = re.findall(r'press[\s,]*\d', speech_lower)
+            is_selection_menu = len(press_options) > 1
+
             response.pause(length=1)
             if npi_detected_wait and state.get('npi'):
+                # If it's a selection menu, press the digit for NPI first
+                if is_selection_menu:
+                    select_digit = _extract_selection_digit_wait(speech_lower, npi_keywords)
+                    if select_digit:
+                        response.play(digits=select_digit)
+                        print(f"🔢 Pressed {select_digit} to select NPI entry (wait phase)")
+                        response.pause(length=3)
+
                 npi_method = state.get('ivr_npi_method', 'dtmf')
                 if npi_method == 'dtmf':
-                    response.play(digits=state['npi'])
-                    print(f"🔢 Sent NPI via DTMF during wait: {state['npi']}")
+                    npi_digits = state['npi'] + state.get('ivr_npi_suffix', '')
+                    response.play(digits=npi_digits)
+                    print(f"🔢 Sent NPI via DTMF during wait: {npi_digits}")
                 else:
                     npi_spoken = format_npi_for_speech(state['npi'])
                     speak_with_tts(response, npi_spoken)
                     print(f"🗣️ Spoke NPI during wait: {npi_spoken}")
             if tax_detected_wait and state.get('tax_id'):
+                # If it's a selection menu, press the digit for Tax ID first
+                if is_selection_menu:
+                    select_digit = _extract_selection_digit_wait(speech_lower, tax_keywords)
+                    if select_digit:
+                        response.play(digits=select_digit)
+                        print(f"🔢 Pressed {select_digit} to select Tax ID entry (wait phase)")
+                        response.pause(length=3)
+
                 tax_method = state.get('ivr_tax_id_method', 'dtmf')
                 clean_tax = re.sub(r'\D', '', state['tax_id'])
                 digits_to_send = state.get('ivr_tax_id_digits_to_send')
                 selected_tax = clean_tax[-digits_to_send:] if isinstance(digits_to_send, int) and 1 <= digits_to_send <= len(clean_tax) else clean_tax
                 if tax_method == 'dtmf':
-                    response.play(digits=selected_tax)
-                    print(f"🔢 Sent Tax ID via DTMF during wait: {selected_tax}")
+                    tax_digits = selected_tax + state.get('ivr_tax_id_suffix', '')
+                    response.play(digits=tax_digits)
+                    print(f"🔢 Sent Tax ID via DTMF during wait: {tax_digits}")
                 else:
                     speak_with_tts(response, '. '.join(list(selected_tax)) + '.')
                     print(f"🗣️ Spoke Tax ID during wait: {selected_tax}")
@@ -1837,12 +2413,12 @@ def speech_webhook():
             # Determine next action based on AI decision
             action = ai_response.get('action', 'continue')
             finalize = action == 'end_call'
+            request_id = state.get('db_request_id') or state.get('call_id')
 
             # Persist conversation + progress in a single DB connection
             try:
                 from credentialing_agent import DatabaseManager
                 db = DatabaseManager()
-                request_id = state.get('db_request_id') or state.get('call_id')
                 db.save_conversation(call_info['call_id'], 'representative', speech_result, state.get('db_request_id'))
                 db.save_conversation(call_info['call_id'], 'agent', ai_response.get('response', ''), state.get('db_request_id'))
                 if request_id:
@@ -1853,6 +2429,13 @@ def speech_webhook():
                 db.close()
             except Exception as db_err:
                 print(f"WARN: Could not persist conversation/progress: {db_err}")
+
+            if finalize:
+                _enqueue_call_knowledge_ingestion(
+                    call_id=call_info['call_id'],
+                    request_id=request_id,
+                    state=state,
+                )
 
             if action == 'end_call':
                 speak_with_tts(response, ai_response.get('response', 'Thank you for your time. Goodbye.'))
@@ -2070,6 +2653,7 @@ def speech_followup_webhook():
             # Determine next action - only end when AI explicitly decides to
             action = ai_response.get('action', 'continue')
             finalize = action == 'end_call'
+            request_id = state.get('db_request_id') or state.get('call_id')
 
             if finalize:
                 state['call_state'] = CallState.COMPLETING
@@ -2078,7 +2662,6 @@ def speech_followup_webhook():
             try:
                 from credentialing_agent import DatabaseManager
                 db = DatabaseManager()
-                request_id = state.get('db_request_id') or state.get('call_id')
                 db.save_conversation(call_info['call_id'], 'representative', speech_result, state.get('db_request_id'))
                 db.save_conversation(call_info['call_id'], 'agent', ai_response.get('response', ''), state.get('db_request_id'))
                 if request_id:
@@ -2089,6 +2672,13 @@ def speech_followup_webhook():
                 db.close()
             except Exception as db_err:
                 print(f"WARN: Could not persist conversation/progress: {db_err}")
+
+            if finalize:
+                _enqueue_call_knowledge_ingestion(
+                    call_id=call_info['call_id'],
+                    request_id=request_id,
+                    state=state,
+                )
 
             if action == 'end_call':
                 speak_with_tts(response, ai_response.get('response', 'Thank you very much for your help. Have a great day. Goodbye.'))
@@ -2227,13 +2817,18 @@ def status_webhook():
     # Update call state
     if call_sid in call_states:
         state = call_states[call_sid]
-        
+
         if call_status == 'completed':
             state['call_state'] = CallState.COMPLETING
         elif call_status == 'failed':
             state['call_state'] = CallState.FAILED
             state['error_message'] = request.values.get('ErrorMessage', 'Unknown error')
-    
+
+    # Release Twilio number on terminal statuses (safety net)
+    terminal_statuses = {'completed', 'failed', 'busy', 'no-answer', 'canceled'}
+    if call_status in terminal_statuses:
+        _release_twilio_number(call_sid=call_sid)
+
     return jsonify({'success': True}), 200
 
 
@@ -2299,19 +2894,29 @@ def recording_status_webhook():
         recording_status = request.values.get('RecordingStatus')
         recording_duration = request.values.get('RecordingDuration')
         call_sid = request.values.get('CallSid')
+        callback_call_id = request.args.get('call_id')
+        callback_request_id = request.args.get('request_id')
+        normalized_recording_status = 'failed' if recording_status == 'absent' else recording_status
 
-        logger.info(f"Recording webhook: {recording_sid} status={recording_status} for call {call_sid}")
+        logger.info(
+            f"Recording webhook: {recording_sid} status={normalized_recording_status} for call {call_sid} "
+            f"(call_id={callback_call_id}, request_id={callback_request_id})"
+        )
 
         # Find call_id and request_id from in-memory state first
-        state = None
         with call_state_lock:
             state = call_states_by_sid.get(call_sid)
-            if state is None:
-                # Also try linear scan in case sid was registered under different key
-                state = get_state_by_sid(call_sid)
+        if state is None:
+            # Also try linear scan in case sid was registered under different key
+            state = get_state_by_sid(call_sid)
 
-        call_id = state.get('call_id') if state else call_sid
-        request_id = state.get('db_request_id') if state else None
+        call_id = callback_call_id or (state.get('call_id') if state else call_sid)
+        request_id = callback_request_id or (state.get('db_request_id') if state else None)
+
+        # Determine recording type from in-memory call state
+        recording_type = 'ai'
+        if state and state.get('call_mode') == 'agent':
+            recording_type = 'agent'
 
         # Save to database
         db = DatabaseManager()
@@ -2345,18 +2950,45 @@ def recording_status_webhook():
                 recording_sid=recording_sid,
                 recording_url=recording_url,
                 recording_duration=int(recording_duration or 0),
-                recording_status=recording_status,
+                recording_status=normalized_recording_status,
                 request_id=request_id,
+                recording_type=recording_type,
             )
-            logger.info(f"Saved recording {recording_sid} for call {call_id} (request_id={request_id})")
+            logger.info(
+                f"Saved recording {recording_sid} for call {call_id} "
+                f"(request_id={request_id}, status={normalized_recording_status})"
+            )
 
             # Trigger Q&A extraction in background if recording is completed.
             # extract_qa_async queries conversation_history by call_id, so always
             # pass call_id here — it resolves request_id itself via a DB JOIN.
-            if recording_status == 'completed':
+            if normalized_recording_status == 'completed':
                 from qa_extractor import extract_qa_async
-                threading.Thread(target=extract_qa_async, args=(call_id,), daemon=True).start()
+                threading.Thread(
+                    target=extract_qa_async,
+                    args=(call_id,),
+                    kwargs={'request_id': request_id},
+                    daemon=True,
+                ).start()
                 logger.info(f"Triggered Q&A extraction for call {call_id}")
+
+                if recording_type == 'ai':
+                    _enqueue_call_knowledge_ingestion(
+                        call_id=call_id,
+                        request_id=request_id,
+                        state=state,
+                    )
+                    logger.info(f"Triggered knowledge ingestion for call {call_id}")
+
+                # Transcribe agent-transferred recordings via Whisper
+                if recording_type == 'agent' and recording_url:
+                    from transcribe_recording import transcribe_agent_recording
+                    threading.Thread(
+                        target=transcribe_agent_recording,
+                        args=(call_id, recording_url, request_id),
+                        daemon=True,
+                    ).start()
+                    logger.info(f"Triggered Whisper transcription for agent call {call_id}")
 
         except Exception as e:
             logger.error(f"Failed to save recording: {e}")
@@ -2371,7 +3003,7 @@ def recording_status_webhook():
 
 
 @app.route('/api/call-recording/<call_id>', methods=['GET'])
-@admin_required
+@agent_or_above
 def get_call_recording(call_id: str):
     """
     Get recording metadata for a call.
@@ -2379,6 +3011,16 @@ def get_call_recording(call_id: str):
     try:
         from credentialing_agent import DatabaseManager
         db = DatabaseManager()
+        with db.conn.cursor() as cur:
+            cur.execute(
+                "SELECT initiated_by::text FROM credentialing_requests WHERE id = %s",
+                (call_id,),
+            )
+            owner_row = cur.fetchone()
+        denial = _deny_if_call_not_owned(owner_row[0] if owner_row else None)
+        if denial:
+            db.close()
+            return denial
         recording = db.get_recording(call_id=call_id)
         db.close()
 
@@ -2396,6 +3038,7 @@ def get_call_recording(call_id: str):
                 'duration': recording['recording_duration'],
                 'format': recording['recording_format'],
                 'status': recording['recording_status'],
+                'recording_type': recording.get('recording_type', 'ai'),
                 'created_at': recording['created_at'].isoformat() if recording['created_at'] else None,
             }
         }), 200
@@ -2409,7 +3052,7 @@ def get_call_recording(call_id: str):
 
 
 @app.route('/api/call-recording/<call_id>/stream', methods=['GET'])
-@admin_required
+@agent_or_above
 def stream_call_recording(call_id: str):
     """
     Stream call recording audio.
@@ -2418,6 +3061,16 @@ def stream_call_recording(call_id: str):
     try:
         from credentialing_agent import DatabaseManager
         db = DatabaseManager()
+        with db.conn.cursor() as cur:
+            cur.execute(
+                "SELECT initiated_by::text FROM credentialing_requests WHERE id = %s",
+                (call_id,),
+            )
+            owner_row = cur.fetchone()
+        denial = _deny_if_call_not_owned(owner_row[0] if owner_row else None)
+        if denial:
+            db.close()
+            return denial
         recording = db.get_recording(call_id=call_id)
         db.close()
 
@@ -2601,7 +3254,7 @@ def get_call_qa(call_id: str):
 
 
 @app.route('/api/call-detail/<call_id>', methods=['GET'])
-@admin_required
+@agent_or_above
 def get_call_detail(call_id: str):
     """
     Get full call details from the database (persists across server restarts).
@@ -2613,6 +3266,7 @@ def get_call_detail(call_id: str):
 
         db = DatabaseManager()
         lookup_id = call_id
+        active_call_state = None
 
         # If frontend passed runtime call_id, map it to request_id when available.
         if call_id in call_states:
@@ -2620,13 +3274,30 @@ def get_call_detail(call_id: str):
             if mapped_request_id:
                 lookup_id = mapped_request_id
 
+        with call_state_lock:
+            active_call_state = (
+                call_states.get(call_id)
+                or call_states.get(lookup_id)
+                or next(
+                    (
+                        state for state in call_states.values()
+                        if state.get('db_request_id') == lookup_id
+                        or state.get('call_id') == call_id
+                        or state.get('call_id') == lookup_id
+                    ),
+                    None,
+                )
+            )
+
         # Fetch credentialing request
         with db.conn.cursor() as cur:
             cur.execute("""
                 SELECT id, insurance_name, provider_name, npi, tax_id,
                        address, insurance_phone, questions, status, reference_number,
                        missing_documents, turnaround_days, notes,
-                       created_at, updated_at, completed_at
+                       created_at, updated_at, completed_at,
+                       call_mode, agent_phone, initiated_by::text,
+                       human_detection_correct
                 FROM credentialing_requests
                 WHERE id = %s
             """, (lookup_id,))
@@ -2635,6 +3306,11 @@ def get_call_detail(call_id: str):
         if not row:
             db.close()
             return jsonify({'success': False, 'error': 'Call not found'}), 404
+
+        denial = _deny_if_call_not_owned(row[18] if len(row) > 18 else None)
+        if denial:
+            db.close()
+            return denial
 
         call_data = {
             'id': str(row[0]),
@@ -2653,6 +3329,10 @@ def get_call_detail(call_id: str):
             'created_at': row[13].isoformat() if row[13] else None,
             'updated_at': row[14].isoformat() if row[14] else None,
             'completed_at': row[15].isoformat() if row[15] else None,
+            'call_mode': row[16] or 'ai',
+            'agent_phone': row[17],
+            'initiated_by': row[18],
+            'human_detection_correct': row[19],
         }
 
         # Fetch conversation history
@@ -2697,8 +3377,11 @@ def get_call_detail(call_id: str):
         if recording is None and lookup_id != call_id:
             recording = db.get_recording(call_id=call_id)
 
-        # Fetch Q&A pairs
+        # Fetch Q&A pairs. Try the request UUID first, then fall back to the
+        # runtime call_id used by extraction/storage for in-flight calls.
         qa_pairs = db.get_qa_pairs(call_id=lookup_id)
+        if not qa_pairs and lookup_id != call_id:
+            qa_pairs = db.get_qa_pairs(call_id=call_id)
 
         # Enrich conversation with Q&A flags
         qa_map = {qa['id']: qa for qa in qa_pairs}
@@ -2718,18 +3401,52 @@ def get_call_detail(call_id: str):
                     except:
                         pass
 
+        # Fetch IVR patterns for this insurance
+        ivr_patterns = []
+        insurance_name = call_data.get('insurance_name')
+        if insurance_name:
+            try:
+                with db.conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT menu_level, detected_phrase, preferred_action, action_value
+                        FROM ivr_knowledge
+                        WHERE insurance_name ILIKE %s
+                        ORDER BY menu_level ASC
+                    """, (f"%{insurance_name}%",))
+                    for r in cur.fetchall():
+                        ivr_patterns.append({
+                            'menu_level': r[0],
+                            'detected_phrase': r[1],
+                            'preferred_action': r[2],
+                            'action_value': r[3],
+                        })
+            except Exception:
+                pass  # IVR patterns are optional
+
         db.close()
 
         # Prepare recording data.  'available' is True only when the recording
         # has finished processing so the audio stream endpoint can serve it.
         recording_data = None
         if recording:
+            recording_status = recording.get('recording_status') or 'processing'
+            if recording_status == 'absent':
+                recording_status = 'failed'
             recording_data = {
-                'available': recording.get('recording_status') == 'completed',
+                'available': recording_status == 'completed',
                 'url': f"/api/call-recording/{lookup_id}/stream",
                 'duration': recording.get('recording_duration'),
-                'status': recording.get('recording_status'),
+                'status': recording_status,
+                'recording_type': recording.get('recording_type', 'ai'),
                 'created_at': recording['created_at'].isoformat() if recording.get('created_at') else None,
+            }
+        elif active_call_state and row[15] is None:
+            recording_data = {
+                'available': False,
+                'url': f"/api/call-recording/{lookup_id}/stream",
+                'duration': None,
+                'status': 'pending',
+                'created_at': None,
             }
 
         # Prepare Q&A pairs data
@@ -2752,6 +3469,7 @@ def get_call_detail(call_id: str):
                 **call_data,
                 'conversation': conversations,
                 'events': events,
+                'ivr_patterns': ivr_patterns,
                 'recording': recording_data,
                 'qa_pairs': qa_pairs_data,
             }
@@ -2762,6 +3480,370 @@ def get_call_detail(call_id: str):
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# =============================================================================
+# Self-Learning Human Detection: Feedback + CRUD
+# =============================================================================
+
+@app.route('/api/call/<call_id>/human-detection-feedback', methods=['POST'])
+@admin_required
+def submit_human_detection_feedback(call_id: str):
+    """
+    Submit feedback on whether human detection was correct for a call.
+    If incorrect, triggers auto-review of the transcript to learn new phrases.
+    """
+    try:
+        data = request.json or {}
+        correct = data.get('correct')
+        if correct is None:
+            return jsonify({'success': False, 'error': 'correct (boolean) is required'}), 400
+
+        from credentialing_agent import DatabaseManager
+        db = DatabaseManager()
+
+        # Save feedback to credentialing_requests
+        with db.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE credentialing_requests
+                SET human_detection_correct = %s, human_detection_feedback_at = NOW()
+                WHERE id = %s
+            """, (correct, call_id))
+        db.conn.commit()
+
+        result = {'success': True, 'correct': correct, 'new_phrases': []}
+
+        if correct:
+            # Positive feedback: boost confidence of phrases that matched
+            with db.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT metadata FROM call_events
+                    WHERE call_id = %s AND event_type = 'human_detected'
+                    ORDER BY timestamp DESC LIMIT 1
+                """, (call_id,))
+                row = cur.fetchone()
+                if row and row[0] and row[0].get('matched_phrases'):
+                    for phrase in row[0]['matched_phrases']:
+                        cur.execute("""
+                            UPDATE human_detection_phrases
+                            SET times_correct = times_correct + 1,
+                                times_seen = times_seen + 1,
+                                confidence = LEAST(1.0, (times_correct + 1)::float / GREATEST(times_seen + 1, 1)::float),
+                                updated_at = NOW()
+                            WHERE phrase = %s AND is_active = TRUE
+                        """, (phrase,))
+            db.conn.commit()
+        else:
+            # Negative feedback: auto-review the transcript
+            # Fetch conversation and events for analysis
+            with db.conn.cursor() as cur:
+                cur.execute("""
+                    SELECT speaker, message, timestamp
+                    FROM conversation_history
+                    WHERE call_id = %s OR request_id = %s
+                    ORDER BY timestamp ASC
+                """, (call_id, call_id))
+                conversations = [{'speaker': r[0], 'message': r[1]} for r in cur.fetchall()]
+
+                cur.execute("""
+                    SELECT event_type, transcript, action_taken, metadata, timestamp
+                    FROM call_events
+                    WHERE call_id = %s
+                    ORDER BY timestamp ASC
+                """, (call_id,))
+                events = [{'event_type': r[0], 'transcript': r[1], 'action_taken': r[2],
+                           'metadata': r[3] or {}} for r in cur.fetchall()]
+
+                # Get insurance name for this call
+                cur.execute("SELECT insurance_name FROM credentialing_requests WHERE id = %s", (call_id,))
+                ins_row = cur.fetchone()
+                insurance_name = ins_row[0] if ins_row else None
+
+            # Determine what went wrong
+            human_events = [e for e in events if e['event_type'] == 'human_detected']
+            ivr_events = [e for e in events if e['event_type'] == 'ivr_system_speech']
+
+            # Build transcript snippet for analysis
+            transcript_lines = []
+            for e in events:
+                if e.get('transcript'):
+                    transcript_lines.append(f"[{e['event_type']}] {e['transcript']}")
+            for c in conversations:
+                transcript_lines.append(f"[{c['speaker']}] {c['message']}")
+
+            transcript_snippet = "\n".join(transcript_lines[:30])  # Limit for LLM context
+
+            # Get current phrases for context
+            current_phrases = _get_human_detection_phrases(insurance_name)
+
+            # Determine error type
+            if human_events:
+                error_description = "The system FALSELY detected a human (false positive) - the speech was actually IVR."
+            else:
+                error_description = "The system MISSED a human (false negative) - a real person was speaking but was classified as IVR."
+
+            # Use GPT-4o-mini to analyze and extract new phrases
+            try:
+                from langchain_openai import ChatOpenAI
+                llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
+                prompt = f"""You are analyzing a phone call transcript where human detection was INCORRECT.
+
+Error: {error_description}
+
+Transcript (events and conversation):
+{transcript_snippet}
+
+Current human indicator phrases: {current_phrases['human'][:20]}
+Current IVR definitive phrases: {current_phrases['ivr_definitive'][:20]}
+Current IVR passive phrases: {current_phrases['ivr_passive'][:15]}
+
+Based on this transcript, extract NEW phrases that should be added to improve detection.
+Rules:
+- Phrases should be lowercase, 2-6 words, generic enough to apply to other calls
+- Do NOT repeat existing phrases
+- Only include phrases that clearly indicate human or IVR
+- For false positive: suggest IVR phrases that were mistaken for human
+- For false negative: suggest human phrases that were missed
+
+Return ONLY valid JSON (no markdown):
+{{
+  "new_phrases": [
+    {{"phrase": "example phrase", "phrase_type": "human", "confidence": 0.7}},
+    {{"phrase": "press hash", "phrase_type": "ivr_definitive", "confidence": 0.9}}
+  ],
+  "demote_phrases": [
+    {{"phrase": "some phrase", "reason": "too ambiguous"}}
+  ]
+}}"""
+
+                response_text = llm.invoke(prompt).content.strip()
+                # Parse JSON response
+                import re
+                json_match = re.search(r'\{[\s\S]*\}', response_text)
+                if json_match:
+                    llm_result = json.loads(json_match.group())
+                else:
+                    llm_result = {'new_phrases': [], 'demote_phrases': []}
+
+                # Save new phrases to DB
+                new_phrases_saved = []
+                for p in llm_result.get('new_phrases', []):
+                    phrase = p.get('phrase', '').lower().strip()
+                    phrase_type = p.get('phrase_type', 'human')
+                    conf = min(max(p.get('confidence', 0.7), 0.3), 0.9)
+
+                    if not phrase or phrase_type not in VALID_PHRASE_TYPES:
+                        continue
+                    if len(phrase) < 3 or len(phrase) > 80:
+                        continue
+
+                    try:
+                        with db.conn.cursor() as cur:
+                            cur.execute("""
+                                INSERT INTO human_detection_phrases
+                                    (phrase, phrase_type, insurance_name, source, confidence, source_call_id)
+                                VALUES (%s, %s, %s, 'auto_review', %s, %s)
+                                ON CONFLICT (phrase, phrase_type, COALESCE(insurance_name, ''))
+                                DO UPDATE SET
+                                    times_seen = human_detection_phrases.times_seen + 1,
+                                    updated_at = NOW()
+                            """, (phrase, phrase_type, insurance_name, conf, call_id))
+                        db.conn.commit()
+                        new_phrases_saved.append({'phrase': phrase, 'phrase_type': phrase_type, 'confidence': conf})
+                    except Exception as insert_err:
+                        print(f"WARN: Could not save phrase '{phrase}': {insert_err}")
+                        db.conn.rollback()
+
+                # Demote bad phrases
+                for d in llm_result.get('demote_phrases', []):
+                    phrase = d.get('phrase', '').lower().strip()
+                    if phrase:
+                        try:
+                            with db.conn.cursor() as cur:
+                                cur.execute("""
+                                    UPDATE human_detection_phrases
+                                    SET times_seen = times_seen + 1,
+                                        confidence = GREATEST(0.0, confidence - 0.15),
+                                        is_active = CASE WHEN confidence - 0.15 < 0.3 THEN FALSE ELSE is_active END,
+                                        updated_at = NOW()
+                                    WHERE phrase = %s
+                                """, (phrase,))
+                            db.conn.commit()
+                        except Exception:
+                            db.conn.rollback()
+
+                result['new_phrases'] = new_phrases_saved
+                result['analysis'] = error_description
+
+            except Exception as llm_err:
+                print(f"WARN: LLM auto-review failed: {llm_err}")
+                import traceback
+                traceback.print_exc()
+                result['analysis_error'] = str(llm_err)
+
+        db.close()
+        return jsonify(result), 200
+
+    except Exception as e:
+        print(f"Error in human detection feedback: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            db.close()
+        except Exception:
+            pass
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/human-detection-phrases', methods=['GET'])
+@admin_required
+def get_human_detection_phrases():
+    """Get all human detection phrases, optionally filtered by insurance name."""
+    try:
+        insurance_name = request.args.get('insurance_name')
+        from credentialing_agent import DatabaseManager
+        db = DatabaseManager()
+
+        with db.conn.cursor() as cur:
+            if insurance_name:
+                cur.execute("""
+                    SELECT id, phrase, phrase_type, insurance_name, source, confidence,
+                           times_seen, times_correct, is_active, source_call_id, created_at, updated_at
+                    FROM human_detection_phrases
+                    WHERE insurance_name IS NULL OR insurance_name ILIKE %s
+                    ORDER BY phrase_type, confidence DESC
+                """, (f"%{insurance_name}%",))
+            else:
+                cur.execute("""
+                    SELECT id, phrase, phrase_type, insurance_name, source, confidence,
+                           times_seen, times_correct, is_active, source_call_id, created_at, updated_at
+                    FROM human_detection_phrases
+                    ORDER BY phrase_type, confidence DESC
+                """)
+
+            phrases = []
+            for r in cur.fetchall():
+                phrases.append({
+                    'id': str(r[0]),
+                    'phrase': r[1],
+                    'phrase_type': r[2],
+                    'insurance_name': r[3],
+                    'source': r[4],
+                    'confidence': r[5],
+                    'times_seen': r[6],
+                    'times_correct': r[7],
+                    'is_active': r[8],
+                    'source_call_id': r[9],
+                    'created_at': r[10].isoformat() if r[10] else None,
+                    'updated_at': r[11].isoformat() if r[11] else None,
+                })
+
+        db.close()
+        return jsonify({'success': True, 'phrases': phrases}), 200
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/human-detection-phrases', methods=['POST'])
+@admin_required
+def add_human_detection_phrase():
+    """Manually add a new human detection phrase."""
+    data = request.json or {}
+    phrase = data.get('phrase', '').lower().strip()
+    phrase_type = data.get('phrase_type', 'human')
+    insurance_name = data.get('insurance_name')
+
+    if not phrase:
+        return jsonify({'success': False, 'error': 'phrase is required'}), 400
+    if phrase_type not in VALID_PHRASE_TYPES:
+        return jsonify({'success': False, 'error': 'Invalid phrase_type'}), 400
+
+    from credentialing_agent import DatabaseManager
+    db = DatabaseManager()
+    try:
+        with db.conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO human_detection_phrases
+                    (phrase, phrase_type, insurance_name, source, confidence)
+                VALUES (%s, %s, %s, 'manual', 0.9)
+                ON CONFLICT (phrase, phrase_type, COALESCE(insurance_name, ''))
+                DO UPDATE SET
+                    is_active = TRUE,
+                    times_seen = human_detection_phrases.times_seen + 1,
+                    updated_at = NOW()
+                RETURNING id
+            """, (phrase, phrase_type, insurance_name))
+            row = cur.fetchone()
+        db.conn.commit()
+
+        return jsonify({'success': True, 'id': str(row[0]) if row else None}), 201
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/human-detection-phrases/<phrase_id>', methods=['DELETE'])
+@admin_required
+def delete_human_detection_phrase(phrase_id: str):
+    """Deactivate a human detection phrase (soft delete)."""
+    from credentialing_agent import DatabaseManager
+    db = DatabaseManager()
+    try:
+        with db.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE human_detection_phrases SET is_active = FALSE, updated_at = NOW()
+                WHERE id = %s
+            """, (phrase_id,))
+        db.conn.commit()
+
+        return jsonify({'success': True}), 200
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/human-detection-phrases/<phrase_id>', methods=['PATCH'])
+@admin_required
+def update_human_detection_phrase(phrase_id: str):
+    """Update a human detection phrase (toggle active, change type, etc.)."""
+    data = request.json or {}
+
+    updates = []
+    params = []
+    if 'is_active' in data:
+        updates.append("is_active = %s")
+        params.append(data['is_active'])
+    if 'phrase_type' in data:
+        updates.append("phrase_type = %s")
+        params.append(data['phrase_type'])
+    if 'confidence' in data:
+        updates.append("confidence = %s")
+        params.append(data['confidence'])
+
+    if not updates:
+        return jsonify({'success': False, 'error': 'No fields to update'}), 400
+
+    from credentialing_agent import DatabaseManager
+    db = DatabaseManager()
+    try:
+        updates.append("updated_at = NOW()")
+        params.append(phrase_id)
+
+        with db.conn.cursor() as cur:
+            cur.execute(f"""
+                UPDATE human_detection_phrases SET {', '.join(updates)}
+                WHERE id = %s
+            """, params)
+        db.conn.commit()
+
+        return jsonify({'success': True}), 200
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        db.close()
 
 
 @app.route('/api/metrics', methods=['GET'])
@@ -2876,7 +3958,7 @@ def add_ivr_knowledge():
 
 
 @app.route('/api/calls', methods=['GET'])
-@admin_required
+@agent_or_above
 def get_recent_calls():
     """
     Get recent credentialing calls
@@ -2885,18 +3967,31 @@ def get_recent_calls():
         from credentialing_agent import DatabaseManager
 
         limit = request.args.get('limit', 20, type=int)
+        current_user = get_current_user()
         db = DatabaseManager()
 
         with db.conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, insurance_name, provider_name, npi, tax_id,
-                       address, insurance_phone, status, reference_number,
-                       missing_documents, turnaround_days, notes,
-                       created_at, completed_at, call_mode, agent_phone
-                FROM credentialing_requests
-                ORDER BY created_at DESC
-                LIMIT %s
-            """, (limit,))
+            if _is_admin_like(current_user):
+                cur.execute("""
+                    SELECT id, insurance_name, provider_name, npi, tax_id,
+                           address, insurance_phone, status, reference_number,
+                           missing_documents, turnaround_days, notes,
+                           created_at, completed_at, call_mode, agent_phone, initiated_by::text
+                    FROM credentialing_requests
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, (limit,))
+            else:
+                cur.execute("""
+                    SELECT id, insurance_name, provider_name, npi, tax_id,
+                           address, insurance_phone, status, reference_number,
+                           missing_documents, turnaround_days, notes,
+                           created_at, completed_at, call_mode, agent_phone, initiated_by::text
+                    FROM credentialing_requests
+                    WHERE initiated_by = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, (current_user["id"], limit))
 
             calls = []
             for row in cur.fetchall():
@@ -2917,6 +4012,7 @@ def get_recent_calls():
                     'completed_at': row[13].isoformat() if row[13] else None,
                     'call_mode': row[14] or 'ai',
                     'agent_phone': row[15],
+                    'initiated_by': row[16],
                 })
 
         db.close()
@@ -3148,7 +4244,7 @@ def cancel_call(call_id: str):
 
 
 @app.route('/api/ivr-knowledge/<insurance_name>', methods=['GET'])
-@admin_required
+@agent_or_above
 def get_ivr_knowledge(insurance_name: str):
     """
     Get IVR knowledge for a specific insurance provider
@@ -3201,7 +4297,7 @@ def get_ivr_knowledge(insurance_name: str):
 # ============================================================================
 
 @app.route('/api/insurance-providers', methods=['GET'])
-@admin_required
+@agent_or_above
 def get_insurance_providers():
     """
     Get all insurance providers
@@ -3215,7 +4311,8 @@ def get_insurance_providers():
             cur.execute("""
                 SELECT id, insurance_name, phone_number, department,
                        best_call_times, average_wait_time_minutes, notes, last_updated,
-                       ivr_asks_npi, ivr_npi_method, ivr_asks_tax_id, ivr_tax_id_method, ivr_tax_id_digits_to_send
+                       ivr_asks_npi, ivr_npi_method, ivr_asks_tax_id, ivr_tax_id_method, ivr_tax_id_digits_to_send,
+                       ivr_npi_suffix, ivr_tax_id_suffix
                 FROM insurance_providers
                 ORDER BY insurance_name ASC
             """)
@@ -3236,6 +4333,8 @@ def get_insurance_providers():
                     'ivr_asks_tax_id': row[10] or False,
                     'ivr_tax_id_method': row[11] or 'speech',
                     'ivr_tax_id_digits_to_send': row[12],
+                    'ivr_npi_suffix': row[13] or None,
+                    'ivr_tax_id_suffix': row[14] or None,
                 })
 
         db.close()
@@ -3269,19 +4368,19 @@ def add_insurance_provider():
         "notes": "Best to call early morning"
     }
     """
+    from credentialing_agent import DatabaseManager
+
+    data = request.json
+    db = DatabaseManager()
     try:
-        from credentialing_agent import DatabaseManager
-
-        data = request.json
-        db = DatabaseManager()
-
         with db.conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO insurance_providers
                 (insurance_name, phone_number, department, best_call_times,
                  average_wait_time_minutes, notes,
-                 ivr_asks_npi, ivr_npi_method, ivr_asks_tax_id, ivr_tax_id_method, ivr_tax_id_digits_to_send)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 ivr_asks_npi, ivr_npi_method, ivr_asks_tax_id, ivr_tax_id_method, ivr_tax_id_digits_to_send,
+                 ivr_npi_suffix, ivr_tax_id_suffix)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 data['insurance_name'],
@@ -3295,25 +4394,26 @@ def add_insurance_provider():
                 data.get('ivr_asks_tax_id', False),
                 data.get('ivr_tax_id_method', 'speech'),
                 data.get('ivr_tax_id_digits_to_send'),
+                data.get('ivr_npi_suffix'),
+                data.get('ivr_tax_id_suffix'),
             ))
 
             provider_id = cur.fetchone()[0]
             db.conn.commit()
-
-        db.close()
 
         return jsonify({
             'success': True,
             'id': str(provider_id),
             'message': 'Insurance provider added successfully'
         }), 201
-
     except Exception as e:
         print(f"Error adding insurance provider: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
+    finally:
+        db.close()
 
 
 @app.route('/api/insurance-providers/<provider_id>', methods=['PUT'])
@@ -3322,12 +4422,11 @@ def update_insurance_provider(provider_id: str):
     """
     Update an existing insurance provider
     """
+    from credentialing_agent import DatabaseManager
+
+    data = request.json
+    db = DatabaseManager()
     try:
-        from credentialing_agent import DatabaseManager
-
-        data = request.json
-        db = DatabaseManager()
-
         with db.conn.cursor() as cur:
             # Read old name first so IVR rows can be kept in sync when renamed.
             cur.execute("""
@@ -3337,7 +4436,6 @@ def update_insurance_provider(provider_id: str):
             """, (provider_id,))
             existing = cur.fetchone()
             if not existing:
-                db.close()
                 return jsonify({
                     'success': False,
                     'error': 'Insurance provider not found'
@@ -3359,6 +4457,8 @@ def update_insurance_provider(provider_id: str):
                     ivr_asks_tax_id = %s,
                     ivr_tax_id_method = %s,
                     ivr_tax_id_digits_to_send = %s,
+                    ivr_npi_suffix = %s,
+                    ivr_tax_id_suffix = %s,
                     last_updated = NOW()
                 WHERE id = %s
                 RETURNING id
@@ -3374,6 +4474,8 @@ def update_insurance_provider(provider_id: str):
                 data.get('ivr_asks_tax_id', False),
                 data.get('ivr_tax_id_method', 'speech'),
                 data.get('ivr_tax_id_digits_to_send'),
+                data.get('ivr_npi_suffix'),
+                data.get('ivr_tax_id_suffix'),
                 provider_id
             ))
 
@@ -3389,19 +4491,18 @@ def update_insurance_provider(provider_id: str):
 
             db.conn.commit()
 
-        db.close()
-
         return jsonify({
             'success': True,
             'message': 'Insurance provider updated successfully'
         }), 200
-
     except Exception as e:
         print(f"Error updating insurance provider: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
+    finally:
+        db.close()
 
 
 @app.route('/api/insurance-providers/<provider_id>', methods=['DELETE'])
@@ -3710,7 +4811,7 @@ def delete_config_value(config_key: str):
 # ============================================================================
 
 @app.route('/api/audit-logs', methods=['GET'])
-@admin_required
+@super_admin_required
 def get_audit_logs_endpoint():
     """
     Get audit logs with filtering and pagination.
@@ -3780,7 +4881,7 @@ def get_audit_logs_endpoint():
 
 
 @app.route('/api/audit-logs', methods=['POST'])
-@admin_required
+@super_admin_required
 def create_audit_log():
     """
     Manually create an audit log entry.
@@ -3830,7 +4931,7 @@ def create_audit_log():
 # ============================================================================
 
 @app.route('/api/transfer-to-agent', methods=['POST'])
-@jwt_required()
+@admin_or_above
 def transfer_to_agent():
     """
     Mid-call transfer from AI to a real human agent using Twilio Conference.
@@ -3873,29 +4974,26 @@ def transfer_to_agent():
         if not call_sid:
             return jsonify({'success': False, 'error': 'Call SID not yet available; call may still be connecting'}), 400
 
-        from_number = os.getenv("TWILIO_PHONE_NUMBER")
+        from_number = call_state.get('from_number') or os.getenv("TWILIO_PHONE_NUMBER")
         conf_name = call_id  # Conference room name = call_id for uniqueness
+        recording_callback_url = build_recording_status_callback(
+            get_callback_base(request),
+            call_id=call_id,
+            request_id=call_state.get('db_request_id'),
+        )
 
         # TwiML to redirect the insurance-side call into the conference
-        insurance_leg_twiml = (
-            '<Response>'
-            '<Dial>'
-            f'<Conference waitUrl="" startConferenceOnEnter="true" endConferenceOnExit="true">'
-            f'{conf_name}'
-            '</Conference>'
-            '</Dial>'
-            '</Response>'
+        insurance_leg_twiml = build_conference_twiml(
+            conf_name,
+            recording_callback_url=recording_callback_url,
+            end_on_exit=True,
         )
 
         # TwiML for the agent leg (does not end conference when agent hangs up)
-        agent_leg_twiml = (
-            '<Response>'
-            '<Dial>'
-            f'<Conference waitUrl="" startConferenceOnEnter="true" endConferenceOnExit="false">'
-            f'{conf_name}'
-            '</Conference>'
-            '</Dial>'
-            '</Response>'
+        agent_leg_twiml = build_conference_twiml(
+            conf_name,
+            recording_callback_url=recording_callback_url,
+            end_on_exit=False,
         )
 
         # Dial the real agent first — if this fails, the insurance call is untouched
@@ -4069,6 +5167,134 @@ def send_audio_to_twilio(stream_sid: str, audio_base64: str):
         }
     }
     socketio.emit('message', json.dumps(message), namespace='/media-stream')
+
+
+# ============================================================================
+# Twilio Number Management Routes (admin only)
+# ============================================================================
+
+@app.route('/api/twilio-numbers', methods=['GET'])
+@admin_required
+def list_twilio_numbers():
+    """List all Twilio numbers with their status."""
+    conn = _tp_get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, phone_number, friendly_name, is_active, "
+                "       current_call_id, current_call_sid, in_use_since, "
+                "       created_at, updated_at "
+                "FROM twilio_numbers ORDER BY created_at ASC"
+            )
+            rows = cur.fetchall()
+        numbers = []
+        for row in rows:
+            d = dict(row)
+            d["id"] = str(d["id"])
+            for ts_field in ("in_use_since", "created_at", "updated_at"):
+                if d.get(ts_field):
+                    d[ts_field] = d[ts_field].isoformat()
+            numbers.append(d)
+        return jsonify({"numbers": numbers}), 200
+    finally:
+        _tp_put_conn(conn)
+
+
+@app.route('/api/twilio-numbers', methods=['POST'])
+@admin_required
+def add_twilio_number():
+    """Add a new Twilio number to the pool."""
+    data = request.get_json(silent=True) or {}
+    phone_number = (data.get("phone_number") or "").strip()
+    friendly_name = (data.get("friendly_name") or "").strip() or None
+
+    if not phone_number:
+        return jsonify({"error": "phone_number is required"}), 400
+
+    # Basic E.164 validation
+    if not re.match(r"^\+\d{10,15}$", phone_number):
+        return jsonify({"error": "Phone number must be in E.164 format (e.g. +13513007215)"}), 400
+
+    conn = _tp_get_conn()
+    try:
+        user_id = get_current_user_id()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "INSERT INTO twilio_numbers (phone_number, friendly_name, added_by) "
+                "VALUES (%s, %s, %s) "
+                "RETURNING id, phone_number, friendly_name, is_active, created_at",
+                (phone_number, friendly_name, user_id),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        d = dict(row)
+        d["id"] = str(d["id"])
+        if d.get("created_at"):
+            d["created_at"] = d["created_at"].isoformat()
+        return jsonify({"number": d}), 201
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
+        return jsonify({"error": "This phone number already exists"}), 409
+    finally:
+        _tp_put_conn(conn)
+
+
+@app.route('/api/twilio-numbers/<number_id>', methods=['PATCH'])
+@admin_required
+def update_twilio_number(number_id):
+    """Toggle is_active for a Twilio number."""
+    data = request.get_json(silent=True) or {}
+
+    if "is_active" not in data:
+        return jsonify({"error": "is_active field is required"}), 400
+
+    conn = _tp_get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "UPDATE twilio_numbers SET is_active = %s, updated_at = NOW() "
+                "WHERE id = %s "
+                "RETURNING id, phone_number, friendly_name, is_active, "
+                "         current_call_id, created_at, updated_at",
+                (bool(data["is_active"]), number_id),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        if not row:
+            return jsonify({"error": "Number not found"}), 404
+        d = dict(row)
+        d["id"] = str(d["id"])
+        for ts_field in ("created_at", "updated_at"):
+            if d.get(ts_field):
+                d[ts_field] = d[ts_field].isoformat()
+        return jsonify({"number": d}), 200
+    finally:
+        _tp_put_conn(conn)
+
+
+@app.route('/api/twilio-numbers/<number_id>', methods=['DELETE'])
+@admin_required
+def delete_twilio_number(number_id):
+    """Delete a Twilio number (only if not currently in use)."""
+    conn = _tp_get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Check if in use
+            cur.execute(
+                "SELECT current_call_id FROM twilio_numbers WHERE id = %s",
+                (number_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"error": "Number not found"}), 404
+            if row["current_call_id"]:
+                return jsonify({"error": "Cannot delete a number that is currently in use"}), 409
+
+            cur.execute("DELETE FROM twilio_numbers WHERE id = %s", (number_id,))
+        conn.commit()
+        return jsonify({"message": "Number deleted"}), 200
+    finally:
+        _tp_put_conn(conn)
 
 
 # ============================================================================
