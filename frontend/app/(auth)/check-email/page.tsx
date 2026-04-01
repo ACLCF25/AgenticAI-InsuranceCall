@@ -1,12 +1,13 @@
 'use client'
 
+import { Suspense } from 'react'
 import Link from 'next/link'
 import { useSearchParams } from 'next/navigation'
 import { MailCheck } from 'lucide-react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 
-export default function CheckEmailPage() {
+function CheckEmailContent() {
   const searchParams = useSearchParams()
   const email = searchParams.get('email')
 
@@ -32,5 +33,27 @@ export default function CheckEmailPage() {
         </CardContent>
       </Card>
     </div>
+  )
+}
+
+export default function CheckEmailPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex min-h-screen items-center justify-center bg-background p-4">
+          <Card className="w-full max-w-md shadow-lg">
+            <CardHeader className="space-y-2 text-center">
+              <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-xl bg-primary/10 text-primary">
+                <MailCheck className="h-5 w-5" />
+              </div>
+              <CardTitle>Check your email</CardTitle>
+              <CardDescription>Loading confirmation details...</CardDescription>
+            </CardHeader>
+          </Card>
+        </div>
+      }
+    >
+      <CheckEmailContent />
+    </Suspense>
   )
 }
