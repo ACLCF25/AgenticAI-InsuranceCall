@@ -14,6 +14,10 @@ import type {
   APIResponse,
   StartCallResponse,
   DashboardStats,
+  AdminUser,
+  TwilioNumber,
+  HumanDetectionPhrase,
+  HumanDetectionFeedbackResponse,
 } from '@/types';
 
 class APIClient {
@@ -218,6 +222,75 @@ class APIClient {
       call_id: callId,
       agent_phone: agentPhone,
     });
+    return data;
+  }
+
+  // ---- User Management (admin) ----
+
+  async getUsers(): Promise<{ users: AdminUser[] }> {
+    const { data } = await this.client.get('/auth/users');
+    return data;
+  }
+
+  async createUser(user: { username: string; email: string; password: string; role: string }): Promise<{ user: AdminUser }> {
+    const { data } = await this.client.post('/auth/register', user);
+    return data;
+  }
+
+  async updateUser(userId: string, updates: { is_active?: boolean; role?: string }): Promise<{ user: AdminUser }> {
+    const { data } = await this.client.patch(`/auth/users/${userId}`, updates);
+    return data;
+  }
+
+  // ---- Twilio Number Management (admin) ----
+
+  async getTwilioNumbers(): Promise<{ numbers: TwilioNumber[] }> {
+    const { data } = await this.client.get('/twilio-numbers');
+    return data;
+  }
+
+  async addTwilioNumber(number: { phone_number: string; friendly_name?: string }): Promise<{ number: TwilioNumber }> {
+    const { data } = await this.client.post('/twilio-numbers', number);
+    return data;
+  }
+
+  async updateTwilioNumber(id: string, updates: { is_active: boolean }): Promise<{ number: TwilioNumber }> {
+    const { data } = await this.client.patch(`/twilio-numbers/${id}`, updates);
+    return data;
+  }
+
+  async deleteTwilioNumber(id: string): Promise<{ message: string }> {
+    const { data } = await this.client.delete(`/twilio-numbers/${id}`);
+    return data;
+  }
+
+  // ---- Human Detection Self-Learning ----
+
+  async submitHumanDetectionFeedback(callId: string, correct: boolean): Promise<HumanDetectionFeedbackResponse> {
+    const { data } = await this.client.post(`/call/${callId}/human-detection-feedback`, { correct });
+    return data;
+  }
+
+  async getHumanDetectionPhrases(insuranceName?: string): Promise<{ success: boolean; phrases: HumanDetectionPhrase[] }> {
+    const params = insuranceName ? `?insurance_name=${encodeURIComponent(insuranceName)}` : '';
+    const { data } = await this.client.get(`/human-detection-phrases${params}`);
+    return data;
+  }
+
+  async addHumanDetectionPhrase(phrase: string, phraseType: string, insuranceName?: string): Promise<APIResponse> {
+    const { data } = await this.client.post('/human-detection-phrases', {
+      phrase, phrase_type: phraseType, insurance_name: insuranceName || null,
+    });
+    return data;
+  }
+
+  async deleteHumanDetectionPhrase(id: string): Promise<APIResponse> {
+    const { data } = await this.client.delete(`/human-detection-phrases/${id}`);
+    return data;
+  }
+
+  async updateHumanDetectionPhrase(id: string, updates: Partial<HumanDetectionPhrase>): Promise<APIResponse> {
+    const { data } = await this.client.patch(`/human-detection-phrases/${id}`, updates);
     return data;
   }
 }

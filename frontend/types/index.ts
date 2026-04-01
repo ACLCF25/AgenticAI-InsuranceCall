@@ -105,6 +105,8 @@ export interface InsuranceProvider {
   ivr_asks_tax_id?: boolean;
   ivr_tax_id_method?: 'speech' | 'dtmf';
   ivr_tax_id_digits_to_send?: number;
+  ivr_npi_suffix?: string | null;       // '*', '#', or null
+  ivr_tax_id_suffix?: string | null;    // '*', '#', or null
   notes?: string;
   last_updated?: string;
 }
@@ -161,6 +163,14 @@ export interface CallDetailEvent {
   metadata?: Record<string, any>;
 }
 
+export interface QAPair {
+  id: string;
+  question_index: number;
+  question_text: string;
+  answer_text?: string;
+  confidence: number;
+}
+
 export interface CallDetail {
   id: string;
   insurance_name: string;
@@ -179,16 +189,74 @@ export interface CallDetail {
   created_at?: string;
   updated_at?: string;
   completed_at?: string;
+  call_mode?: string;
+  agent_phone?: string;
   conversation: ConversationMessage[];
   events: CallDetailEvent[];
+  ivr_patterns?: Array<{
+    menu_level: number;
+    detected_phrase: string;
+    preferred_action: string;
+    action_value: string;
+  }>;
   recording?: {
     available: boolean;
     url: string;
     duration?: number;
-    status?: string;
+    status?: 'completed' | 'failed' | 'pending' | 'processing';
     created_at?: string;
   };
-  qa_pairs?: any[];
+  qa_pairs?: QAPair[];
+  human_detection_correct?: boolean | null;
+}
+
+export interface HumanDetectionPhrase {
+  id: string;
+  phrase: string;
+  phrase_type: 'human' | 'ivr_definitive' | 'ivr_passive' | 'simple_greeting';
+  insurance_name: string | null;
+  source: 'manual' | 'auto_review' | 'feedback';
+  confidence: number;
+  times_seen: number;
+  times_correct: number;
+  is_active: boolean;
+  source_call_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface HumanDetectionFeedbackResponse {
+  success: boolean;
+  correct: boolean;
+  new_phrases: Array<{
+    phrase: string;
+    phrase_type: string;
+    confidence: number;
+  }>;
+  analysis?: string;
+  analysis_error?: string;
+}
+
+export interface AdminUser {
+  id: string;
+  username: string;
+  email: string;
+  role: 'admin' | 'user';
+  is_active: boolean;
+  created_at: string;
+  last_login: string | null;
+}
+
+export interface TwilioNumber {
+  id: string;
+  phone_number: string;
+  friendly_name: string | null;
+  is_active: boolean;
+  current_call_id: string | null;
+  current_call_sid: string | null;
+  in_use_since: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface LangSmithTrace {

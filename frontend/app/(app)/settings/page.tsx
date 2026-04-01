@@ -1,7 +1,8 @@
 'use client'
 
+import Link from 'next/link'
 import { motion } from 'framer-motion'
-import { Settings, Globe, Server, Bell } from 'lucide-react'
+import { Settings, Globe, Server, Bell, Users, PhoneCall, ChevronRight } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 
 export default function SettingsPage() {
@@ -11,6 +12,34 @@ export default function SettingsPage() {
       animate={{ opacity: 1, y: 0 }}
       className="max-w-2xl space-y-6"
     >
+      {/* Quick Links */}
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Link href="/settings/users">
+          <Card className="hover:bg-sidebar-accent transition-colors cursor-pointer">
+            <CardContent className="flex items-center gap-3 pt-6">
+              <Users className="h-5 w-5 text-primary" />
+              <div className="flex-1">
+                <p className="text-sm font-medium">User Management</p>
+                <p className="text-xs text-muted-foreground">Add and approve users</p>
+              </div>
+              <ChevronRight className="h-4 w-4 text-muted-foreground" />
+            </CardContent>
+          </Card>
+        </Link>
+        <Link href="/settings/phone-numbers">
+          <Card className="hover:bg-sidebar-accent transition-colors cursor-pointer">
+            <CardContent className="flex items-center gap-3 pt-6">
+              <PhoneCall className="h-5 w-5 text-primary" />
+              <div className="flex-1">
+                <p className="text-sm font-medium">Phone Lines</p>
+                <p className="text-xs text-muted-foreground">Manage Twilio numbers</p>
+              </div>
+              <ChevronRight className="h-4 w-4 text-muted-foreground" />
+            </CardContent>
+          </Card>
+        </Link>
+      </div>
+
       {/* API Configuration */}
       <Card>
         <CardHeader>

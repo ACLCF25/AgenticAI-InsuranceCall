@@ -4,6 +4,7 @@ Provides JWT-based login/logout/refresh endpoints and role-based decorators.
 """
 
 import os
+import re
 from functools import wraps
 from datetime import datetime, timezone
 
@@ -11,6 +12,7 @@ import bcrypt
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
+import psycopg2.sql
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import (
     create_access_token,
@@ -62,6 +64,18 @@ def _query_one(sql: str, params: tuple):
         _auth_pool.putconn(conn)
 
 
+def _query_all(sql: str, params: tuple = ()):
+    """Execute a SELECT and return all rows as a list of dicts."""
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
+    finally:
+        _auth_pool.putconn(conn)
+
+
 def _execute(sql: str, params: tuple):
     """Execute a write statement and commit."""
     conn = _get_conn()
@@ -69,6 +83,19 @@ def _execute(sql: str, params: tuple):
         with conn.cursor() as cur:
             cur.execute(sql, params)
         conn.commit()
+    finally:
+        _auth_pool.putconn(conn)
+
+
+def _execute_returning(sql: str, params: tuple):
+    """Execute a write statement with RETURNING and return the row as a dict."""
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+        conn.commit()
+        return dict(row) if row else None
     finally:
         _auth_pool.putconn(conn)
 
@@ -196,6 +223,119 @@ def me():
         return jsonify({"error": "User not found"}), 404
 
     # Serialize datetime fields for JSON
+    user["id"] = str(user["id"])
+    if user.get("created_at"):
+        user["created_at"] = user["created_at"].isoformat()
+    if user.get("last_login"):
+        user["last_login"] = user["last_login"].isoformat()
+
+    return jsonify({"user": user}), 200
+
+
+# ---------------------------------------------------------------------------
+# User management routes (admin only)
+# ---------------------------------------------------------------------------
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+@auth_bp.route("/register", methods=["POST"])
+@admin_required
+def register():
+    """Create a new user (admin only). User starts as inactive (pending approval)."""
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    role = data.get("role", "user")
+
+    # Validation
+    if not username:
+        return jsonify({"error": "Username is required"}), 400
+    if not email or not _EMAIL_RE.match(email):
+        return jsonify({"error": "A valid email is required"}), 400
+    if len(password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters"}), 400
+    if role not in ("admin", "user"):
+        return jsonify({"error": "Role must be 'admin' or 'user'"}), 400
+
+    password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+    try:
+        user = _execute_returning(
+            "INSERT INTO users (username, email, password_hash, role, is_active) "
+            "VALUES (%s, %s, %s, %s, FALSE) "
+            "RETURNING id, username, email, role, is_active, created_at",
+            (username, email, password_hash, role),
+        )
+    except psycopg2.errors.UniqueViolation:
+        return jsonify({"error": "Username or email already exists"}), 409
+
+    user["id"] = str(user["id"])
+    if user.get("created_at"):
+        user["created_at"] = user["created_at"].isoformat()
+
+    return jsonify({"user": user}), 201
+
+
+@auth_bp.route("/users", methods=["GET"])
+@admin_required
+def list_users():
+    """List all users (admin only)."""
+    rows = _query_all(
+        "SELECT id, username, email, role, is_active, created_at, last_login "
+        "FROM users ORDER BY created_at DESC"
+    )
+    for row in rows:
+        row["id"] = str(row["id"])
+        if row.get("created_at"):
+            row["created_at"] = row["created_at"].isoformat()
+        if row.get("last_login"):
+            row["last_login"] = row["last_login"].isoformat()
+
+    return jsonify({"users": rows}), 200
+
+
+@auth_bp.route("/users/<user_id>", methods=["PATCH"])
+@admin_required
+def update_user(user_id):
+    """Update a user's is_active or role (admin only)."""
+    current_user_id = get_jwt_identity()
+    data = request.get_json(silent=True) or {}
+
+    # Prevent self-deactivation
+    if str(user_id) == str(current_user_id) and data.get("is_active") is False:
+        return jsonify({"error": "Cannot deactivate your own account"}), 400
+
+    set_clauses = []
+    params = []
+
+    if "is_active" in data:
+        set_clauses.append(psycopg2.sql.SQL("{} = %s").format(psycopg2.sql.Identifier("is_active")))
+        params.append(bool(data["is_active"]))
+
+    if "role" in data:
+        if data["role"] not in ("admin", "user"):
+            return jsonify({"error": "Role must be 'admin' or 'user'"}), 400
+        # Prevent changing own role
+        if str(user_id) == str(current_user_id):
+            return jsonify({"error": "Cannot change your own role"}), 400
+        set_clauses.append(psycopg2.sql.SQL("{} = %s").format(psycopg2.sql.Identifier("role")))
+        params.append(data["role"])
+
+    if not set_clauses:
+        return jsonify({"error": "No valid fields to update"}), 400
+
+    params.append(user_id)
+    sql = psycopg2.sql.SQL(
+        "UPDATE users SET {} WHERE id = %s "
+        "RETURNING id, username, email, role, is_active, created_at, last_login"
+    ).format(psycopg2.sql.SQL(", ").join(set_clauses))
+
+    user = _execute_returning(sql, tuple(params))
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
     user["id"] = str(user["id"])
     if user.get("created_at"):
         user["created_at"] = user["created_at"].isoformat()

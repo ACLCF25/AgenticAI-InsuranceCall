@@ -1,8 +1,9 @@
 'use client'
 
 import { useParams, useRouter } from 'next/navigation'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
+import { toast } from 'sonner'
 import { useEffect, useState } from 'react'
 import {
   ArrowLeft,
@@ -18,6 +19,12 @@ import {
   CheckCircle2,
   Bot,
   User,
+  ListOrdered,
+  Activity,
+  ThumbsUp,
+  ThumbsDown,
+  Brain,
+  Sparkles,
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -44,26 +51,68 @@ export default function CallDetailPage() {
   // protected /api/call-recording/:id/stream endpoint.
   const [recordingBlobUrl, setRecordingBlobUrl] = useState<string | null>(null)
   const [recordingLoadError, setRecordingLoadError] = useState<string | null>(null)
+  const queryClient = useQueryClient()
+
+  // Human detection feedback state
+  const [feedbackSubmitting, setFeedbackSubmitting] = useState(false)
+  const [feedbackResult, setFeedbackResult] = useState<{
+    new_phrases: Array<{ phrase: string; phrase_type: string; confidence: number }>;
+    analysis?: string;
+  } | null>(null)
 
   useEffect(() => {
-    if (!call?.recording?.available || call.recording.status !== 'completed') return
+    if (call?.recording?.status !== 'completed') {
+      setRecordingLoadError(null)
+      setRecordingBlobUrl((current) => {
+        if (current) URL.revokeObjectURL(current)
+        return null
+      })
+      return
+    }
 
     let objectUrl: string | null = null
+    let cancelled = false
+    setRecordingLoadError(null)
 
     api
       .getCallRecordingBlob(callId)
       .then((blob) => {
+        if (cancelled) return
         objectUrl = URL.createObjectURL(blob)
-        setRecordingBlobUrl(objectUrl)
+        setRecordingBlobUrl((current) => {
+          if (current) URL.revokeObjectURL(current)
+          return objectUrl
+        })
       })
       .catch(() => {
+        if (cancelled) return
         setRecordingLoadError('Recording could not be loaded.')
       })
 
     return () => {
+      cancelled = true
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
-  }, [callId, call?.recording?.available, call?.recording?.status])
+  }, [callId, call?.recording?.status])
+
+  const handleFeedback = async (correct: boolean) => {
+    if (!call) return
+    setFeedbackSubmitting(true)
+    try {
+      const res = await api.submitHumanDetectionFeedback(call.id, correct)
+      if (!correct && res.new_phrases?.length) {
+        setFeedbackResult({ new_phrases: res.new_phrases, analysis: res.analysis })
+      } else {
+        setFeedbackResult({ new_phrases: [], analysis: correct ? 'Marked as correct' : res.analysis })
+      }
+      queryClient.invalidateQueries({ queryKey: ['call-detail', callId] })
+    } catch (err) {
+      console.error('Feedback submission failed:', err)
+      toast.error('Failed to submit feedback. Please try again.')
+    } finally {
+      setFeedbackSubmitting(false)
+    }
+  }
 
   if (isLoading) {
     return (
@@ -154,6 +203,7 @@ export default function CallDetailPage() {
                   <p className="text-sm">{formatPhoneNumber(call.insurance_phone)}</p>
                 </div>
               </div>
+              {call.call_mode && (
               <div className="flex items-start gap-2">
                 {call.call_mode === 'agent' ? (
                   <User className="h-4 w-4 mt-0.5 text-muted-foreground" />
@@ -165,6 +215,7 @@ export default function CallDetailPage() {
                   <p className="text-sm capitalize">{call.call_mode === 'agent' ? 'Human Agent' : 'AI Agent'}</p>
                 </div>
               </div>
+              )}
               {call.reference_number && (
                 <div className="flex items-start gap-2">
                   <Hash className="h-4 w-4 mt-0.5 text-muted-foreground" />
@@ -223,19 +274,33 @@ export default function CallDetailPage() {
             </CardContent>
           </Card>
 
-          {call.recording?.available && (
+          {call.recording && (
             <Card>
               <CardHeader>
                 <CardTitle className="text-lg flex items-center gap-2">
                   <Phone className="h-4 w-4" />
                   Call Recording
+                  {call.recording.recording_type && (
+                    <Badge variant={call.recording.recording_type === 'agent' ? 'secondary' : 'outline'} className="text-xs ml-2">
+                      {call.recording.recording_type === 'agent' ? 'Agent Transfer' : call.recording.recording_type === 'both' ? 'AI + Agent' : 'AI Call'}
+                    </Badge>
+                  )}
                 </CardTitle>
               </CardHeader>
               <CardContent>
-                {call.recording.status !== 'completed' ? (
+                {call.recording.status === 'failed' ? (
+                  <div className="flex items-center gap-2 text-sm text-yellow-600 py-2">
+                    <AlertTriangle className="h-4 w-4" />
+                    <span>Recording could not be processed.</span>
+                  </div>
+                ) : call.recording.status !== 'completed' ? (
                   <div className="flex items-center gap-2 text-sm text-muted-foreground py-2">
                     <Loader2 className="h-4 w-4 animate-spin" />
-                    <span>Recording is being processed&hellip;</span>
+                    <span>
+                      {call.recording.status === 'pending'
+                        ? 'Recording is pending and will appear after Twilio posts it.'
+                        : 'Recording is being processed...'}
+                    </span>
                   </div>
                 ) : recordingLoadError ? (
                   <div className="flex items-center gap-2 text-sm text-yellow-600 py-2">
@@ -276,7 +341,7 @@ export default function CallDetailPage() {
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
-                {call.qa_pairs.map((qa: any) => (
+                {call.qa_pairs.map((qa) => (
                   <div key={qa.id} className="border-l-2 border-primary/30 pl-4">
                     <div className="flex items-start gap-2 mb-2">
                       <span className="flex-shrink-0 w-6 h-6 rounded-full bg-primary/15 text-primary text-xs flex items-center justify-center font-medium">
@@ -332,6 +397,73 @@ export default function CallDetailPage() {
               </CardContent>
             </Card>
           )}
+
+          {/* IVR Menu Script */}
+          {call.ivr_patterns && call.ivr_patterns.length > 0 && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-lg flex items-center gap-2">
+                  <ListOrdered className="h-4 w-4" />
+                  IVR Menu Script
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <ol className="space-y-2">
+                  {call.ivr_patterns.map((p, i) => (
+                    <li key={i} className="flex items-start gap-2 text-sm">
+                      <span className="flex-shrink-0 w-5 h-5 rounded-full bg-blue-500/15 text-blue-500 text-xs flex items-center justify-center font-medium">
+                        {p.menu_level}
+                      </span>
+                      <div className="flex-1">
+                        <p className="text-muted-foreground text-xs">Listen for: <span className="text-foreground">{p.detected_phrase}</span></p>
+                        <Badge variant="outline" className="mt-1 text-xs">
+                          {p.preferred_action === 'dtmf' ? `Press ${p.action_value}` : p.preferred_action === 'speech' ? `Say "${p.action_value}"` : 'Wait'}
+                        </Badge>
+                      </div>
+                    </li>
+                  ))}
+                </ol>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* IVR Navigation Log */}
+          {call.events && call.events.length > 0 && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-lg flex items-center gap-2">
+                  <Activity className="h-4 w-4" />
+                  IVR Navigation Log
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-3 max-h-[400px] overflow-y-auto">
+                  {call.events.map((evt, i) => (
+                    <div key={i} className="border-l-2 pl-3 py-1 text-sm border-muted-foreground/20">
+                      <div className="flex items-center gap-2 mb-0.5">
+                        <Badge variant="outline" className="text-[10px] px-1.5 py-0">
+                          {evt.event_type === 'ivr_menu_matched' ? 'Menu Matched' :
+                           evt.event_type === 'ivr_credential_sent' ? 'Credential Sent' :
+                           evt.event_type === 'human_detected' ? 'Human Detected' :
+                           evt.event_type === 'ivr_system_speech' ? 'IVR Speech' :
+                           evt.event_type}
+                        </Badge>
+                        {evt.action_taken && (
+                          <span className="text-xs text-muted-foreground font-mono">{evt.action_taken}</span>
+                        )}
+                        {evt.timestamp && (
+                          <span className="text-[10px] text-muted-foreground ml-auto">{formatRelativeTime(evt.timestamp)}</span>
+                        )}
+                      </div>
+                      {evt.transcript && (
+                        <p className="text-xs text-muted-foreground line-clamp-2">{evt.transcript}</p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+          )}
         </div>
 
         {/* Right column - Conversation + Notes */}
@@ -374,7 +506,7 @@ export default function CallDetailPage() {
                         >
                           <div className="flex items-center gap-2 mb-1 flex-wrap">
                             <span className="text-xs font-medium opacity-80">
-                              {msg.speaker === 'agent' ? 'AI Agent' : 'Representative'}
+                              {msg.speaker === 'agent' ? 'AI Agent' : msg.speaker === 'ivr' ? 'IVR System' : msg.speaker === 'agent_transcript' ? 'Agent Call Transcript' : 'Representative'}
                             </span>
                             {msg.timestamp && (
                               <span className="text-xs opacity-60">
@@ -423,6 +555,101 @@ export default function CallDetailPage() {
               </CardContent>
             </Card>
           )}
+
+          {/* Human Detection Feedback */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-lg flex items-center gap-2">
+                <Brain className="h-4 w-4" />
+                Human Detection Feedback
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              {call.human_detection_correct !== null && call.human_detection_correct !== undefined && !feedbackResult ? (
+                <div className="flex items-center gap-2 text-sm">
+                  {call.human_detection_correct ? (
+                    <>
+                      <ThumbsUp className="h-4 w-4 text-green-500" />
+                      <span className="text-green-500">Marked as correct</span>
+                    </>
+                  ) : (
+                    <>
+                      <ThumbsDown className="h-4 w-4 text-red-500" />
+                      <span className="text-red-500">Marked as incorrect - system learned from this</span>
+                    </>
+                  )}
+                </div>
+              ) : feedbackResult ? (
+                <div className="space-y-3">
+                  <p className="text-sm text-muted-foreground">{feedbackResult.analysis}</p>
+                  {feedbackResult.new_phrases.length > 0 ? (
+                    <div>
+                      <p className="text-sm font-medium flex items-center gap-1.5 mb-2">
+                        <Sparkles className="h-3.5 w-3.5 text-yellow-500" />
+                        {feedbackResult.new_phrases.length} new phrase{feedbackResult.new_phrases.length > 1 ? 's' : ''} learned:
+                      </p>
+                      <div className="space-y-1.5">
+                        {feedbackResult.new_phrases.map((p, i) => (
+                          <div key={i} className="flex items-center gap-2 text-sm">
+                            <Badge variant="outline" className="text-[10px]">
+                              {p.phrase_type === 'human' ? 'Human' :
+                               p.phrase_type === 'ivr_definitive' ? 'IVR' :
+                               p.phrase_type === 'ivr_passive' ? 'IVR Passive' : p.phrase_type}
+                            </Badge>
+                            <span className="font-mono text-xs">&quot;{p.phrase}&quot;</span>
+                            <span className="text-xs text-muted-foreground ml-auto">{Math.round(p.confidence * 100)}%</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-green-500 flex items-center gap-1.5">
+                      <ThumbsUp className="h-4 w-4" />
+                      Feedback recorded. Thank you!
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <p className="text-sm text-muted-foreground">
+                    Was the human correctly detected in this call? Your feedback helps improve future calls.
+                  </p>
+                  <div className="flex gap-3">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="gap-1.5"
+                      disabled={feedbackSubmitting}
+                      onClick={() => handleFeedback(true)}
+                    >
+                      <ThumbsUp className="h-3.5 w-3.5" />
+                      Yes, correct
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="gap-1.5 border-red-500/30 text-red-500 hover:bg-red-500/10"
+                      disabled={feedbackSubmitting}
+                      onClick={() => handleFeedback(false)}
+                    >
+                      {feedbackSubmitting ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <ThumbsDown className="h-3.5 w-3.5" />
+                      )}
+                      No, incorrect
+                    </Button>
+                  </div>
+                  {feedbackSubmitting && (
+                    <p className="text-xs text-muted-foreground flex items-center gap-1.5">
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      Analyzing transcript for new detection phrases...
+                    </p>
+                  )}
+                </div>
+              )}
+            </CardContent>
+          </Card>
         </div>
       </div>
     </motion.div>

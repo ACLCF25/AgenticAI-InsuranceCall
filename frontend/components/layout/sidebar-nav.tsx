@@ -9,6 +9,8 @@ import {
   Building2,
   BarChart3,
   Settings,
+  Users,
+  PhoneCall,
   type LucideIcon,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -26,6 +28,8 @@ const adminNavItems: NavItem[] = [
   { href: '/insurance', label: 'Insurance', icon: Building2 },
   { href: '/analytics', label: 'Analytics', icon: BarChart3 },
   { href: '/settings', label: 'Settings', icon: Settings },
+  { href: '/settings/users', label: 'Users', icon: Users },
+  { href: '/settings/phone-numbers', label: 'Phone Lines', icon: PhoneCall },
 ]
 
 const userNavItems: NavItem[] = [
