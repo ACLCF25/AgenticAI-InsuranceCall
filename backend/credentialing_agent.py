@@ -10,7 +10,7 @@ import json
 import asyncio
 import concurrent.futures
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Literal, TypedDict, Annotated, Any
 from enum import Enum
 from urllib.parse import urlencode
@@ -1573,7 +1573,7 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
         self.db.log_call_event(
             state['call_id'],
             'on_hold',
-            {'timestamp': datetime.now().isoformat()}
+            {'timestamp': datetime.now(timezone.utc).isoformat()}
         )
         
         return state

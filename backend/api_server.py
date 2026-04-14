@@ -5,6 +5,7 @@ Handles Twilio webhooks and real-time audio streaming
 
 import os
 import re
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 # Load environment variables BEFORE any other imports that use them
@@ -13,7 +14,6 @@ load_dotenv()
 import asyncio
 import json
 import uuid
-from datetime import datetime
 from typing import Dict, Optional
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
@@ -287,6 +287,32 @@ def _is_public_url(url: str) -> bool:
     return not re.match(r"^https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)(:?|/)", (url or "").lower())
 
 
+def utcnow() -> datetime:
+    """Return the current UTC time as a timezone-aware datetime."""
+    return datetime.now(timezone.utc)
+
+
+def utcnow_iso() -> str:
+    """Return the current UTC time as an ISO 8601 string with timezone info."""
+    return utcnow().isoformat()
+
+
+def serialize_timestamp(value: Optional[datetime]) -> Optional[str]:
+    """
+    Serialize timestamps for API responses.
+
+    Existing database columns may still be naive; treat those values as UTC so
+    browser-local rendering stays correct across viewer timezones.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return value.isoformat()
+
+
 def get_callback_base(req) -> str:
     """
     Prefer CALLBACK_URL (minus /webhook/voice suffix) if set and usable; otherwise derive from request host.
@@ -326,7 +352,7 @@ def build_conference_twiml(conference_name: str, recording_callback_url: str, en
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<Response>'
         '<Dial>'
-        f'<Conference waitUrl="" startConferenceOnEnter="true" endConferenceOnExit="{end_on_exit_value}" '
+        f'<Conference startConferenceOnEnter="true" endConferenceOnExit="{end_on_exit_value}" '
         'record="record-from-start" '
         f'recordingStatusCallback="{escaped_callback_url}" '
         'recordingStatusCallbackMethod="POST" '
@@ -504,14 +530,13 @@ def speak_with_tts(response, text: str, gather=None):
         logger.warning(f"Falling back to Polly TTS for: {text[:50]}...")
 
 
-def _ai_classify_speech(speech_text: str, context: str = ''):
-    """
-    Use gpt-4o-mini to classify a speech chunk during the wait-for-human phase.
-    Returns {"type": "human_speech|ivr_menu|hold_music|silence", "confidence": float, "reasoning": str}
-    or None if the AI call fails.
-    Only called for agent-mode calls — not on every webhook to control cost/latency.
-    """
-    try:
+_classify_chain = None
+
+
+def _get_classify_chain():
+    """Lazy singleton for the speech classification LLM chain."""
+    global _classify_chain
+    if _classify_chain is None:
         from langchain_openai import ChatOpenAI
         from langchain_core.prompts import ChatPromptTemplate
         from langchain_core.output_parsers import JsonOutputParser
@@ -535,7 +560,19 @@ Key signals for hold_music: "all representatives are busy", "estimated wait time
 Return ONLY valid JSON: {{"type": "...", "confidence": 0.0-1.0, "reasoning": "one sentence"}}"""),
             ("user", "Context: {context}\n\nSpeech: {speech}")
         ])
-        chain = prompt | llm | JsonOutputParser()
+        _classify_chain = prompt | llm | JsonOutputParser()
+    return _classify_chain
+
+
+def _ai_classify_speech(speech_text: str, context: str = ''):
+    """
+    Use gpt-4o-mini to classify a speech chunk during the wait-for-human phase.
+    Returns {"type": "human_speech|ivr_menu|hold_music|silence", "confidence": float, "reasoning": str}
+    or None if the AI call fails.
+    Only called for agent-mode calls — not on every webhook to control cost/latency.
+    """
+    try:
+        chain = _get_classify_chain()
         return chain.invoke({"context": context, "speech": speech_text})
     except Exception as e:
         logger.warning(f"[ai_classify_speech] AI classification failed: {e}")
@@ -1309,6 +1346,7 @@ def _bridge_to_agent(call_info, callback_base):
             to=agent_phone_number,
             from_=from_number,
             twiml=agent_conference_twiml,
+            timeout=30,
         )
         call_state_obj['conference_sid'] = agent_call.sid
         call_state_obj['call_state'] = CallState.SPEAKING_WITH_HUMAN
@@ -1812,7 +1850,7 @@ def ivr_navigate_webhook():
                     # All IVR levels done - enter silent listening mode
                     print(f"✅ IVR navigation complete - entering silent listening mode")
                     state['call_state'] = CallState.WAITING_FOR_HUMAN
-                    state['wait_start_time'] = datetime.now().isoformat()
+                    state['wait_start_time'] = utcnow_iso()
 
                     # Listen silently for human speech (no Say/Play first)
                     gather = Gather(
@@ -1820,7 +1858,7 @@ def ivr_navigate_webhook():
                         action=f'{callback_base}/webhook/wait-for-human',
                         method='POST',
                         speech_timeout='2',
-                        timeout=30,
+                        timeout=15,
                         language='en-US'
                     )
                     response.append(gather)
@@ -2057,7 +2095,7 @@ def wait_for_human_webhook():
                 action=f'{callback_base}/webhook/wait-for-human',
                 method='POST',
                 speech_timeout='2',
-                timeout=30,
+                timeout=15,
                 language='en-US'
             )
             response.append(gather)
@@ -2068,12 +2106,12 @@ def wait_for_human_webhook():
         # Track total wait time (needed by both AI classification and keyword logic)
         if 'wait_start_time' not in state:
             from datetime import datetime
-            state['wait_start_time'] = datetime.now().isoformat()
+            state['wait_start_time'] = utcnow_iso()
 
         # Calculate how long we've been waiting
         from datetime import datetime
         wait_start = datetime.fromisoformat(state['wait_start_time'])
-        wait_duration_minutes = (datetime.now() - wait_start).total_seconds() / 60
+        wait_duration_minutes = (utcnow() - wait_start).total_seconds() / 60
 
         # ── AI-assisted classification (agent mode only) ──────────────────────────
         # Uses gpt-4o-mini to classify each speech chunk as human/IVR/hold/silence.
@@ -2104,7 +2142,7 @@ def wait_for_human_webhook():
                         action=f'{callback_base}/webhook/wait-for-human',
                         method='POST',
                         speech_timeout='2',
-                        timeout=30,
+                        timeout=15,
                         language='en-US'
                     )
                     response.append(gather)
@@ -2207,7 +2245,7 @@ def wait_for_human_webhook():
                     action=f'{callback_base}/webhook/wait-for-human',
                     method='POST',
                     speech_timeout='2',
-                    timeout=30,
+                    timeout=15,
                     language='en-US'
                 )
                 response.append(gather)
@@ -2259,7 +2297,7 @@ def wait_for_human_webhook():
                 action=f'{callback_base}/webhook/wait-for-human',
                 method='POST',
                 speech_timeout='2',
-                timeout=30,
+                timeout=15,
                 language='en-US'
             )
             response.append(gather)
@@ -2310,7 +2348,7 @@ def speech_webhook():
                 state['transcript'].append({
                     'speaker': 'insurance',
                     'text': speech_result,
-                    'timestamp': datetime.now().isoformat()
+                    'timestamp': utcnow_iso()
                 })
                 break
 
@@ -2394,7 +2432,7 @@ def speech_webhook():
             state['transcript'].append({
                 'speaker': 'agent',
                 'text': ai_response.get('response', ''),
-                'timestamp': datetime.now().isoformat()
+                'timestamp': utcnow_iso()
             })
 
             # Store any extracted info
@@ -2550,7 +2588,7 @@ def speech_followup_webhook():
                 state['transcript'].append({
                     'speaker': 'insurance',
                     'text': speech_result,
-                    'timestamp': datetime.now().isoformat()
+                    'timestamp': utcnow_iso()
                 })
                 break
 
@@ -2631,7 +2669,7 @@ def speech_followup_webhook():
             state['transcript'].append({
                 'speaker': 'agent',
                 'text': ai_response.get('response', ''),
-                'timestamp': datetime.now().isoformat()
+                'timestamp': utcnow_iso()
             })
 
             # Store any extracted info
@@ -2864,7 +2902,7 @@ def transcription_webhook():
             # Add to transcript
             state['transcript'].append({
                 'text': transcript,
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': utcnow_iso(),
                 'confidence': confidence
             })
             print(f"📡 DEEPGRAM [{confidence:.2f}]: \"{transcript}\"")
@@ -3039,7 +3077,7 @@ def get_call_recording(call_id: str):
                 'format': recording['recording_format'],
                 'status': recording['recording_status'],
                 'recording_type': recording.get('recording_type', 'ai'),
-                'created_at': recording['created_at'].isoformat() if recording['created_at'] else None,
+                'created_at': serialize_timestamp(recording['created_at']),
             }
         }), 200
 
@@ -3326,9 +3364,9 @@ def get_call_detail(call_id: str):
             'missing_documents': row[10] or [],
             'turnaround_days': row[11],
             'notes': row[12],
-            'created_at': row[13].isoformat() if row[13] else None,
-            'updated_at': row[14].isoformat() if row[14] else None,
-            'completed_at': row[15].isoformat() if row[15] else None,
+            'created_at': serialize_timestamp(row[13]),
+            'updated_at': serialize_timestamp(row[14]),
+            'completed_at': serialize_timestamp(row[15]),
             'call_mode': row[16] or 'ai',
             'agent_phone': row[17],
             'initiated_by': row[18],
@@ -3348,7 +3386,7 @@ def get_call_detail(call_id: str):
                 conversations.append({
                     'speaker': r[0],
                     'message': r[1],
-                    'timestamp': r[2].isoformat() if r[2] else None,
+                    'timestamp': serialize_timestamp(r[2]),
                 })
 
         # Fetch call events
@@ -3366,7 +3404,7 @@ def get_call_detail(call_id: str):
                     'transcript': r[1],
                     'action_taken': r[2],
                     'confidence': r[3],
-                    'timestamp': r[4].isoformat() if r[4] else None,
+                    'timestamp': serialize_timestamp(r[4]),
                     'metadata': r[5] or {},
                 })
 
@@ -3438,7 +3476,7 @@ def get_call_detail(call_id: str):
                 'duration': recording.get('recording_duration'),
                 'status': recording_status,
                 'recording_type': recording.get('recording_type', 'ai'),
-                'created_at': recording['created_at'].isoformat() if recording.get('created_at') else None,
+                'created_at': serialize_timestamp(recording.get('created_at')),
             }
         elif active_call_state and row[15] is None:
             recording_data = {
@@ -3458,7 +3496,7 @@ def get_call_detail(call_id: str):
                 'question_text': qa['question_text'],
                 'answer_text': qa.get('answer_text'),
                 'confidence': qa.get('confidence', 0.0),
-                'extracted_at': qa['extracted_at'].isoformat() if qa.get('extracted_at') else None,
+                'extracted_at': serialize_timestamp(qa.get('extracted_at')),
                 'verified': qa.get('verified', False),
                 'conversation_snippet': qa.get('conversation_snippet') if isinstance(qa.get('conversation_snippet'), list) else (json.loads(qa.get('conversation_snippet')) if qa.get('conversation_snippet') else []),
             })
@@ -3900,7 +3938,7 @@ def health_check():
     """
     return jsonify({
         'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
+        'timestamp': utcnow_iso(),
         'active_calls': len(active_calls)
     }), 200
 
@@ -4008,8 +4046,8 @@ def get_recent_calls():
                     'missing_documents': row[9] or [],
                     'turnaround_days': row[10],
                     'notes': row[11],
-                    'created_at': row[12].isoformat() if row[12] else None,
-                    'completed_at': row[13].isoformat() if row[13] else None,
+                    'created_at': serialize_timestamp(row[12]),
+                    'completed_at': serialize_timestamp(row[13]),
                     'call_mode': row[14] or 'ai',
                     'agent_phone': row[15],
                     'initiated_by': row[16],
@@ -4138,7 +4176,7 @@ def get_scheduled_followups():
                 followups.append({
                     'id': str(row[0]),
                     'request_id': str(row[1]),
-                    'scheduled_date': row[2].isoformat() if row[2] else None,
+                    'scheduled_date': serialize_timestamp(row[2]),
                     'action_type': row[3],
                     'status': row[4] if len(row) > 4 else 'pending',
                     'insurance_name': row[-2],
@@ -5002,6 +5040,7 @@ def transfer_to_agent():
                 to=agent_phone,
                 from_=from_number,
                 twiml=agent_leg_twiml,
+                timeout=30,
             )
         except Exception as dial_err:
             logger.error(f"[transfer-to-agent] Failed to dial agent {agent_phone}: {dial_err}")
@@ -5029,28 +5068,31 @@ def transfer_to_agent():
         call_state['agent_phone'] = agent_phone
         call_state['conference_sid'] = conference_sid  # Note: this is agent call SID, not a Twilio Conference SID
 
-        # Persist the transfer in the DB
-        try:
-            from credentialing_agent import DatabaseManager
-            db = DatabaseManager()
-            request_id = call_state.get('db_request_id')
-            if request_id:
-                with db.conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        UPDATE credentialing_requests
-                        SET call_mode = 'agent',
-                            agent_phone = %s,
-                            conference_sid = %s,
-                            updated_at = NOW()
-                        WHERE id = %s
-                        """,
-                        (agent_phone, conference_sid, request_id)
-                    )
-                    db.conn.commit()
-            db.close()
-        except Exception as db_err:
-            logger.warning(f"[transfer-to-agent] Could not persist transfer to DB: {db_err}")
+        # Persist the transfer in the DB (background thread — non-blocking)
+        def _persist_transfer():
+            try:
+                from credentialing_agent import DatabaseManager
+                db = DatabaseManager()
+                request_id = call_state.get('db_request_id')
+                if request_id:
+                    with db.conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE credentialing_requests
+                            SET call_mode = 'agent',
+                                agent_phone = %s,
+                                conference_sid = %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (agent_phone, conference_sid, request_id)
+                        )
+                        db.conn.commit()
+                db.close()
+            except Exception as db_err:
+                logger.warning(f"[transfer-to-agent] Could not persist transfer to DB: {db_err}")
+
+        threading.Thread(target=_persist_transfer, daemon=True).start()
 
         return jsonify({
             'success': True,

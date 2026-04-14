@@ -37,10 +37,16 @@ export function ProtectedRoute({ children }: ProtectedRouteProps) {
   }, [user, isLoading, router, pathname])
 
   const spinner = (
-    <div className="flex h-screen items-center justify-center bg-background">
-      <div className="flex flex-col items-center gap-3">
-        <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />
-        <p className="text-sm text-muted-foreground">Loading...</p>
+    <div
+      className="flex h-screen items-center justify-center bg-background"
+      suppressHydrationWarning
+    >
+      <div className="flex flex-col items-center gap-3" suppressHydrationWarning>
+        <div
+          className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent"
+          suppressHydrationWarning
+        />
+        <p className="text-sm text-muted-foreground" suppressHydrationWarning>Loading...</p>
       </div>
     </div>
   )

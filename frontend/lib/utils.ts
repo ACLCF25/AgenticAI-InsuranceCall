@@ -3,18 +3,35 @@
 
 import { type ClassValue, clsx } from "clsx"
 import { twMerge } from "tailwind-merge"
-import { format, formatDistanceToNow } from 'date-fns';
+import { formatDistanceToNow } from 'date-fns';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
+function parseDateValue(date: string | Date): Date | null {
+  const parsed = date instanceof Date ? date : new Date(date)
+  return Number.isNaN(parsed.getTime()) ? null : parsed
+}
+
 export function formatDate(date: string | Date): string {
-  return format(new Date(date), 'MMM d, yyyy HH:mm');
+  const parsed = parseDateValue(date)
+  if (!parsed) return ''
+
+  return new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(parsed)
 }
 
 export function formatRelativeTime(date: string | Date): string {
-  return formatDistanceToNow(new Date(date), { addSuffix: true });
+  const parsed = parseDateValue(date)
+  if (!parsed) return ''
+
+  return formatDistanceToNow(parsed, { addSuffix: true });
 }
 
 export function formatDuration(seconds: number): string {

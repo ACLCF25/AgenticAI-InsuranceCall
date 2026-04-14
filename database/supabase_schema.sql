@@ -26,9 +26,9 @@ CREATE TABLE credentialing_requests (
     call_mode VARCHAR(10) DEFAULT 'ai' CHECK (call_mode IN ('ai', 'agent')),
     agent_phone VARCHAR(20),
     conference_sid VARCHAR(100),
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW(),
-    completed_at TIMESTAMP,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
     INDEX idx_status (status),
     INDEX idx_insurance_name (insurance_name),
     INDEX idx_created_at (created_at)
@@ -62,7 +62,7 @@ CREATE TABLE call_events (
     transcript TEXT,
     action_taken VARCHAR(50),
     confidence FLOAT,
-    timestamp TIMESTAMP DEFAULT NOW(),
+    timestamp TIMESTAMPTZ DEFAULT NOW(),
     metadata JSONB DEFAULT '{}'::jsonb,
     INDEX idx_call_id (call_id),
     INDEX idx_event_type (event_type),
@@ -76,7 +76,7 @@ CREATE TABLE conversation_history (
     request_id UUID REFERENCES credentialing_requests(id),
     speaker VARCHAR(20) NOT NULL, -- 'agent', 'representative', 'ivr'
     message TEXT NOT NULL,
-    timestamp TIMESTAMP DEFAULT NOW(),
+    timestamp TIMESTAMPTZ DEFAULT NOW(),
     metadata JSONB DEFAULT '{}'::jsonb,
     INDEX idx_call_id (call_id),
     INDEX idx_request_id (request_id),
@@ -425,9 +425,9 @@ CREATE TABLE call_recordings (
     recording_type VARCHAR(20) DEFAULT 'ai',  -- 'ai', 'agent', or 'both'
     downloaded BOOLEAN DEFAULT FALSE,  -- If stored locally/S3
     local_path TEXT,  -- Optional: local/S3 storage path
-    retention_until TIMESTAMP,  -- For automatic cleanup
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+    retention_until TIMESTAMPTZ,  -- For automatic cleanup
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Create indexes for call_recordings
@@ -445,7 +445,7 @@ CREATE TABLE call_qa_pairs (
     question_text TEXT NOT NULL,
     answer_text TEXT,
     confidence FLOAT DEFAULT 0.0,  -- Confidence in extraction (0.0-1.0)
-    extracted_at TIMESTAMP DEFAULT NOW(),
+    extracted_at TIMESTAMPTZ DEFAULT NOW(),
     extraction_method VARCHAR(50) DEFAULT 'gpt4',  -- 'gpt4', 'manual', 'rule-based'
     conversation_snippet JSONB,  -- Related conversation context
     verified BOOLEAN DEFAULT FALSE,  -- Manual verification flag

@@ -1,7 +1,7 @@
 'use client'
 
 import { useState } from 'react'
-import { useQuery, useMutation } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useRouter } from 'next/navigation'
 import { Phone, Loader2, UserCheck, Bot, User } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -24,8 +24,9 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { LocalDateTime } from '@/components/ui/local-date-time'
 import { api } from '@/lib/api'
-import { getCallStateColor, formatStatus, formatRelativeTime } from '@/lib/utils'
+import { getCallStateColor, formatStatus } from '@/lib/utils'
 import { toast } from 'sonner'
 
 interface TakeOverDialogState {
@@ -36,6 +37,7 @@ interface TakeOverDialogState {
 
 export function ActiveCallsTable() {
   const router = useRouter()
+  const queryClient = useQueryClient()
   const [takeOverDialog, setTakeOverDialog] = useState<TakeOverDialogState>({
     open: false,
     callId: '',
@@ -65,6 +67,10 @@ export function ActiveCallsTable() {
       toast.success('Agent connected', {
         description: `Call transferred to ${variables.agentPhone}`,
       })
+      queryClient.invalidateQueries({ queryKey: ['active-calls'] })
+      queryClient.invalidateQueries({ queryKey: ['call-detail', variables.callId] })
+      queryClient.invalidateQueries({ queryKey: ['recent-calls'] })
+      queryClient.invalidateQueries({ queryKey: ['metrics'] })
     },
     onError: (error: any) => {
       toast.error('Transfer failed', {
@@ -156,7 +162,7 @@ export function ActiveCallsTable() {
                         )}
                       </TableCell>
                       <TableCell className="text-muted-foreground text-xs">
-                        {call.created_at ? formatRelativeTime(call.created_at) : 'Just now'}
+                        <LocalDateTime value={call.created_at} fallback="Just now" />
                       </TableCell>
                       <TableCell className="text-right">
                         {isAiMode && !isAgentConnected && call.id && (

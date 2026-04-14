@@ -9,8 +9,17 @@ import { AuthProvider } from '@/lib/auth-context'
 if (typeof window !== 'undefined') {
   const originalError = console.error
   console.error = (...args: unknown[]) => {
-    const message = args[0]
-    if (typeof message === 'string' && message.includes('Accessing element.ref')) {
+    const message = args.find((arg) => typeof arg === 'string') as string | undefined
+    const joined = args
+      .filter((arg) => typeof arg === 'string')
+      .join(' ')
+
+    if (message?.includes('Accessing element.ref')) {
+      return
+    }
+
+    // Ignore extension-injected hydration noise (for example, bis_skin_checked).
+    if (joined.includes('bis_skin_checked')) {
       return
     }
     originalError.apply(console, args)

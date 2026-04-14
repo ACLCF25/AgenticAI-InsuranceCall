@@ -15,8 +15,9 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { LocalDateTime } from '@/components/ui/local-date-time'
 import { api } from '@/lib/api'
-import { getStatusColor, formatDate, formatPhoneNumber } from '@/lib/utils'
+import { getStatusColor, formatPhoneNumber } from '@/lib/utils'
 
 interface RecentCallsTableProps {
   showAll?: boolean
@@ -99,7 +100,7 @@ export function RecentCallsTable({ showAll = false }: RecentCallsTableProps) {
                     {call.reference_number || '-'}
                   </TableCell>
                   <TableCell className="text-muted-foreground text-sm">
-                    {call.created_at ? formatDate(call.created_at) : '-'}
+                    <LocalDateTime value={call.created_at} fallback="-" />
                   </TableCell>
                   <TableCell>
                     <Button variant="ghost" size="sm">
