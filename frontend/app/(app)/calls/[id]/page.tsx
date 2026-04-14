@@ -29,8 +29,9 @@ import {
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { LocalDateTime } from '@/components/ui/local-date-time'
 import { api } from '@/lib/api'
-import { getStatusColor, formatStatus, formatDate, formatPhoneNumber, formatRelativeTime } from '@/lib/utils'
+import { getStatusColor, formatStatus, formatPhoneNumber } from '@/lib/utils'
 import Link from 'next/link'
 
 function splitTranscriptParagraphs(text: string): string[] {
@@ -265,12 +266,12 @@ export default function CallDetailPage() {
               <div className="pt-2 border-t space-y-1">
                 {call.created_at && (
                   <p className="text-xs text-muted-foreground">
-                    Created: {formatDate(call.created_at)}
+                    Created: <LocalDateTime value={call.created_at} fallback="" />
                   </p>
                 )}
                 {call.completed_at && (
                   <p className="text-xs text-muted-foreground">
-                    Completed: {formatDate(call.completed_at)}
+                    Completed: <LocalDateTime value={call.completed_at} fallback="" />
                   </p>
                 )}
               </div>
@@ -480,7 +481,11 @@ export default function CallDetailPage() {
                           <span className="text-xs text-muted-foreground font-mono">{evt.action_taken}</span>
                         )}
                         {evt.timestamp && (
-                          <span className="text-[10px] text-muted-foreground ml-auto">{formatRelativeTime(evt.timestamp)}</span>
+                          <LocalDateTime
+                            value={evt.timestamp}
+                            fallback=""
+                            className="text-[10px] text-muted-foreground ml-auto"
+                          />
                         )}
                       </div>
                       {evt.transcript && (
@@ -554,9 +559,11 @@ export default function CallDetailPage() {
                                     : 'Representative'}
                             </span>
                             {msg.timestamp && (
-                              <span className="text-xs opacity-60">
-                                {formatRelativeTime(msg.timestamp)}
-                              </span>
+                              <LocalDateTime
+                                value={msg.timestamp}
+                                fallback=""
+                                className="text-xs opacity-60"
+                              />
                             )}
                             {isAgentTranscript && (
                               <Badge variant="outline" className="text-xs h-5">

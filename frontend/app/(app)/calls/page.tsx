@@ -16,8 +16,9 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { LocalDateTime } from '@/components/ui/local-date-time'
 import { api } from '@/lib/api'
-import { formatStatus, getStatusColor, formatRelativeTime, formatPhoneNumber } from '@/lib/utils'
+import { formatStatus, getStatusColor, formatPhoneNumber } from '@/lib/utils'
 import { useState } from 'react'
 import { useAuth } from '@/lib/auth-context'
 
@@ -99,7 +100,7 @@ export default function CallsPage() {
                       </Badge>
                     </TableCell>
                     <TableCell className="text-muted-foreground text-xs">
-                      {call.created_at ? formatRelativeTime(call.created_at) : '-'}
+                      <LocalDateTime value={call.created_at} fallback="-" />
                     </TableCell>
                     <TableCell>
                       <ExternalLink className="h-3.5 w-3.5 text-muted-foreground" />

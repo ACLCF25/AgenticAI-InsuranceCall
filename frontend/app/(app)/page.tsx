@@ -13,7 +13,8 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
-import { formatRelativeTime, formatStatus, getStatusColor } from '@/lib/utils'
+import { LocalDateTime } from '@/components/ui/local-date-time'
+import { formatStatus, getStatusColor } from '@/lib/utils'
 
 export default function DashboardPage() {
   const router = useRouter()
@@ -109,9 +110,11 @@ export default function DashboardPage() {
                     <Badge className={getStatusColor(call.status || 'initiated')}>
                       {formatStatus(call.status || 'initiated')}
                     </Badge>
-                    <span className="hidden text-xs text-muted-foreground sm:inline">
-                      {call.created_at ? formatRelativeTime(call.created_at) : '-'}
-                    </span>
+                    <LocalDateTime
+                      value={call.created_at}
+                      fallback="-"
+                      className="hidden text-xs text-muted-foreground sm:inline"
+                    />
                   </div>
                 </div>
               ))}
