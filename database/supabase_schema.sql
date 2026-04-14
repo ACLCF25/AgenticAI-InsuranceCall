@@ -46,8 +46,8 @@ CREATE TABLE ivr_knowledge (
     attempts INTEGER DEFAULT 0,
     successes INTEGER DEFAULT 0,
     success_rate FLOAT DEFAULT 0.0,
-    last_success TIMESTAMP,
-    last_updated TIMESTAMP DEFAULT NOW(),
+    last_success TIMESTAMPTZ,
+    last_updated TIMESTAMPTZ DEFAULT NOW(),
     metadata JSONB DEFAULT '{}'::jsonb,
     INDEX idx_insurance_menu (insurance_name, menu_level),
     INDEX idx_success_rate (success_rate DESC),
@@ -87,11 +87,11 @@ CREATE TABLE conversation_history (
 CREATE TABLE scheduled_followups (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     request_id UUID REFERENCES credentialing_requests(id),
-    scheduled_date TIMESTAMP NOT NULL,
+    scheduled_date TIMESTAMPTZ NOT NULL,
     action_type VARCHAR(50) NOT NULL, -- 'retry_call', 'follow_up_call', 'submit_documents_then_call'
     status VARCHAR(20) DEFAULT 'pending', -- 'pending', 'completed', 'failed'
-    created_at TIMESTAMP DEFAULT NOW(),
-    executed_at TIMESTAMP,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    executed_at TIMESTAMPTZ,
     INDEX idx_scheduled_date (scheduled_date),
     INDEX idx_status (status),
     INDEX idx_request_id (request_id)
@@ -109,7 +109,7 @@ CREATE TABLE call_metrics (
     successful BOOLEAN,
     failure_reason TEXT,
     retry_count INTEGER DEFAULT 0,
-    created_at TIMESTAMP DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
     INDEX idx_call_id (call_id),
     INDEX idx_successful (successful),
     INDEX idx_created_at (created_at DESC)
@@ -138,7 +138,7 @@ CREATE TABLE insurance_providers (
         CHECK (ivr_npi_suffix IS NULL OR ivr_npi_suffix IN ('*', '#')),
     CONSTRAINT chk_ivr_tax_id_suffix
         CHECK (ivr_tax_id_suffix IS NULL OR ivr_tax_id_suffix IN ('*', '#')),
-    last_updated TIMESTAMP DEFAULT NOW(),
+    last_updated TIMESTAMPTZ DEFAULT NOW(),
     INDEX idx_insurance_name (insurance_name)
 );
 
@@ -156,7 +156,7 @@ CREATE TABLE system_config (
     config_key VARCHAR(100) NOT NULL UNIQUE,
     config_value JSONB NOT NULL,
     description TEXT,
-    last_updated TIMESTAMP DEFAULT NOW()
+    last_updated TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Audit Log Table for Compliance
@@ -168,7 +168,7 @@ CREATE TABLE audit_log (
     resource_id VARCHAR(100),
     details JSONB,
     ip_address INET,
-    timestamp TIMESTAMP DEFAULT NOW(),
+    timestamp TIMESTAMPTZ DEFAULT NOW(),
     INDEX idx_user_id (user_id),
     INDEX idx_action (action),
     INDEX idx_timestamp (timestamp DESC)
@@ -246,7 +246,7 @@ CREATE TABLE call_knowledge (
     chunk_index INTEGER DEFAULT 0,
     parent_id UUID REFERENCES call_knowledge(id),
     total_chunks INTEGER DEFAULT 1,
-    created_at TIMESTAMP DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Migration: Add chunking columns if table already exists
@@ -319,9 +319,9 @@ CREATE TABLE user_profiles (
     role user_role NOT NULL DEFAULT 'agent',
     approval_status approval_status NOT NULL DEFAULT 'pending',
     approved_by UUID REFERENCES auth.users(id) ON DELETE SET NULL,
-    approved_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+    approved_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX idx_user_profiles_role ON user_profiles(role);
@@ -362,8 +362,8 @@ CREATE TABLE users (
     password_hash VARCHAR(255) NOT NULL,
     role user_role NOT NULL DEFAULT 'agent',
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMP DEFAULT NOW(),
-    last_login TIMESTAMP
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    last_login TIMESTAMPTZ
 );
 
 CREATE INDEX idx_users_username ON users(username);
@@ -373,8 +373,8 @@ CREATE INDEX idx_users_email ON users(email);
 CREATE TABLE token_blacklist (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     jti VARCHAR(36) NOT NULL UNIQUE,
-    expires_at TIMESTAMP NOT NULL,
-    created_at TIMESTAMP DEFAULT NOW()
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX idx_token_blacklist_jti ON token_blacklist(jti);
@@ -394,10 +394,10 @@ CREATE TABLE twilio_numbers (
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     current_call_id VARCHAR(100),
     current_call_sid VARCHAR(100),
-    in_use_since TIMESTAMP,
+    in_use_since TIMESTAMPTZ,
     added_by UUID REFERENCES users(id) ON DELETE SET NULL,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX idx_twilio_numbers_available ON twilio_numbers(is_active, current_call_id);
@@ -505,8 +505,8 @@ CREATE TABLE human_detection_phrases (
     times_correct INTEGER DEFAULT 1,
     is_active BOOLEAN DEFAULT TRUE,
     source_call_id VARCHAR(100),
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE UNIQUE INDEX idx_hdp_unique_phrase
@@ -518,4 +518,4 @@ GRANT ALL ON human_detection_phrases TO authenticated;
 
 -- Migration: Add human detection feedback columns to credentialing_requests
 -- ALTER TABLE credentialing_requests ADD COLUMN IF NOT EXISTS human_detection_correct BOOLEAN;
--- ALTER TABLE credentialing_requests ADD COLUMN IF NOT EXISTS human_detection_feedback_at TIMESTAMP;
+-- ALTER TABLE credentialing_requests ADD COLUMN IF NOT EXISTS human_detection_feedback_at TIMESTAMPTZ;
