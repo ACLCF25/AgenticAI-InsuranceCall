@@ -106,13 +106,13 @@ _llm_kb_summarizer = ChatOpenAI(
 _kb_summary_prompt = ChatPromptTemplate.from_messages([
     ("system", """Summarize the credentialing phone call for future reuse.
 Return JSON:
-{
+{{
   "summary": "2-4 bullet summary (concise)",
   "qa": [
-    {"q": "...", "a": "..."},
+    {{"q": "...", "a": "..."}},
     ...
   ]
-}
+}}
 Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
     ("user", "Conversation:\n{conversation}")
 ])
