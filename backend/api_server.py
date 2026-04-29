@@ -110,6 +110,20 @@ call_states_by_sid: Dict[str, CredentialingState] = {}
 call_state_lock = threading.Lock()
 audio_queues: Dict[str, Queue] = {}
 
+# ── Per-call log buffering ──────────────────────────────────────────────────
+import re as _re
+import logging as _logging
+
+call_log_buffers: Dict[str, list] = {}
+_call_log_buffers_lock = threading.Lock()
+_log_tl = threading.local()  # thread-local: .call_id set per webhook/ws handler
+
+_RE_CALL_ID  = _re.compile(
+    r'call_id[=:\s]+([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})',
+    _re.I,
+)
+_RE_CALL_SID = _re.compile(r'\b(CA[a-f0-9]{32})\b', _re.I)
+
 
 def _is_admin_like(user: Optional[dict]) -> bool:
     return bool(user and user.get("role") in {"admin", "super_admin"})
@@ -300,6 +314,115 @@ try:
     _seed_twilio_numbers()
 except Exception as e:
     logger.warning(f"Twilio number seeding skipped: {e}")
+
+# =============================================================================
+# Call-log sink (Loguru + stdlib bridge)
+# =============================================================================
+
+class CallLogSink:
+    """Loguru sink that routes records into per-call in-memory buffers."""
+
+    def __call__(self, message):
+        record = message.record
+        text   = record["message"]
+
+        call_id = getattr(_log_tl, "call_id", None)
+
+        if not call_id:
+            m = _RE_CALL_ID.search(text)
+            if m:
+                call_id = m.group(1)
+
+        if not call_id:
+            m = _RE_CALL_SID.search(text)
+            if m:
+                with call_state_lock:
+                    state = call_states_by_sid.get(m.group(1))
+                    if state:
+                        call_id = state.get("call_id")
+
+        if not call_id:
+            return
+
+        entry = {
+            "call_id":       call_id,
+            "logged_at":     record["time"].isoformat(),
+            "level":         record["level"].name,
+            "logger_name":   record["name"],
+            "function_name": record["function"],
+            "line_number":   record["line"],
+            "message":       text,
+        }
+        with _call_log_buffers_lock:
+            call_log_buffers.setdefault(call_id, []).append(entry)
+
+
+class _StdLogBridge(_logging.Handler):
+    """Bridges Python standard-library log records (deepgram_streaming) into call buffers."""
+
+    def emit(self, record):
+        msg     = record.getMessage()
+        call_id = getattr(_log_tl, "call_id", None)
+
+        if not call_id:
+            m = _RE_CALL_SID.search(msg)
+            if m:
+                with call_state_lock:
+                    state = call_states_by_sid.get(m.group(1))
+                    if state:
+                        call_id = state.get("call_id")
+
+        if not call_id:
+            return
+
+        entry = {
+            "call_id":       call_id,
+            "logged_at":     datetime.utcnow().isoformat() + "Z",
+            "level":         record.levelname,
+            "logger_name":   record.name,
+            "function_name": record.funcName,
+            "line_number":   record.lineno,
+            "message":       msg,
+        }
+        with _call_log_buffers_lock:
+            call_log_buffers.setdefault(call_id, []).append(entry)
+
+
+def _set_log_context(call_id: str) -> None:
+    _log_tl.call_id = call_id
+
+
+def _clear_log_context() -> None:
+    _log_tl.call_id = None
+
+
+def _flush_call_logs(call_id: str, call_sid: str = None) -> None:
+    """Pop this call's buffer and batch-insert into Supabase call_logs table."""
+    with _call_log_buffers_lock:
+        entries = call_log_buffers.pop(call_id, [])
+    if not entries:
+        return
+    if call_sid:
+        for e in entries:
+            e.setdefault("call_sid", call_sid)
+    try:
+        from credentialing_agent import DatabaseManager
+        db = DatabaseManager()
+        db.save_call_logs(entries)
+        db.close()
+        logger.info(f"Saved {len(entries)} call log entries for call_id={call_id}")
+    except Exception as exc:
+        logger.error(f"Failed to save call logs for call_id={call_id}: {exc}")
+
+
+# Register Loguru sink
+logger.add(CallLogSink(), level="DEBUG", format="{message}")
+
+# Bridge deepgram_streaming's standard-library logger
+_dg_bridge = _StdLogBridge()
+_logging.getLogger("deepgram_streaming").addHandler(_dg_bridge)
+_logging.getLogger("deepgram_streaming").propagate = False
+
 
 # =============================================================================
 # Helper utilities
@@ -650,6 +773,8 @@ def deepgram_process_webhook():
             call_id = cid
             break
 
+    _set_log_context(call_id)
+
     ws_url = _ws_url_from_request()
     stream_block = (
         f'<Connect><Stream url="{ws_url}">'
@@ -716,6 +841,8 @@ if sock is not None:
                     logger.info(f"🎙️ Stream started — StreamSID={stream_sid}, CallSID={call_sid}, "
                                 f"call_id={stream_call_id}")
 
+                    _set_log_context(stream_call_id)
+
                     media_streams[socket_sid] = {
                         'stream_sid': stream_sid,
                         'call_sid': call_sid,
@@ -755,7 +882,12 @@ if sock is not None:
         finally:
             if ENABLE_DEEPGRAM_STREAMING and deepgram_streaming.is_available():
                 deepgram_streaming.close_session(socket_sid)
-            media_streams.pop(socket_sid, None)
+            _ws_stream_info = media_streams.pop(socket_sid, None)
+            if _ws_stream_info:
+                _ws_flush_call_id = _ws_stream_info.get('call_id')
+                _ws_flush_call_sid = _ws_stream_info.get('call_sid')
+                if _ws_flush_call_id:
+                    _flush_call_logs(_ws_flush_call_id, _ws_flush_call_sid)
             logger.info(f"🔌 Twilio WebSocket closed sid={socket_sid}")
 
 
@@ -1634,6 +1766,9 @@ def voice_webhook():
             }
             call_info = {'call_id': call_sid or 'unknown', 'state': fallback_state}
 
+        if call_info:
+            _set_log_context(call_info['call_id'])
+
         # Check if insurance has IVR patterns configured
         ivr_patterns = []
         insurance_name = None
@@ -1761,6 +1896,9 @@ def voice_human_webhook():
                 state['call_state'] = CallState.SPEAKING_WITH_HUMAN
                 break
 
+        if call_info:
+            _set_log_context(call_info['call_id'])
+
         # If call_mode is 'agent', bridge to the real human agent instead of AI
         if call_info and call_info['state'].get('call_mode') == 'agent':
             print(f"🔀 Real Human Agent mode - redirecting to bridge-agent from voice/human webhook")
@@ -1821,6 +1959,9 @@ def bridge_agent_webhook():
                 call_info = {'call_id': call_id, 'state': state}
                 break
 
+        if call_info:
+            _set_log_context(call_info['call_id'])
+
         if not call_info:
             logger.error(f"[bridge_agent_webhook] No call state found for CallSID={call_sid}")
             error_twiml = (
@@ -1873,6 +2014,7 @@ def ivr_navigate_webhook():
                 break
 
         if call_info:
+            _set_log_context(call_info['call_id'])
             state = call_info['state']
             ivr_patterns = state.get('ivr_knowledge', [])
             current_level = state.get('current_menu_level', 0)
@@ -2242,6 +2384,9 @@ def wait_for_human_webhook():
                 call_info = {'call_id': call_id, 'state': state}
                 break
 
+        if call_info:
+            _set_log_context(call_info['call_id'])
+
         if not call_info:
             # No state found - proceed to human mode
             print(f"⚠️ No call state found - proceeding to human mode")
@@ -2588,6 +2733,9 @@ def speech_webhook():
                 })
                 break
 
+        if call_info:
+            _set_log_context(call_info['call_id'])
+
         # Use GPT-4 to generate intelligent response
         if call_info:
             state = call_info['state']
@@ -2829,6 +2977,9 @@ def speech_followup_webhook():
                 break
 
         if call_info:
+            _set_log_context(call_info['call_id'])
+
+        if call_info:
             state = call_info['state']
 
             # Check if we're hearing IVR menu options instead of human speech
@@ -2953,6 +3104,7 @@ def speech_followup_webhook():
                     request_id=request_id,
                     state=state,
                 )
+                _flush_call_logs(call_info['call_id'], state.get('call_sid'))
 
             if action == 'end_call':
                 speak_with_tts(response, ai_response.get('response', 'Thank you very much for your help. Have a great day. Goodbye.'))
@@ -3048,6 +3200,12 @@ def speech_dead_air_webhook():
             callback_base = f"https://{request.host}"
         call_sid = request.values.get('CallSid')
 
+        # Set log context if we can resolve call_id from call_sid
+        for _cid, _st in list(call_states.items()):
+            if _st.get('call_sid') == call_sid:
+                _set_log_context(_cid)
+                break
+
         print(f"🔇 Dead air detected for call {call_sid} - asking if anything else needed")
 
         # Ask if there's anything else (this is triggered after 5 sec dead air)
@@ -3102,6 +3260,21 @@ def status_webhook():
     terminal_statuses = {'completed', 'failed', 'busy', 'no-answer', 'canceled'}
     if call_status in terminal_statuses:
         _release_twilio_number(call_sid=call_sid)
+
+    # Flush per-call log buffer on terminal statuses
+    if call_status in terminal_statuses:
+        _call_id_for_flush = None
+        with call_state_lock:
+            state_by_sid = call_states_by_sid.get(call_sid)
+            if state_by_sid:
+                _call_id_for_flush = state_by_sid.get('call_id')
+        if not _call_id_for_flush:
+            for _cid, _st in list(call_states.items()):
+                if _st.get('call_sid') == call_sid:
+                    _call_id_for_flush = _cid
+                    break
+        if _call_id_for_flush:
+            _flush_call_logs(_call_id_for_flush, call_sid)
 
     return jsonify({'success': True}), 200
 
@@ -4504,6 +4677,9 @@ def cancel_call(call_id: str):
                     pass  # Call may have already ended
 
             del active_calls[call_id]
+
+        _call_sid_for_flush = call_states.get(call_id, {}).get('call_sid') if call_id in call_states else None
+        _flush_call_logs(call_id, _call_sid_for_flush)
 
         return jsonify({
             'success': True,

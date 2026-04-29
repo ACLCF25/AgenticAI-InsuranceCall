@@ -906,6 +906,24 @@ class DatabaseManager:
             )
             return [dict(row) for row in cur.fetchall()]
 
+    def save_call_logs(self, entries: list) -> None:
+        """Batch-insert buffered call log entries into call_logs table."""
+        if not entries:
+            return
+        self._ensure_connection()
+        with self._conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO call_logs
+                    (call_id, call_sid, logged_at, level, logger_name, function_name, line_number, message)
+                VALUES
+                    (%(call_id)s, %(call_sid)s, %(logged_at)s, %(level)s,
+                     %(logger_name)s, %(function_name)s, %(line_number)s, %(message)s)
+                """,
+                [{**e, "call_sid": e.get("call_sid")} for e in entries]
+            )
+        self._conn.commit()
+
     def close(self):
         """Return database connection to the pool (does not close the TCP connection)."""
         if self._conn:
