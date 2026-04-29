@@ -136,6 +136,14 @@ _ivr_knowledge_cache: dict = {}
 _IVR_CACHE_TTL_SECONDS: int = 1800  # 30 minutes
 
 
+def invalidate_ivr_knowledge_cache(insurance_name: Optional[str] = None):
+    """Clear cached IVR knowledge after menu steps are edited."""
+    if insurance_name:
+        _ivr_knowledge_cache.pop(insurance_name.lower(), None)
+    else:
+        _ivr_knowledge_cache.clear()
+
+
 def ingest_call_knowledge(
     insurance_name: str,
     provider_name: Optional[str],

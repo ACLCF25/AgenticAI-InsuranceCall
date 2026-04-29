@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS twilio_numbers (
     current_call_id VARCHAR(100),
     current_call_sid VARCHAR(100),
     in_use_since TIMESTAMP,
-    added_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    added_by UUID REFERENCES auth.users(id) ON DELETE SET NULL,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );

@@ -676,6 +676,44 @@ def speak_with_tts(response, text: str, gather=None):
         logger.warning(f"Falling back to Polly TTS for: {text[:50]}...")
 
 
+def normalize_ivr_action(preferred_action, action_value):
+    """
+    Normalize IVR action rows before saving or executing them.
+
+    This protects existing rows that were entered with UI words in the value,
+    such as preferred_action='dtmf' and action_value='Say credentialing'.
+    """
+    action = str(preferred_action or 'dtmf').strip().lower()
+    value = '' if action_value is None else str(action_value).strip()
+
+    if action not in ('dtmf', 'speech', 'wait'):
+        action = 'dtmf'
+
+    if action == 'wait':
+        return action, None
+
+    while value:
+        original_value = value
+        if action != 'speech':
+            value = re.sub(
+                r'^(?:press|dial|enter|choose option|option)\s+',
+                '',
+                value,
+                flags=re.IGNORECASE,
+            ).strip()
+        if re.match(r'^(?:say|speak)\s+', value, flags=re.IGNORECASE):
+            action = 'speech'
+            value = re.sub(r'^(?:say|speak)\s+', '', value, flags=re.IGNORECASE).strip()
+        if value == original_value:
+            break
+
+    if action == 'dtmf' and value and re.search(r'[^0-9*#wW\s]', value):
+        logger.warning(f"IVR DTMF action has non-DTMF value; treating as speech: {value}")
+        action = 'speech'
+
+    return action, value or None
+
+
 # =============================================================================
 # Deepgram streaming — emit <Connect><Stream> instead of <Gather> when enabled,
 # and bridge final transcripts back into the existing /webhook/speech logic.
@@ -1714,6 +1752,14 @@ def _bridge_to_agent(call_info, callback_base):
         logger.info(f"[bridge_to_agent] Dialed agent {agent_phone_number} into conference {conf_name}, agent call SID={agent_call.sid}")
     except Exception as dial_err:
         logger.error(f"[bridge_to_agent] Failed to dial agent into conference: {dial_err}")
+        error_twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Response>'
+            '<Say>We are sorry, we could not connect the agent for this call. Goodbye.</Say>'
+            '<Hangup/>'
+            '</Response>'
+        )
+        return Response(error_twiml, mimetype='text/xml')
 
     return Response(conference_twiml, mimetype='text/xml')
 
@@ -1780,25 +1826,47 @@ def voice_webhook():
                     db = DatabaseManager()
                     ivr_patterns = db.get_ivr_knowledge(insurance_name)
 
-                    # Load IVR auto-response flags (NPI/Tax ID)
+                    # Load IVR auto-response flags (NPI/Tax ID).
+                    # ivr_npi_suffix / ivr_tax_id_suffix were added in a later migration
+                    # (add_ivr_suffix_columns.sql). If those columns don't exist yet we
+                    # roll back and retry without them so the core flags always load.
                     with db.conn.cursor() as cur:
-                        cur.execute("""
-                            SELECT ivr_asks_npi, ivr_npi_method, ivr_asks_tax_id, ivr_tax_id_method, ivr_tax_id_digits_to_send,
-                                   ivr_npi_suffix, ivr_tax_id_suffix
-                            FROM insurance_providers
-                            WHERE insurance_name ILIKE %s
-                            LIMIT 1
-                        """, (f"%{insurance_name}%",))
-                        provider_row = cur.fetchone()
+                        try:
+                            cur.execute("""
+                                SELECT ivr_asks_npi, ivr_npi_method, ivr_asks_tax_id, ivr_tax_id_method,
+                                       ivr_tax_id_digits_to_send, ivr_npi_suffix, ivr_tax_id_suffix
+                                FROM insurance_providers
+                                WHERE insurance_name ILIKE %s
+                                LIMIT 1
+                            """, (f"%{insurance_name}%",))
+                            provider_row = cur.fetchone()
+                            suffix_npi = (provider_row[5] or '') if provider_row else ''
+                            suffix_tax = (provider_row[6] or '') if provider_row else ''
+                        except Exception:
+                            # Suffix columns missing — run add_ivr_suffix_columns.sql migration
+                            db.conn.rollback()
+                            cur.execute("""
+                                SELECT ivr_asks_npi, ivr_npi_method, ivr_asks_tax_id, ivr_tax_id_method,
+                                       ivr_tax_id_digits_to_send
+                                FROM insurance_providers
+                                WHERE insurance_name ILIKE %s
+                                LIMIT 1
+                            """, (f"%{insurance_name}%",))
+                            provider_row = cur.fetchone()
+                            suffix_npi = ''
+                            suffix_tax = ''
+
                         if provider_row and call_info:
                             call_info['state']['ivr_asks_npi'] = provider_row[0] or False
                             call_info['state']['ivr_npi_method'] = provider_row[1] or 'speech'
                             call_info['state']['ivr_asks_tax_id'] = provider_row[2] or False
                             call_info['state']['ivr_tax_id_method'] = provider_row[3] or 'speech'
                             call_info['state']['ivr_tax_id_digits_to_send'] = provider_row[4]
-                            call_info['state']['ivr_npi_suffix'] = provider_row[5] or ''
-                            call_info['state']['ivr_tax_id_suffix'] = provider_row[6] or ''
+                            call_info['state']['ivr_npi_suffix'] = suffix_npi
+                            call_info['state']['ivr_tax_id_suffix'] = suffix_tax
                             print(f"📋 IVR flags - NPI: {provider_row[0]} ({provider_row[1]}), Tax ID: {provider_row[2]} ({provider_row[3]}), Tax Digits: {provider_row[4]}")
+                        elif not provider_row:
+                            print(f"⚠️ No insurance provider matched '{insurance_name}' — IVR auto-response flags not loaded")
 
                     db.close()
                     print(f"🎯 Found {len(ivr_patterns)} IVR patterns for {insurance_name}")
@@ -1829,6 +1897,7 @@ def voice_webhook():
                 language='en-US'
             )
             response.append(gather)
+            response.redirect(f'{callback_base}/webhook/ivr-navigate')
         else:
             # No IVR patterns - go straight to human conversation (or bridge agent)
             print(f"📞 Direct Human Mode - No IVR patterns configured")
@@ -2159,27 +2228,33 @@ def ivr_navigate_webhook():
                 next_level_patterns = [p for p in ivr_patterns if p['menu_level'] == current_level + 1]
 
                 for pattern in next_level_patterns:
-                    action_value = pattern.get('action_value', '')
+                    _, action_value = normalize_ivr_action(
+                        pattern.get('preferred_action', 'dtmf'),
+                        pattern.get('action_value', '')
+                    )
+                    action_value_lower = action_value.lower() if action_value else ''
                     # Try to detect menu options like "press 1" or "press 2"
-                    if action_value and f"press {action_value}" in speech_lower:
+                    if action_value_lower and f"press {action_value_lower}" in speech_lower:
                         matched_pattern = pattern
                         print(f"✅ Flexible match: detected 'press {action_value}' at level {pattern['menu_level']}")
                         break
                     # Try "option 1" or "dial 1"
-                    elif action_value and (f"option {action_value}" in speech_lower or f"dial {action_value}" in speech_lower):
+                    elif action_value_lower and (f"option {action_value_lower}" in speech_lower or f"dial {action_value_lower}" in speech_lower):
                         matched_pattern = pattern
                         print(f"✅ Flexible match: detected option/dial {action_value} at level {pattern['menu_level']}")
                         break
                     # Try "say provider" or "say credentialing" (speech-based IVR prompts)
-                    elif action_value and f"say {action_value}" in speech_lower:
+                    elif action_value_lower and f"say {action_value_lower}" in speech_lower:
                         matched_pattern = pattern
                         print(f"✅ Flexible match: detected 'say {action_value}' at level {pattern['menu_level']}")
                         break
 
             if matched_pattern:
                 # Execute the matched action
-                action = matched_pattern.get('preferred_action', 'dtmf')
-                action_value = matched_pattern.get('action_value', '')
+                action, action_value = normalize_ivr_action(
+                    matched_pattern.get('preferred_action', 'dtmf'),
+                    matched_pattern.get('action_value', '')
+                )
 
                 print(f"🎮 Executing IVR action: {action} = {action_value}")
                 _log_ivr_event(
@@ -2224,6 +2299,7 @@ def ivr_navigate_webhook():
                         language='en-US'
                     )
                     response.append(gather)
+                    response.redirect(f'{callback_base}/webhook/ivr-navigate')
                 else:
                     # All IVR levels done - enter silent listening mode
                     print(f"✅ IVR navigation complete - entering silent listening mode")
@@ -2240,6 +2316,7 @@ def ivr_navigate_webhook():
                         language='en-US'
                     )
                     response.append(gather)
+                    response.redirect(f'{callback_base}/webhook/voice/human')
             else:
                 # No match - might be IVR announcement, human, or different IVR prompt
                 # Track how many times we've heard unmatched speech
@@ -2295,6 +2372,7 @@ def ivr_navigate_webhook():
                         language='en-US'
                     )
                     response.append(gather)
+                    response.redirect(f'{callback_base}/webhook/ivr-navigate')
                 elif is_human and state['ivr_unmatched_count'] >= 1:
                     # Respond immediately on the first human signal.
                     # IVR counter-indicators already filter out pure IVR speech, so
@@ -2341,6 +2419,7 @@ def ivr_navigate_webhook():
                         language='en-US'
                     )
                     response.append(gather)
+                    response.redirect(f'{callback_base}/webhook/ivr-navigate')
         else:
             # No call state found - go to human mode
             response.redirect(f'{callback_base}/webhook/voice/human')
@@ -4368,9 +4447,13 @@ def add_ivr_knowledge():
     }
     """
     try:
-        from credentialing_agent import DatabaseManager
+        from credentialing_agent import DatabaseManager, invalidate_ivr_knowledge_cache
         
         data = request.json
+        preferred_action, action_value = normalize_ivr_action(
+            data.get('preferred_action'),
+            data.get('action_value')
+        )
         db = DatabaseManager()
         
         with db.conn.cursor() as cur:
@@ -4383,14 +4466,15 @@ def add_ivr_knowledge():
                 data['insurance_name'],
                 data['menu_level'],
                 data['detected_phrase'],
-                data['preferred_action'],
-                data.get('action_value')
+                preferred_action,
+                action_value
             ))
             
             ivr_id = cur.fetchone()[0]
             db.conn.commit()
         
         db.close()
+        invalidate_ivr_knowledge_cache(data['insurance_name'])
         
         return jsonify({
             'success': True,
@@ -4716,13 +4800,14 @@ def get_ivr_knowledge(insurance_name: str):
 
             knowledge = []
             for row in cur.fetchall():
+                preferred_action, action_value = normalize_ivr_action(row[4], row[5])
                 knowledge.append({
                     'id': str(row[0]),
                     'insurance_name': row[1],
                     'menu_level': row[2],
                     'detected_phrase': row[3],
-                    'preferred_action': row[4],
-                    'action_value': row[5],
+                    'preferred_action': preferred_action,
+                    'action_value': action_value,
                     'confidence_threshold': row[6],
                     'success_rate': row[7],
                     'attempts': row[8]
@@ -4872,7 +4957,7 @@ def update_insurance_provider(provider_id: str):
     """
     Update an existing insurance provider
     """
-    from credentialing_agent import DatabaseManager
+    from credentialing_agent import DatabaseManager, invalidate_ivr_knowledge_cache
 
     data = request.json
     db = DatabaseManager()
@@ -4940,6 +5025,10 @@ def update_insurance_provider(provider_id: str):
                 """, (new_insurance_name, old_insurance_name))
 
             db.conn.commit()
+
+        invalidate_ivr_knowledge_cache(old_insurance_name)
+        if old_insurance_name != new_insurance_name:
+            invalidate_ivr_knowledge_cache(new_insurance_name)
 
         return jsonify({
             'success': True,
@@ -5014,7 +5103,7 @@ def delete_ivr_knowledge(ivr_id: str):
     Delete an IVR knowledge entry
     """
     try:
-        from credentialing_agent import DatabaseManager
+        from credentialing_agent import DatabaseManager, invalidate_ivr_knowledge_cache
 
         db = DatabaseManager()
 
@@ -5022,7 +5111,7 @@ def delete_ivr_knowledge(ivr_id: str):
             cur.execute("""
                 DELETE FROM ivr_knowledge
                 WHERE id = %s
-                RETURNING id
+                RETURNING id, insurance_name
             """, (ivr_id,))
 
             result = cur.fetchone()
@@ -5036,6 +5125,7 @@ def delete_ivr_knowledge(ivr_id: str):
             db.conn.commit()
 
         db.close()
+        invalidate_ivr_knowledge_cache(result[1])
 
         return jsonify({
             'success': True,
@@ -5057,9 +5147,13 @@ def update_ivr_knowledge(ivr_id: str):
     Update an IVR knowledge entry
     """
     try:
-        from credentialing_agent import DatabaseManager
+        from credentialing_agent import DatabaseManager, invalidate_ivr_knowledge_cache
 
         data = request.json
+        preferred_action, action_value = normalize_ivr_action(
+            data.get('preferred_action'),
+            data.get('action_value')
+        )
         db = DatabaseManager()
 
         with db.conn.cursor() as cur:
@@ -5071,12 +5165,12 @@ def update_ivr_knowledge(ivr_id: str):
                     action_value = %s,
                     last_updated = NOW()
                 WHERE id = %s
-                RETURNING id
+                RETURNING id, insurance_name
             """, (
                 data['menu_level'],
                 data['detected_phrase'],
-                data['preferred_action'],
-                data.get('action_value'),
+                preferred_action,
+                action_value,
                 ivr_id
             ))
 
@@ -5091,6 +5185,7 @@ def update_ivr_knowledge(ivr_id: str):
             db.conn.commit()
 
         db.close()
+        invalidate_ivr_knowledge_cache(result[1])
 
         return jsonify({
             'success': True,
@@ -5707,6 +5802,10 @@ def add_twilio_number():
     except psycopg2.errors.UniqueViolation:
         conn.rollback()
         return jsonify({"error": "This phone number already exists"}), 409
+    except Exception as e:
+        conn.rollback()
+        logger.error("add_twilio_number error: %s", e)
+        return jsonify({"error": str(e)}), 500
     finally:
         _tp_put_conn(conn)
 
