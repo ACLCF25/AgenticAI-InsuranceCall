@@ -50,6 +50,21 @@ BASE_URL = os.getenv("BASE_URL", "http://localhost:5000").rstrip("/")
 ENABLE_ELEVENLABS_TTS = os.getenv("ENABLE_ELEVENLABS_TTS", "true").lower() == "true"
 CHECK_CALLBACK_REACHABLE = os.getenv("CHECK_CALLBACK_REACHABLE", "false").lower() == "true"
 
+# Deepgram live-streaming STT (replaces Twilio Gather speech recognition for the
+# human-conversation phase, cutting ~1.5-2s per turn). Off by default for safety.
+ENABLE_DEEPGRAM_STREAMING = os.getenv("ENABLE_DEEPGRAM_STREAMING", "false").lower() == "true"
+import deepgram_streaming  # noqa: E402  (import after env load is intentional)
+
+# Raw-WebSocket adapter for Twilio Media Streams. Twilio uses raw WebSockets,
+# not Socket.IO, so we need flask-sock to handle the /media-stream endpoint.
+try:
+    from flask_sock import Sock  # noqa: E402
+    _FLASK_SOCK_AVAILABLE = True
+except ImportError:
+    _FLASK_SOCK_AVAILABLE = False
+    logger.warning("flask-sock not installed; Twilio Media Streams /media-stream will 404. "
+                   "Install with: pip install flask-sock")
+
 # IVR menu detection phrases — used in both human-speech webhook handlers
 IVR_MENU_INDICATORS = [
     'press 1', 'press 2', 'press 3', 'press 4', 'press 5',
@@ -68,6 +83,11 @@ IVR_MENU_INDICATORS = [
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes (Bearer token auth doesn't require restricted origins)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+# Raw-WebSocket support for Twilio Media Streams (separate from Socket.IO above).
+# Twilio sends raw WebSocket frames, not the Socket.IO protocol, so we need a
+# different handler. Sock attaches transparently to the same Flask app.
+sock = Sock(app) if _FLASK_SOCK_AVAILABLE else None
 from auth import (  # noqa: E402
     admin_or_above,
     admin_required,
@@ -528,6 +548,212 @@ def speak_with_tts(response, text: str, gather=None):
         # Fallback to Polly
         target.say(text, voice='Polly.Joanna')
         logger.warning(f"Falling back to Polly TTS for: {text[:50]}...")
+
+
+# =============================================================================
+# Deepgram streaming — emit <Connect><Stream> instead of <Gather> when enabled,
+# and bridge final transcripts back into the existing /webhook/speech logic.
+# =============================================================================
+
+def _ws_url_from_request():
+    """Derive a wss:// URL for the /media-stream namespace from the current request."""
+    try:
+        host = request.host
+    except Exception:
+        host = (BASE_URL or "").replace("https://", "").replace("http://", "")
+    return f"wss://{host}/media-stream"
+
+
+def emit_human_listening(response, callback_base, call_id, gather_action='/webhook/speech'):
+    """
+    Append the right TwiML to capture human speech.
+
+    With ENABLE_DEEPGRAM_STREAMING=true, emits <Connect><Stream> so audio flows
+    into Deepgram. Otherwise emits the original <Gather input='speech'>.
+
+    NOTE: <Connect><Stream> takes over the call — no TwiML after it runs.
+    Always speak (ElevenLabs / Polly) BEFORE calling this.
+    """
+    if ENABLE_DEEPGRAM_STREAMING and deepgram_streaming.is_available():
+        connect = Connect()
+        stream = Stream(url=_ws_url_from_request())
+        stream.parameter(name='call_id', value=str(call_id))
+        connect.append(stream)
+        response.append(connect)
+        logger.info(f"Listening via Deepgram stream for call_id={call_id}")
+        return None  # caller doesn't need a Gather handle
+    else:
+        from twilio.twiml.voice_response import Gather
+        gather = Gather(
+            input='speech',
+            action=f'{callback_base}{gather_action}',
+            method='POST',
+            speech_timeout='auto',
+            language='en-US',
+        )
+        response.append(gather)
+        return gather
+
+
+def _on_deepgram_final(call_sid: str, transcript: str):
+    """
+    Called by Deepgram when a final transcript is ready. Re-runs the existing
+    /webhook/speech logic by asking Twilio to fetch it again, passing the
+    transcript as a query param. The webhook's response (with ElevenLabs <Play>
+    and the next listener) is post-processed to swap any <Gather> for
+    <Connect><Stream> so streaming continues for the next turn.
+    """
+    try:
+        from urllib.parse import urlencode
+        callback_base = (os.getenv("CALLBACK_URL", "")
+                         .replace("/webhook/voice", "")
+                         .rstrip("/"))
+        if not callback_base:
+            callback_base = BASE_URL
+        qs = urlencode({"SpeechResult": transcript, "CallSid": call_sid,
+                        "DeepgramSource": "1"})
+        next_url = f"{callback_base}/webhook/deepgram-process?{qs}"
+        logger.info(f"Deepgram final → redirecting call {call_sid} to {next_url[:120]}")
+        twilio_client.calls(call_sid).update(url=next_url, method='POST')
+    except Exception as e:
+        logger.error(f"_on_deepgram_final failed for {call_sid}: {e}", exc_info=True)
+
+
+@app.route('/webhook/deepgram-process', methods=['GET', 'POST'])
+def deepgram_process_webhook():
+    """
+    Internal endpoint Twilio is redirected to after Deepgram fires a final
+    transcript. Forwards the request through the existing speech_webhook,
+    then rewrites any <Gather> in the response to <Connect><Stream> so the
+    streaming loop continues. ElevenLabs <Play> elements pass through unchanged.
+    """
+    import re
+    # Reuse the existing speech webhook logic (it reads SpeechResult / CallSid
+    # from request.values, which includes both query string and form body).
+    twiml_response = speech_webhook()
+    try:
+        xml = twiml_response.get_data(as_text=True)
+    except Exception:
+        xml = str(twiml_response)
+
+    if not ENABLE_DEEPGRAM_STREAMING or '<Gather' not in xml:
+        return Response(xml, mimetype='text/xml')
+
+    # Pull call_id from in-memory state for the parameter.
+    call_sid = request.values.get('CallSid', '')
+    call_id = call_sid
+    for cid, st in call_states.items():
+        if st.get('call_sid') == call_sid:
+            call_id = cid
+            break
+
+    ws_url = _ws_url_from_request()
+    stream_block = (
+        f'<Connect><Stream url="{ws_url}">'
+        f'<Parameter name="call_id" value="{xml_escape(str(call_id))}"/>'
+        f'</Stream></Connect>'
+    )
+
+    # Strip the <Gather ...>...</Gather> wrapper and replace with the inner
+    # contents (Play / Say) followed by the Stream block. Anything inside the
+    # Gather (the agent's spoken reply) plays first, then Stream takes over.
+    pattern = re.compile(r'<Gather[^>]*>(.*?)</Gather>', re.DOTALL)
+    xml = pattern.sub(lambda m: m.group(1) + stream_block, xml, count=1)
+    # Drop any trailing extra Gathers (rare).
+    xml = pattern.sub(lambda m: m.group(1), xml)
+
+    return Response(xml, mimetype='text/xml')
+
+
+# =============================================================================
+# Raw WebSocket endpoint for Twilio Media Streams (replaces the dead
+# Flask-SocketIO handler — Twilio uses raw WebSockets, not Socket.IO).
+# =============================================================================
+
+if sock is not None:
+    @sock.route('/media-stream')
+    def media_stream_ws(ws):
+        """
+        Raw WebSocket handler for Twilio Media Streams.
+
+        Twilio sends a sequence of JSON messages over the WebSocket:
+          {event: "connected"}                — protocol greeting
+          {event: "start",  start: {callSid, customParameters: {...}}}
+          {event: "media",  media: {payload: <base64 mu-law>}}     (many)
+          {event: "stop"}
+        We forward the audio payloads to a per-call Deepgram session and let
+        Deepgram's on_final callback drive the next agent turn.
+        """
+        socket_sid = uuid.uuid4().hex
+        call_sid = None
+        stream_sid = None
+        logger.info(f"🔌 Twilio WebSocket connected sid={socket_sid}")
+
+        try:
+            while True:
+                raw = ws.receive(timeout=120)
+                if raw is None:
+                    break
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    continue
+
+                event_type = data.get('event')
+
+                if event_type == 'connected':
+                    logger.info(f"📞 Twilio stream protocol={data.get('protocol')} sid={socket_sid}")
+
+                elif event_type == 'start':
+                    start_payload = data.get('start', {}) or {}
+                    stream_sid = data.get('streamSid')
+                    call_sid = start_payload.get('callSid')
+                    custom_params = start_payload.get('customParameters', {}) or {}
+                    stream_call_id = custom_params.get('call_id') or call_sid
+                    logger.info(f"🎙️ Stream started — StreamSID={stream_sid}, CallSID={call_sid}, "
+                                f"call_id={stream_call_id}")
+
+                    media_streams[socket_sid] = {
+                        'stream_sid': stream_sid,
+                        'call_sid': call_sid,
+                        'call_id': stream_call_id,
+                    }
+
+                    # Mark the conversation phase in call state
+                    for cid, st in call_states.items():
+                        if st.get('call_sid') == call_sid:
+                            st['current_audio_type'] = AudioType.HUMAN_SPEECH
+                            break
+
+                    if ENABLE_DEEPGRAM_STREAMING and deepgram_streaming.is_available() and call_sid:
+                        deepgram_streaming.open_session(
+                            socket_sid=socket_sid,
+                            call_sid=call_sid,
+                            on_final=_on_deepgram_final,
+                        )
+
+                elif event_type == 'media':
+                    if not (ENABLE_DEEPGRAM_STREAMING and deepgram_streaming.is_available()):
+                        continue
+                    payload = (data.get('media') or {}).get('payload', '')
+                    if not payload:
+                        continue
+                    try:
+                        audio_bytes = base64.b64decode(payload)
+                        deepgram_streaming.feed_audio(socket_sid, audio_bytes)
+                    except Exception as fe:
+                        logger.debug(f"Failed to forward audio chunk: {fe}")
+
+                elif event_type == 'stop':
+                    logger.info(f"🛑 Stream stopped: {stream_sid} sid={socket_sid}")
+                    break
+        except Exception as e:
+            logger.error(f"media_stream_ws error sid={socket_sid}: {e}", exc_info=True)
+        finally:
+            if ENABLE_DEEPGRAM_STREAMING and deepgram_streaming.is_available():
+                deepgram_streaming.close_session(socket_sid)
+            media_streams.pop(socket_sid, None)
+            logger.info(f"🔌 Twilio WebSocket closed sid={socket_sid}")
 
 
 _classify_chain = None
@@ -1547,17 +1773,24 @@ def voice_human_webhook():
         phone_part = f" at {provider_phone}" if provider_phone else ""
         disclosure = f"Hello, I'm calling on behalf of {provider_name}{phone_part} for credentialing. Am I speaking with the credentialing department?"
 
-        gather = Gather(
-            input='speech',
-            action=f'{callback_base}/webhook/speech',
-            method='POST',
-            speech_timeout='auto',
-            language='en-US'
-        )
-        speak_with_tts(response, disclosure, gather=gather)
-        response.append(gather)
-
-        speak_with_tts(response, "I didn't hear a response. I'll try again later. Goodbye.")
+        if ENABLE_DEEPGRAM_STREAMING and deepgram_streaming.is_available():
+            # Speak the disclosure first via ElevenLabs, then hand the call to
+            # Deepgram via <Connect><Stream>. (Stream takes over — no TwiML
+            # after it will run.)
+            speak_with_tts(response, disclosure)
+            emit_human_listening(response, callback_base, call_info['call_id']
+                                 if call_info else 'unknown')
+        else:
+            gather = Gather(
+                input='speech',
+                action=f'{callback_base}/webhook/speech',
+                method='POST',
+                speech_timeout='auto',
+                language='en-US'
+            )
+            speak_with_tts(response, disclosure, gather=gather)
+            response.append(gather)
+            speak_with_tts(response, "I didn't hear a response. I'll try again later. Goodbye.")
 
         return Response(str(response), mimetype='text/xml')
 
@@ -5126,6 +5359,9 @@ def handle_connect():
 def handle_disconnect():
     """Handle WebSocket disconnection"""
     print(f"🔌 WebSocket disconnected: {request.sid}")
+    # Close any Deepgram session bound to this socket
+    if ENABLE_DEEPGRAM_STREAMING and deepgram_streaming.is_available():
+        deepgram_streaming.close_session(request.sid)
     # Clean up any associated stream data
     if request.sid in media_streams:
         del media_streams[request.sid]
@@ -5155,13 +5391,17 @@ def handle_message(message):
 
         elif event_type == 'start':
             stream_sid = data.get('streamSid')
-            call_sid = data.get('start', {}).get('callSid')
-            print(f"🎙️ Stream started - StreamSID: {stream_sid}, CallSID: {call_sid}")
+            start_payload = data.get('start', {}) or {}
+            call_sid = start_payload.get('callSid')
+            custom_params = start_payload.get('customParameters', {}) or {}
+            stream_call_id = custom_params.get('call_id') or call_sid
+            print(f"🎙️ Stream started - StreamSID: {stream_sid}, CallSID: {call_sid}, call_id: {stream_call_id}")
 
             # Store stream info
             media_streams[request.sid] = {
                 'stream_sid': stream_sid,
                 'call_sid': call_sid,
+                'call_id': stream_call_id,
                 'audio_buffer': [],
                 'transcript': ''
             }
@@ -5173,19 +5413,30 @@ def handle_message(message):
                     print(f"📊 Updated call {call_id} audio type to HUMAN_SPEECH")
                     break
 
+            # Open the Deepgram session for this WebSocket if streaming is on
+            if ENABLE_DEEPGRAM_STREAMING and deepgram_streaming.is_available() and call_sid:
+                deepgram_streaming.open_session(
+                    socket_sid=request.sid,
+                    call_sid=call_sid,
+                    on_final=_on_deepgram_final,
+                )
+
         elif event_type == 'media':
-            # Audio payload - base64 encoded mu-law audio
+            # Audio payload — base64 encoded mu-law @ 8kHz from Twilio.
             payload = data.get('media', {}).get('payload', '')
             if payload and request.sid in media_streams:
-                # Decode audio (for future Deepgram integration)
-                # audio_data = base64.b64decode(payload)
-                # For now, just acknowledge receipt
-                pass
+                if ENABLE_DEEPGRAM_STREAMING and deepgram_streaming.is_available():
+                    try:
+                        audio_bytes = base64.b64decode(payload)
+                        deepgram_streaming.feed_audio(request.sid, audio_bytes)
+                    except Exception as fe:
+                        logger.debug(f"Failed to forward audio chunk: {fe}")
 
         elif event_type == 'stop':
             stream_sid = data.get('streamSid')
             print(f"🛑 Stream stopped: {stream_sid}")
-
+            if ENABLE_DEEPGRAM_STREAMING and deepgram_streaming.is_available():
+                deepgram_streaming.close_session(request.sid)
             if request.sid in media_streams:
                 del media_streams[request.sid]
 

@@ -1329,13 +1329,13 @@ class CredentialingAgent:
         self.kb_summary_prompt = ChatPromptTemplate.from_messages([
             ("system", """Summarize the credentialing phone call for future reuse.
 Return JSON:
-{
+{{
   "summary": "2-4 bullet summary (concise)",
   "qa": [
-    {"q": "...", "a": "..."},
+    {{"q": "...", "a": "..."}},
     ...
   ]
-}
+}}
 Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
             ("user", "Conversation:\n{conversation}")
         ])
@@ -1904,10 +1904,16 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
     
     async def process_call(self, initial_state: CredentialingState) -> CredentialingState:
         """Process a complete credentialing call"""
-        config = {"configurable": {"thread_id": initial_state.get('call_id', 'default')}}
-        
+        # recursion_limit bumped to 200 — LangGraph 0.3.x defaults to 25, but the
+        # graph here loops on "continue" edges until external state (from Twilio
+        # webhooks) flips should_continue=False, so it needs more cycles.
+        config = {
+            "configurable": {"thread_id": initial_state.get('call_id', 'default')},
+            "recursion_limit": 200,
+        }
+
         final_state = await self.graph.ainvoke(initial_state, config=config)
-        
+
         return final_state
     
     def close(self):

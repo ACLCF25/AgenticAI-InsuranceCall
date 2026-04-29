@@ -1,18 +1,20 @@
 # Autonomous AI Insurance Credentialing System - Python Dependencies
 
-# LangChain and LangGraph
-langchain>=0.1.0
-langchain-openai>=0.0.2
-langchain-core>=0.1.10
-langgraph>=0.0.20
-langsmith>=0.0.77
+# LangChain and LangGraph — pinned to 0.x; v1.x has breaking changes
+# (stricter prompt-template validation, LCEL renames, etc.) and the existing
+# code is written for the 0.x API.
+langchain>=0.3,<0.4
+langchain-openai>=0.2,<0.3
+langchain-core>=0.3,<0.4
+langgraph>=0.2,<0.3
+langsmith>=0.1.0,<0.2.0
 
 # OpenAI
 openai>=1.6.1
 
 # Telephony
 twilio>=8.11.0
-deepgram-sdk>=3.0.0
+deepgram-sdk>=3.10,<4.0
 elevenlabs>=0.2.27
 
 # Database
@@ -24,6 +26,7 @@ flask>=3.0.0
 flask-cors>=4.0.0
 flask-socketio>=5.3.5
 python-socketio>=5.10.0
+flask-sock>=0.7.0  # Raw WebSocket support for Twilio Media Streams
 flask-jwt-extended>=4.6.0
 bcrypt>=4.1.2
 
