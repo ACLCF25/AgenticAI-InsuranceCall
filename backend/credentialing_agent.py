@@ -390,7 +390,8 @@ class DatabaseManager:
         The cache key is the lower-cased insurance name to mirror the
         case-insensitive ILIKE query.
         """
-        cache_key = insurance_name.lower()
+        normalized_name = insurance_name.strip().lower()
+        cache_key = normalized_name
         cached = _ivr_knowledge_cache.get(cache_key)
         if cached is not None:
             data, fetched_at = cached
@@ -400,10 +401,20 @@ class DatabaseManager:
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
                 SELECT * FROM ivr_knowledge
-                WHERE insurance_name ILIKE %s
+                WHERE lower(trim(insurance_name)) = lower(trim(%s))
                 ORDER BY success_rate DESC, menu_level ASC
-            """, (f"%{insurance_name}%",))
+            """, (insurance_name,))
             data = [dict(row) for row in cur.fetchall()]
+
+            if not data:
+                cur.execute("""
+                    SELECT * FROM ivr_knowledge
+                    WHERE insurance_name ILIKE %s
+                    ORDER BY success_rate DESC, menu_level ASC
+                """, (f"%{insurance_name}%",))
+                data = [dict(row) for row in cur.fetchall()]
+                if data:
+                    print(f"⚠️ IVR knowledge used fuzzy match for requested insurance '{insurance_name}'")
 
         _ivr_knowledge_cache[cache_key] = (data, time.monotonic())
         return data

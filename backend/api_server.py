@@ -714,6 +714,90 @@ def normalize_ivr_action(preferred_action, action_value):
     return action, value or None
 
 
+def _digits_only(value) -> str:
+    return re.sub(r'\D', '', str(value or ''))
+
+
+def get_provider_ivr_flags(db, insurance_name: str, insurance_phone: str = None):
+    """
+    Load IVR auto-response flags without mixing similarly named insurers.
+    Exact normalized name and exact phone matches win; fuzzy name matching is
+    only a last fallback for legacy rows.
+    """
+    select_with_suffix = """
+        SELECT insurance_name, phone_number,
+               ivr_asks_npi, ivr_npi_method, ivr_asks_tax_id, ivr_tax_id_method,
+               ivr_tax_id_digits_to_send, ivr_npi_suffix, ivr_tax_id_suffix
+        FROM insurance_providers
+    """
+    select_without_suffix = """
+        SELECT insurance_name, phone_number,
+               ivr_asks_npi, ivr_npi_method, ivr_asks_tax_id, ivr_tax_id_method,
+               ivr_tax_id_digits_to_send, NULL AS ivr_npi_suffix, NULL AS ivr_tax_id_suffix
+        FROM insurance_providers
+    """
+    phone_digits = _digits_only(insurance_phone)
+
+    def _fetch(select_sql):
+        with db.conn.cursor() as cur:
+            cur.execute(
+                select_sql + """
+                WHERE lower(trim(insurance_name)) = lower(trim(%s))
+                   OR (%s <> '' AND regexp_replace(COALESCE(phone_number, ''), '\\D', '', 'g') = %s)
+                ORDER BY
+                    CASE
+                        WHEN lower(trim(insurance_name)) = lower(trim(%s)) THEN 0
+                        WHEN %s <> '' AND regexp_replace(COALESCE(phone_number, ''), '\\D', '', 'g') = %s THEN 1
+                        ELSE 2
+                    END,
+                    last_updated DESC NULLS LAST
+                LIMIT 1
+                """,
+                (insurance_name, phone_digits, phone_digits, insurance_name, phone_digits, phone_digits),
+            )
+            row = cur.fetchone()
+            match_type = 'exact_or_phone'
+            if not row:
+                cur.execute(
+                    select_sql + """
+                    WHERE insurance_name ILIKE %s
+                    ORDER BY last_updated DESC NULLS LAST
+                    LIMIT 1
+                    """,
+                    (f"%{insurance_name}%",),
+                )
+                row = cur.fetchone()
+                match_type = 'fuzzy'
+            return row, match_type
+
+    try:
+        row, match_type = _fetch(select_with_suffix)
+    except Exception:
+        db.conn.rollback()
+        row, match_type = _fetch(select_without_suffix)
+
+    if not row:
+        return None
+
+    if match_type == 'fuzzy':
+        logger.warning(
+            f"Provider IVR flags used fuzzy match for requested insurance='{insurance_name}': "
+            f"selected '{row[0]}' ({row[1]})"
+        )
+
+    return {
+        'insurance_name': row[0],
+        'phone_number': row[1],
+        'ivr_asks_npi': row[2] or False,
+        'ivr_npi_method': row[3] or 'speech',
+        'ivr_asks_tax_id': row[4] or False,
+        'ivr_tax_id_method': row[5] or 'speech',
+        'ivr_tax_id_digits_to_send': row[6],
+        'ivr_npi_suffix': row[7] or '',
+        'ivr_tax_id_suffix': row[8] or '',
+    }
+
+
 # =============================================================================
 # Deepgram streaming — emit <Connect><Stream> instead of <Gather> when enabled,
 # and bridge final transcripts back into the existing /webhook/speech logic.
@@ -1739,27 +1823,36 @@ def _bridge_to_agent(call_info, callback_base):
         end_on_exit=False,
     )
 
-    try:
-        from_number = call_state_obj.get('from_number') or os.getenv("TWILIO_PHONE_NUMBER")
-        agent_call = twilio_client.calls.create(
-            to=agent_phone_number,
-            from_=from_number,
-            twiml=agent_conference_twiml,
-            timeout=30,
-        )
-        call_state_obj['conference_sid'] = agent_call.sid
-        call_state_obj['call_state'] = CallState.SPEAKING_WITH_HUMAN
-        logger.info(f"[bridge_to_agent] Dialed agent {agent_phone_number} into conference {conf_name}, agent call SID={agent_call.sid}")
-    except Exception as dial_err:
-        logger.error(f"[bridge_to_agent] Failed to dial agent into conference: {dial_err}")
-        error_twiml = (
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<Response>'
-            '<Say>We are sorry, we could not connect the agent for this call. Goodbye.</Say>'
-            '<Hangup/>'
-            '</Response>'
-        )
-        return Response(error_twiml, mimetype='text/xml')
+    def _dial_agent_into_conference():
+        try:
+            from_number = call_state_obj.get('from_number') or os.getenv("TWILIO_PHONE_NUMBER")
+            agent_call = twilio_client.calls.create(
+                to=agent_phone_number,
+                from_=from_number,
+                twiml=agent_conference_twiml,
+                timeout=30,
+            )
+            call_state_obj['conference_sid'] = agent_call.sid
+            logger.info(f"[bridge_to_agent] Dialed agent {agent_phone_number} into conference {conf_name}, agent call SID={agent_call.sid}")
+        except Exception as dial_err:
+            logger.error(f"[bridge_to_agent] Failed to dial agent into conference: {dial_err}")
+            insurance_call_sid = call_state_obj.get('call_sid')
+            if insurance_call_sid:
+                failure_twiml = (
+                    '<?xml version="1.0" encoding="UTF-8"?>'
+                    '<Response>'
+                    '<Say>We are sorry, we could not connect the agent for this call. Goodbye.</Say>'
+                    '<Hangup/>'
+                    '</Response>'
+                )
+                try:
+                    twilio_client.calls(insurance_call_sid).update(twiml=failure_twiml)
+                except Exception as update_err:
+                    logger.error(f"[bridge_to_agent] Failed to update insurance leg after agent dial failure: {update_err}")
+
+    call_state_obj['call_state'] = CallState.SPEAKING_WITH_HUMAN
+    call_state_obj['transfer_to_agent'] = True
+    threading.Thread(target=_dial_agent_into_conference, daemon=True).start()
 
     return Response(conference_twiml, mimetype='text/xml')
 
@@ -1826,47 +1919,27 @@ def voice_webhook():
                     db = DatabaseManager()
                     ivr_patterns = db.get_ivr_knowledge(insurance_name)
 
-                    # Load IVR auto-response flags (NPI/Tax ID).
-                    # ivr_npi_suffix / ivr_tax_id_suffix were added in a later migration
-                    # (add_ivr_suffix_columns.sql). If those columns don't exist yet we
-                    # roll back and retry without them so the core flags always load.
-                    with db.conn.cursor() as cur:
-                        try:
-                            cur.execute("""
-                                SELECT ivr_asks_npi, ivr_npi_method, ivr_asks_tax_id, ivr_tax_id_method,
-                                       ivr_tax_id_digits_to_send, ivr_npi_suffix, ivr_tax_id_suffix
-                                FROM insurance_providers
-                                WHERE insurance_name ILIKE %s
-                                LIMIT 1
-                            """, (f"%{insurance_name}%",))
-                            provider_row = cur.fetchone()
-                            suffix_npi = (provider_row[5] or '') if provider_row else ''
-                            suffix_tax = (provider_row[6] or '') if provider_row else ''
-                        except Exception:
-                            # Suffix columns missing — run add_ivr_suffix_columns.sql migration
-                            db.conn.rollback()
-                            cur.execute("""
-                                SELECT ivr_asks_npi, ivr_npi_method, ivr_asks_tax_id, ivr_tax_id_method,
-                                       ivr_tax_id_digits_to_send
-                                FROM insurance_providers
-                                WHERE insurance_name ILIKE %s
-                                LIMIT 1
-                            """, (f"%{insurance_name}%",))
-                            provider_row = cur.fetchone()
-                            suffix_npi = ''
-                            suffix_tax = ''
-
-                        if provider_row and call_info:
-                            call_info['state']['ivr_asks_npi'] = provider_row[0] or False
-                            call_info['state']['ivr_npi_method'] = provider_row[1] or 'speech'
-                            call_info['state']['ivr_asks_tax_id'] = provider_row[2] or False
-                            call_info['state']['ivr_tax_id_method'] = provider_row[3] or 'speech'
-                            call_info['state']['ivr_tax_id_digits_to_send'] = provider_row[4]
-                            call_info['state']['ivr_npi_suffix'] = suffix_npi
-                            call_info['state']['ivr_tax_id_suffix'] = suffix_tax
-                            print(f"📋 IVR flags - NPI: {provider_row[0]} ({provider_row[1]}), Tax ID: {provider_row[2]} ({provider_row[3]}), Tax Digits: {provider_row[4]}")
-                        elif not provider_row:
-                            print(f"⚠️ No insurance provider matched '{insurance_name}' — IVR auto-response flags not loaded")
+                    provider_flags = get_provider_ivr_flags(
+                        db,
+                        insurance_name,
+                        call_info['state'].get('insurance_phone') if call_info else None,
+                    )
+                    if provider_flags and call_info:
+                        call_info['state']['ivr_asks_npi'] = provider_flags['ivr_asks_npi']
+                        call_info['state']['ivr_npi_method'] = provider_flags['ivr_npi_method']
+                        call_info['state']['ivr_asks_tax_id'] = provider_flags['ivr_asks_tax_id']
+                        call_info['state']['ivr_tax_id_method'] = provider_flags['ivr_tax_id_method']
+                        call_info['state']['ivr_tax_id_digits_to_send'] = provider_flags['ivr_tax_id_digits_to_send']
+                        call_info['state']['ivr_npi_suffix'] = provider_flags['ivr_npi_suffix']
+                        call_info['state']['ivr_tax_id_suffix'] = provider_flags['ivr_tax_id_suffix']
+                        print(
+                            f"📋 IVR flags - Provider: {provider_flags['insurance_name']}, "
+                            f"NPI: {provider_flags['ivr_asks_npi']} ({provider_flags['ivr_npi_method']}), "
+                            f"Tax ID: {provider_flags['ivr_asks_tax_id']} ({provider_flags['ivr_tax_id_method']}), "
+                            f"Tax Digits: {provider_flags['ivr_tax_id_digits_to_send']}"
+                        )
+                    elif not provider_flags:
+                        print(f"⚠️ No insurance provider matched '{insurance_name}' — IVR auto-response flags not loaded")
 
                     db.close()
                     print(f"🎯 Found {len(ivr_patterns)} IVR patterns for {insurance_name}")
@@ -2207,7 +2280,7 @@ def ivr_navigate_webhook():
                         language='en-US'
                     )
                     response.append(gather)
-                    response.redirect(f'{callback_base}/webhook/voice/human')
+                    response.redirect(f'{callback_base}/webhook/ivr-navigate')
                     return Response(str(response), mimetype='text/xml')
             # ── End NPI / Tax ID auto-response ──────────────────────────────
 
@@ -2351,7 +2424,29 @@ def ivr_navigate_webhook():
                 is_ivr_system = is_definitive_ivr or (is_passive_ivr and not is_human)
 
                 # DECISION — priority order matters
-                if is_ivr_system:
+                if (
+                    state.get('call_mode') == 'agent'
+                    and (
+                        'connect you with someone' in speech_lower
+                        or 'connecting you with someone' in speech_lower
+                        or 'please hold while i connect' in speech_lower
+                        or 'please hold while we connect' in speech_lower
+                    )
+                ):
+                    print("☎️ Transfer/hold detected in agent mode - waiting for human representative")
+                    state['call_state'] = CallState.WAITING_FOR_HUMAN
+                    state['wait_start_time'] = utcnow_iso()
+                    gather = Gather(
+                        input='speech',
+                        action=f'{callback_base}/webhook/wait-for-human',
+                        method='POST',
+                        speech_timeout='2',
+                        timeout=15,
+                        language='en-US'
+                    )
+                    response.append(gather)
+                    response.redirect(f'{callback_base}/webhook/wait-for-human')
+                elif is_ivr_system:
                     # Definitely still in IVR — decrement counter so false positives
                     # don't accumulate toward the human-mode fallback threshold.
                     state['ivr_unmatched_count'] = max(state['ivr_unmatched_count'] - 1, 0)
@@ -3429,15 +3524,22 @@ def recording_status_webhook():
             f"(call_id={callback_call_id}, request_id={callback_request_id})"
         )
 
-        # Find call_id and request_id from in-memory state first
-        with call_state_lock:
-            state = call_states_by_sid.get(call_sid)
-        if state is None:
-            # Also try linear scan in case sid was registered under different key
-            state = get_state_by_sid(call_sid)
+        # Find call_id and request_id from in-memory state first.
+        # Conference recording callbacks may omit CallSid, so avoid resolving
+        # state by None and fall back to callback identifiers.
+        state = None
+        if call_sid:
+            with call_state_lock:
+                state = call_states_by_sid.get(call_sid)
+            if state is None:
+                state = get_state_by_sid(call_sid)
+        elif callback_call_id:
+            with call_state_lock:
+                state = call_states.get(callback_call_id)
 
-        call_id = callback_call_id or (state.get('call_id') if state else call_sid)
+        call_id = callback_call_id or (state.get('call_id') if state else call_sid or recording_sid)
         request_id = callback_request_id or (state.get('db_request_id') if state else None)
+        effective_call_sid = call_sid or (state.get('call_sid') if state else None) or f"recording:{recording_sid}"
 
         # Determine recording type from in-memory call state
         recording_type = 'ai'
@@ -3472,7 +3574,7 @@ def recording_status_webhook():
 
             db.save_recording(
                 call_id=call_id,
-                call_sid=call_sid,
+                call_sid=effective_call_sid,
                 recording_sid=recording_sid,
                 recording_url=recording_url,
                 recording_duration=int(recording_duration or 0),
