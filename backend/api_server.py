@@ -53,7 +53,10 @@ CHECK_CALLBACK_REACHABLE = os.getenv("CHECK_CALLBACK_REACHABLE", "false").lower(
 # Deepgram live-streaming STT (replaces Twilio Gather speech recognition for the
 # human-conversation phase, cutting ~1.5-2s per turn). Off by default for safety.
 ENABLE_DEEPGRAM_STREAMING = os.getenv("ENABLE_DEEPGRAM_STREAMING", "false").lower() == "true"
-import deepgram_streaming  # noqa: E402  (import after env load is intentional)
+try:
+    import deepgram_streaming  # noqa: E402  (import after env load is intentional)
+except ImportError:
+    deepgram_streaming = None  # type: ignore[assignment]
 
 # Raw-WebSocket adapter for Twilio Media Streams. Twilio uses raw WebSockets,
 # not Socket.IO, so we need flask-sock to handle the /media-stream endpoint.
