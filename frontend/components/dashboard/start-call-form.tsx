@@ -24,6 +24,19 @@ import { formatUsPhoneInput, normalizeUsPhone } from '@/lib/utils'
 import { toast } from 'sonner'
 import type { InsuranceProvider, StartCallResponse } from '@/types'
 
+const AGENTS = [
+  { name: 'Roya Beuokaghaei',     phone: '7028843330'   },
+  { name: 'Jan Paoleen Olivar',   phone: '7252201473'   },
+  { name: 'Rodess-Ann Ramos',     phone: '7252285335'   },
+  { name: 'Mark Ervin Pinpiño',   phone: '7252010564'   },
+  { name: 'Mark Christian Lazo',  phone: '7252261326'   },
+  { name: 'Joyce Cleofe',         phone: '7257125225'   },
+  { name: 'Allan De Los Santos',  phone: '7253310279'   },
+  { name: 'Edcel Santiago',       phone: '4108345799'   },
+  { name: 'Cristel Mae Cabe',     phone: '7252261427'   },
+  { name: 'Ma. Grace Amatosa',    phone: '7252285837'   },
+]
+
 const callFormSchema = z.object({
   insurance_name: z.string().min(1, 'Insurance name is required'),
   provider_name: z.string().min(1, 'Provider name is required'),
@@ -60,6 +73,7 @@ export function StartCallForm({
   const [selectedInsurance, setSelectedInsurance] = useState<InsuranceProvider | null>(null)
   const [callMode, setCallMode] = useState<'ai' | 'agent'>('ai')
   const [agentPhone, setAgentPhone] = useState('')
+  const [selectedAgentName, setSelectedAgentName] = useState('')
 
   const form = useForm<CallFormValues>({
     resolver: zodResolver(callFormSchema),
@@ -199,14 +213,6 @@ export function StartCallForm({
 
   function onSubmit(values: CallFormValues) {
     mutation.mutate(values)
-  }
-
-  function handleAgentPhoneChange(value: string) {
-    setAgentPhone(formatUsPhoneInput(value))
-  }
-
-  function handleAgentPhoneBlur() {
-    setAgentPhone((current) => formatUsPhoneInput(current))
   }
 
   return (
@@ -406,7 +412,7 @@ export function StartCallForm({
           <div className="flex gap-2">
             <button
               type="button"
-              onClick={() => setCallMode('ai')}
+              onClick={() => { setCallMode('ai'); setAgentPhone(''); setSelectedAgentName('') }}
               className={`flex flex-1 items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
                 callMode === 'ai'
                   ? 'border-primary bg-primary text-primary-foreground'
@@ -430,19 +436,39 @@ export function StartCallForm({
             </button>
           </div>
           {callMode === 'agent' && (
-            <div className="mt-3">
+            <div className="mt-3 space-y-2">
               <label className="mb-1.5 block text-sm font-medium">
-                Agent Phone Number
+                Select Agent
               </label>
-              <Input
-                placeholder="+1 (555) 000-0000"
-                value={agentPhone}
-                onChange={(e) => handleAgentPhoneChange(e.target.value)}
-                onBlur={handleAgentPhoneBlur}
-              />
-              <p className="mt-1.5 text-xs text-muted-foreground">
-                Staff or user phone to bridge into the call. Do not enter the insurance phone number.
-              </p>
+              <div className="relative">
+                <select
+                  value={selectedAgentName}
+                  onChange={(e) => {
+                    const agent = AGENTS.find((a) => a.name === e.target.value)
+                    setSelectedAgentName(e.target.value)
+                    setAgentPhone(agent ? formatUsPhoneInput(agent.phone) : '')
+                  }}
+                  className="w-full appearance-none rounded-md border border-input bg-background px-3 py-2 pr-8 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+                >
+                  <option value="">— Select an agent —</option>
+                  {AGENTS.map((agent) => (
+                    <option key={agent.name} value={agent.name}>
+                      {agent.name} — {agent.phone}
+                    </option>
+                  ))}
+                </select>
+                <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              </div>
+              {agentPhone && (
+                <p className="text-xs text-muted-foreground">
+                  Bridging to: <span className="font-medium text-foreground">{agentPhone}</span>
+                </p>
+              )}
+              {!agentPhone && (
+                <p className="text-xs text-muted-foreground">
+                  Select an agent to bridge into the call.
+                </p>
+              )}
             </div>
           )}
         </div>

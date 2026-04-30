@@ -26,7 +26,7 @@ _kb_pool = psycopg2.pool.ThreadedConnectionPool(
     database="postgres",
     user=os.getenv("SUPABASE_USER", "postgres"),
     password=os.getenv("SUPABASE_PASSWORD"),
-    port=5432,
+    port=6543,
 )
 
 # Configure loguru for knowledge base operations

@@ -158,7 +158,7 @@ _twilio_pool = psycopg2.pool.ThreadedConnectionPool(
     database="postgres",
     user=os.getenv("SUPABASE_USER", "postgres"),
     password=os.getenv("SUPABASE_PASSWORD"),
-    port=5432,
+    port=6543,
 )
 
 
@@ -2202,6 +2202,52 @@ def ivr_navigate_webhook():
                 print(f"🔍 Analyzing speech: '{speech_lower[:100]}...'")
                 print(f"📊 Current menu level: {current_level}, Available patterns: {len(ivr_patterns)}")
 
+            # ── Credential confirmation check ────────────────────────────────
+            # After sending NPI or Tax ID, some IVR systems read it back and ask
+            # the caller to confirm (e.g. "Is that correct? Say yes or press 1.").
+            awaiting_conf = state.get('awaiting_credential_confirmation')
+            if awaiting_conf and speech_lower:
+                confirm_keywords = [
+                    r'\bcorrect\b', r'\bconfirm\b', r'\bis that right\b',
+                    r'\bsay yes\b', r'\bpress 1\b', r'\bpress one\b', r'\bverif'
+                ]
+                is_confirmation_prompt = any(
+                    re.search(kw, speech_lower) for kw in confirm_keywords
+                )
+                if is_confirmation_prompt:
+                    print(f"✅ IVR asking to confirm {awaiting_conf} — responding yes")
+                    _log_ivr_event(
+                        state.get('db_request_id') or call_info['call_id'],
+                        'ivr_credential_confirmed',
+                        transcript=speech_result,
+                        action_taken=f"confirmed {awaiting_conf}",
+                        metadata={'awaiting': awaiting_conf}
+                    )
+                    state['awaiting_credential_confirmation'] = None
+                    response.pause(length=1)
+                    if re.search(r'press\s*1', speech_lower):
+                        response.play(digits='1')
+                        print(f"🔢 Sent DTMF 1 to confirm {awaiting_conf}")
+                    else:
+                        speak_with_tts(response, 'Yes.')
+                        print(f"🗣️ Spoke 'Yes' to confirm {awaiting_conf}")
+                    response.pause(length=1)
+                    gather = Gather(
+                        input='speech dtmf',
+                        action=f'{callback_base}/webhook/ivr-navigate',
+                        method='POST',
+                        speech_timeout='2',
+                        timeout=30,
+                        language='en-US'
+                    )
+                    response.append(gather)
+                    response.redirect(f'{callback_base}/webhook/ivr-navigate')
+                    return Response(str(response), mimetype='text/xml')
+                else:
+                    # IVR moved on — clear the flag so it doesn't persist
+                    state['awaiting_credential_confirmation'] = None
+            # ── End credential confirmation check ────────────────────────────
+
             # ── NPI / Tax ID auto-response ──────────────────────────────────
             # If the insurance provider is flagged as asking for NPI or Tax ID
             # during IVR navigation, detect the request and respond automatically.
@@ -2271,8 +2317,10 @@ def ivr_navigate_webhook():
                             npi_spoken = format_npi_for_speech(state['npi'])
                             speak_with_tts(response, npi_spoken)
                             print(f"🔢 Spoke NPI: {npi_spoken}")
+                        state['awaiting_credential_confirmation'] = 'npi'
+                        state['last_credential_sent'] = state['npi']
 
-                    if tax_detected and state.get('tax_id'):
+                    elif tax_detected and state.get('tax_id'):
                         # If it's a selection menu, press the digit for Tax ID first
                         if is_selection_menu:
                             select_digit = _extract_selection_digit(speech_lower, tax_keywords)
@@ -2300,6 +2348,8 @@ def ivr_navigate_webhook():
                             tax_spoken = '. '.join(list(selected_tax)) + '.'
                             speak_with_tts(response, tax_spoken)
                             print(f"🔢 Spoke Tax ID: {tax_spoken}")
+                        state['awaiting_credential_confirmation'] = 'tax_id'
+                        state['last_credential_sent'] = selected_tax
 
                     # Continue listening for more IVR prompts
                     response.pause(length=1)
