@@ -63,6 +63,24 @@ export function formatPhoneNumber(phone?: string | null): string {
   return phone;
 }
 
+export function normalizeUsPhone(phone?: string | null): string | null {
+  const digits = (phone || '').replace(/\D/g, '')
+  if (digits.length === 10) return `+1${digits}`
+  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`
+  return null
+}
+
+export function formatUsPhoneInput(phone?: string | null): string {
+  const value = phone || ''
+  const normalized = normalizeUsPhone(value)
+
+  if (normalized) {
+    return formatPhoneNumber(normalized)
+  }
+
+  return value.replace(/[^\d+\-().\s]/g, '')
+}
+
 export function formatStatus(status: string): string {
   return status.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
 }

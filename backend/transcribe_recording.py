@@ -51,7 +51,22 @@ def _chunk_transcript(text: str, max_chars: int = 420, max_sentences: int = 4) -
     return chunks or [normalized]
 
 
-def transcribe_agent_recording(call_id: str, recording_url: str, request_id: str = None):
+def _has_agent_transcript(db, call_id: str, request_id: str = None) -> bool:
+    with db.conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1
+            FROM conversation_history
+            WHERE speaker = 'agent_transcript'
+              AND (call_id = %s OR request_id::text = %s)
+            LIMIT 1
+            """,
+            (call_id, request_id or ""),
+        )
+        return cur.fetchone() is not None
+
+
+def transcribe_agent_recording(call_id: str, recording_url: str, request_id: str = None, force: bool = False):
     """
     Download a Twilio recording and transcribe it with OpenAI Whisper.
     Saves the resulting transcript to conversation_history.
@@ -61,6 +76,17 @@ def transcribe_agent_recording(call_id: str, recording_url: str, request_id: str
     """
     try:
         logger.info(f"[transcribe] Starting transcription for call_id={call_id}")
+
+        from credentialing_agent import DatabaseManager
+        db = DatabaseManager()
+        try:
+            if not force and _has_agent_transcript(db, call_id, request_id):
+                logger.info(
+                    f"[transcribe] Existing agent transcript found for call_id={call_id}; skipping"
+                )
+                return
+        finally:
+            db.close()
 
         # Build full URL if needed
         if not recording_url.startswith('http'):
@@ -125,9 +151,14 @@ def transcribe_agent_recording(call_id: str, recording_url: str, request_id: str
         transcript_chunks = _chunk_transcript(transcript_text)
 
         # Save to conversation_history
-        from credentialing_agent import DatabaseManager
         db = DatabaseManager()
         try:
+            if not force and _has_agent_transcript(db, call_id, request_id):
+                logger.info(
+                    f"[transcribe] Existing agent transcript found after transcription "
+                    f"for call_id={call_id}; skipping save"
+                )
+                return
             for chunk in transcript_chunks:
                 db.save_conversation(
                     call_id=call_id,

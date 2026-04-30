@@ -245,6 +245,15 @@ export default function CallDetailPage() {
                 </div>
               </div>
               )}
+              {call.call_mode === 'agent' && call.agent_phone && (
+                <div className="flex items-start gap-2">
+                  <Phone className="h-4 w-4 mt-0.5 text-muted-foreground" />
+                  <div>
+                    <p className="text-xs text-muted-foreground">Human Agent Phone</p>
+                    <p className="text-sm">{formatPhoneNumber(call.agent_phone)}</p>
+                  </div>
+                </div>
+              )}
               {call.reference_number && (
                 <div className="flex items-start gap-2">
                   <Hash className="h-4 w-4 mt-0.5 text-muted-foreground" />

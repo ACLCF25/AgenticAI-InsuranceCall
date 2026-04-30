@@ -20,6 +20,7 @@ import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { Badge } from '@/components/ui/badge'
+import { formatUsPhoneInput, normalizeUsPhone } from '@/lib/utils'
 import { toast } from 'sonner'
 import type { InsuranceProvider, StartCallResponse } from '@/types'
 
@@ -132,11 +133,29 @@ export function StartCallForm({
         .split('\n')
         .filter((q) => q.trim().length > 0)
 
+      const normalizedAgentPhone =
+        callMode === 'agent' ? normalizeUsPhone(agentPhone) : null
+      const normalizedInsurancePhone = normalizeUsPhone(values.insurance_phone)
+
+      if (callMode === 'agent') {
+        if (!normalizedAgentPhone) {
+          throw new Error('Enter a valid staff/user phone number for the human agent.')
+        }
+        if (
+          normalizedInsurancePhone &&
+          normalizedAgentPhone === normalizedInsurancePhone
+        ) {
+          throw new Error('Agent phone must be a staff/user phone, not the insurance phone.')
+        }
+      }
+
       return api.startCall({
         ...values,
         questions: questionsArray,
         call_mode: callMode,
-        ...(callMode === 'agent' && agentPhone ? { agent_phone: agentPhone } : {}),
+        ...(callMode === 'agent' && normalizedAgentPhone
+          ? { agent_phone: normalizedAgentPhone }
+          : {}),
       })
     },
     onSuccess: (response) => {
@@ -180,6 +199,14 @@ export function StartCallForm({
 
   function onSubmit(values: CallFormValues) {
     mutation.mutate(values)
+  }
+
+  function handleAgentPhoneChange(value: string) {
+    setAgentPhone(formatUsPhoneInput(value))
+  }
+
+  function handleAgentPhoneBlur() {
+    setAgentPhone((current) => formatUsPhoneInput(current))
   }
 
   return (
@@ -410,8 +437,12 @@ export function StartCallForm({
               <Input
                 placeholder="+1 (555) 000-0000"
                 value={agentPhone}
-                onChange={(e) => setAgentPhone(e.target.value)}
+                onChange={(e) => handleAgentPhoneChange(e.target.value)}
+                onBlur={handleAgentPhoneBlur}
               />
+              <p className="mt-1.5 text-xs text-muted-foreground">
+                Staff or user phone to bridge into the call. Do not enter the insurance phone number.
+              </p>
             </div>
           )}
         </div>

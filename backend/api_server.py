@@ -718,6 +718,22 @@ def _digits_only(value) -> str:
     return re.sub(r'\D', '', str(value or ''))
 
 
+def _normalize_us_phone(value) -> Optional[str]:
+    """Normalize a US phone number to E.164, or return None if invalid."""
+    digits = _digits_only(value)
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    return None
+
+
+def _same_us_phone(left, right) -> bool:
+    left_normalized = _normalize_us_phone(left)
+    right_normalized = _normalize_us_phone(right)
+    return bool(left_normalized and right_normalized and left_normalized == right_normalized)
+
+
 def get_provider_ivr_flags(db, insurance_name: str, insurance_phone: str = None):
     """
     Load IVR auto-response flags without mixing similarly named insurers.
@@ -1632,9 +1648,25 @@ def start_credentialing_call():
         call_mode = data.get('call_mode', 'ai')
         if call_mode not in ('ai', 'agent'):
             call_mode = 'ai'
-        agent_phone = data.get('agent_phone')
-        if call_mode == 'agent' and not agent_phone:
-            return jsonify({'success': False, 'error': 'agent_phone is required when call_mode is agent'}), 400
+
+        insurance_phone = _normalize_us_phone(data.get('insurance_phone'))
+        if not insurance_phone:
+            return jsonify({'success': False, 'error': 'insurance_phone must be a valid US phone number'}), 400
+        data['insurance_phone'] = insurance_phone
+
+        agent_phone = None
+        raw_agent_phone = data.get('agent_phone')
+        if call_mode == 'agent':
+            if not raw_agent_phone:
+                return jsonify({'success': False, 'error': 'agent_phone is required when call_mode is agent'}), 400
+            agent_phone = _normalize_us_phone(raw_agent_phone)
+            if not agent_phone:
+                return jsonify({'success': False, 'error': 'agent_phone must be a valid US phone number'}), 400
+            if _same_us_phone(agent_phone, insurance_phone):
+                return jsonify({
+                    'success': False,
+                    'error': 'Agent phone must be a staff/user phone, not the insurance phone.'
+                }), 400
 
         # Acquire a Twilio number only after request validation that can fail fast.
         from_number = _acquire_twilio_number(call_id)
@@ -3813,6 +3845,70 @@ def get_call_transcript(call_id: str):
     }), 200
 
 
+@app.route('/api/call-transcript/<call_id>/backfill-agent-recording', methods=['POST'])
+@admin_required
+def backfill_agent_recording_transcript(call_id: str):
+    """
+    Re-run post-call transcription for the longest completed Human Agent recording.
+    Useful when the recording webhook completed but no agent_transcript rows exist.
+    """
+    try:
+        from credentialing_agent import DatabaseManager
+
+        db = DatabaseManager()
+        try:
+            with db.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT call_id, request_id::text, recording_url, recording_sid, recording_duration
+                    FROM call_recordings
+                    WHERE (request_id::text = %s OR call_id = %s)
+                      AND recording_status = 'completed'
+                      AND recording_type = 'agent'
+                    ORDER BY recording_duration DESC NULLS LAST, created_at DESC
+                    LIMIT 1
+                    """,
+                    (call_id, call_id),
+                )
+                recording = cur.fetchone()
+        finally:
+            db.close()
+
+        if not recording:
+            return jsonify({
+                'success': False,
+                'error': 'No completed Human Agent recording found for this call'
+            }), 404
+
+        runtime_call_id, request_id, recording_url, recording_sid, recording_duration = recording
+
+        def _worker():
+            try:
+                from transcribe_recording import transcribe_agent_recording
+                transcribe_agent_recording(
+                    str(runtime_call_id),
+                    recording_url,
+                    request_id or call_id,
+                )
+            except Exception as exc:
+                logger.error(f"Agent recording transcript backfill failed for {call_id}: {exc}", exc_info=True)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+        return jsonify({
+            'success': True,
+            'message': 'Agent recording transcript backfill started',
+            'call_id': str(runtime_call_id),
+            'request_id': request_id,
+            'recording_sid': recording_sid,
+            'recording_duration': recording_duration,
+        }), 202
+
+    except Exception as e:
+        logger.error(f"Backfill agent recording transcript error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/call-qa/extract/<call_id>', methods=['POST'])
 @admin_required
 def extract_call_qa(call_id: str):
@@ -5616,6 +5712,16 @@ def transfer_to_agent():
             )
         if not call_state:
             return jsonify({'success': False, 'error': 'Call not found or already ended'}), 404
+
+        normalized_agent_phone = _normalize_us_phone(agent_phone)
+        if not normalized_agent_phone:
+            return jsonify({'success': False, 'error': 'agent_phone must be a valid US phone number'}), 400
+        if _same_us_phone(normalized_agent_phone, call_state.get('insurance_phone')):
+            return jsonify({
+                'success': False,
+                'error': 'Agent phone must be a staff/user phone, not the insurance phone.'
+            }), 400
+        agent_phone = normalized_agent_phone
 
         call_sid = call_state.get('call_sid')
         if not call_sid:
