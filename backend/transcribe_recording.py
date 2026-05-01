@@ -1,10 +1,14 @@
 """
-Post-call transcription for agent-transferred recordings using OpenAI Whisper.
+Post-call transcription for agent-transferred recordings.
 
 When a call is transferred to a real human agent, the conversation happens in a
 Twilio Conference and is not captured as text.  This module downloads the
-conference recording from Twilio and transcribes it via OpenAI Whisper, then
-saves the transcript to conversation_history so it appears in the call detail UI.
+conference recording from Twilio and transcribes it — first attempting
+Deepgram's pre-recorded API (which supports speaker diarization), then falling
+back to OpenAI Whisper if Deepgram is unavailable or fails.
+
+Diarized entries are saved with speaker = 'transcript_speaker_N'.
+Whisper fallback entries are saved with speaker = 'agent_transcript'.
 """
 
 import io
@@ -52,12 +56,17 @@ def _chunk_transcript(text: str, max_chars: int = 420, max_sentences: int = 4) -
 
 
 def _has_agent_transcript(db, call_id: str, request_id: str = None) -> bool:
+    """Check whether any transcript entries already exist for this call.
+
+    Matches both legacy 'agent_transcript' speaker values and diarized
+    'transcript_speaker_N' entries so we do not double-transcribe calls.
+    """
     with db.conn.cursor() as cur:
         cur.execute(
             """
             SELECT 1
             FROM conversation_history
-            WHERE speaker = 'agent_transcript'
+            WHERE (speaker = 'agent_transcript' OR speaker LIKE 'transcript_speaker_%')
               AND (call_id = %s OR request_id::text = %s)
             LIMIT 1
             """,
@@ -66,10 +75,81 @@ def _has_agent_transcript(db, call_id: str, request_id: str = None) -> bool:
         return cur.fetchone() is not None
 
 
+def _transcribe_with_deepgram(audio_data: bytes, call_id: str) -> list[dict] | None:
+    """Transcribe audio using Deepgram's pre-recorded API with speaker diarization.
+
+    Returns a list of dicts with keys 'speaker' and 'message' — one entry per
+    utterance — or None if Deepgram is unavailable or transcription fails, so
+    the caller can fall back to Whisper.
+    """
+    try:
+        from deepgram import DeepgramClient, PrerecordedOptions
+    except ImportError:
+        logger.warning("[transcribe] deepgram-sdk not installed; skipping Deepgram transcription")
+        return None
+
+    api_key = os.getenv("DEEPGRAM_API_KEY")
+    if not api_key:
+        logger.warning(
+            f"[transcribe] DEEPGRAM_API_KEY not set for call_id={call_id}; skipping Deepgram"
+        )
+        return None
+
+    try:
+        client = DeepgramClient(api_key)
+
+        source = {"buffer": audio_data, "mimetype": "audio/mp3"}
+        options = PrerecordedOptions(
+            model=os.getenv("DEEPGRAM_MODEL", "nova-2"),
+            language="en-US",
+            diarize=True,
+            utterances=True,
+            punctuate=True,
+            smart_format=True,
+        )
+
+        response = client.listen.prerecorded.v("1").transcribe_file(source, options)
+
+        utterances = response.results.utterances
+        if not utterances:
+            logger.warning(
+                f"[transcribe] Deepgram returned no utterances for call_id={call_id}"
+            )
+            return None
+
+        entries = []
+        for u in utterances:
+            text = u.transcript.strip() if u.transcript else ""
+            if not text:
+                continue
+            entries.append(
+                {
+                    "speaker": f"transcript_speaker_{u.speaker}",
+                    "message": text,
+                }
+            )
+
+        logger.info(
+            f"[transcribe] Deepgram returned {len(entries)} utterance(s) for call_id={call_id}"
+        )
+        return entries if entries else None
+
+    except Exception as e:
+        logger.error(
+            f"[transcribe] Deepgram transcription failed for call_id={call_id}: {e}"
+        )
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def transcribe_agent_recording(call_id: str, recording_url: str, request_id: str = None, force: bool = False):
     """
-    Download a Twilio recording and transcribe it with OpenAI Whisper.
-    Saves the resulting transcript to conversation_history.
+    Download a Twilio recording and transcribe it.
+
+    Attempts Deepgram diarization first; falls back to OpenAI Whisper if
+    Deepgram is unavailable or returns no results.  Saves the transcript to
+    conversation_history so it appears in the call detail UI.
 
     This is designed to be called in a background thread from the recording
     webhook when call_mode='agent'.
@@ -117,40 +197,60 @@ def transcribe_agent_recording(call_id: str, recording_url: str, request_id: str
 
         logger.info(f"[transcribe] Downloaded {len(audio_data)} bytes for call_id={call_id}")
 
-        # Transcribe with OpenAI Whisper
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        # --- Primary: Deepgram with speaker diarization ---
+        transcript_entries = _transcribe_with_deepgram(audio_data, call_id)
 
-        # Write to a temp file since OpenAI SDK expects a file-like object with a name
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-            tmp.write(audio_data)
-            tmp_path = tmp.name
+        if transcript_entries:
+            logger.info(
+                f"[transcribe] Using Deepgram diarized transcript "
+                f"({len(transcript_entries)} entries) for call_id={call_id}"
+            )
+        else:
+            # --- Fallback: OpenAI Whisper (no diarization) ---
+            logger.info(
+                f"[transcribe] Falling back to Whisper for call_id={call_id}"
+            )
+            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-        try:
-            with open(tmp_path, "rb") as audio_file:
-                transcription = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    response_format="text",
-                )
-        finally:
+            # Write to a temp file since OpenAI SDK expects a file-like object with a name
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                tmp.write(audio_data)
+                tmp_path = tmp.name
+
             try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+                with open(tmp_path, "rb") as audio_file:
+                    transcription = client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=audio_file,
+                        response_format="text",
+                    )
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
-        transcript_text = transcription.strip() if isinstance(transcription, str) else str(transcription).strip()
+            transcript_text = (
+                transcription.strip()
+                if isinstance(transcription, str)
+                else str(transcription).strip()
+            )
 
-        if not transcript_text:
-            logger.warning(f"[transcribe] Empty transcript for call_id={call_id}")
-            return
+            if not transcript_text:
+                logger.warning(f"[transcribe] Empty Whisper transcript for call_id={call_id}")
+                return
 
-        logger.info(
-            f"[transcribe] Transcribed {len(transcript_text)} chars for call_id={call_id}"
-        )
+            logger.info(
+                f"[transcribe] Whisper transcribed {len(transcript_text)} chars "
+                f"for call_id={call_id}"
+            )
 
-        transcript_chunks = _chunk_transcript(transcript_text)
+            transcript_entries = [
+                {"speaker": "agent_transcript", "message": chunk}
+                for chunk in _chunk_transcript(transcript_text)
+            ]
 
-        # Save to conversation_history
+        # --- Save entries to conversation_history ---
         db = DatabaseManager()
         try:
             if not force and _has_agent_transcript(db, call_id, request_id):
@@ -159,15 +259,15 @@ def transcribe_agent_recording(call_id: str, recording_url: str, request_id: str
                     f"for call_id={call_id}; skipping save"
                 )
                 return
-            for chunk in transcript_chunks:
+            for entry in transcript_entries:
                 db.save_conversation(
                     call_id=call_id,
-                    speaker='agent_transcript',
-                    message=chunk,
+                    speaker=entry["speaker"],
+                    message=entry["message"],
                     request_id=request_id,
                 )
             logger.info(
-                f"[transcribe] Saved {len(transcript_chunks)} transcript chunk(s) "
+                f"[transcribe] Saved {len(transcript_entries)} transcript entry/entries "
                 f"to conversation_history for call_id={call_id}"
             )
         finally:

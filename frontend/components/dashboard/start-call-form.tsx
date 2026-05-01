@@ -35,6 +35,7 @@ const AGENTS = [
   { name: 'Edcel Santiago',       phone: '4108345799'   },
   { name: 'Cristel Mae Cabe',     phone: '7252261427'   },
   { name: 'Ma. Grace Amatosa',    phone: '7252285837'   },
+  { name: 'Test',                 phone: '8184576953'   },
 ]
 
 const callFormSchema = z.object({

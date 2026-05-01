@@ -520,96 +520,158 @@ export default function CallDetailPage() {
             <CardContent>
               {call.conversation && call.conversation.length > 0 ? (
                 <div className="space-y-3">
-                  {call.conversation.map(
-                    (msg: {
+                  {(() => {
+                    type ConvMsg = {
                       speaker: string
                       message: string
                       timestamp?: string
                       is_question?: boolean
                       is_answer?: boolean
                       related_qa_id?: string
-                    }, i: number) => (
-                      (() => {
-                        const isAgentTranscript = msg.speaker === 'agent_transcript'
-                        const transcriptParagraphs = isAgentTranscript
-                          ? splitTranscriptParagraphs(msg.message)
-                          : []
+                    }
+                    type Group =
+                      | { type: 'transcript'; messages: ConvMsg[] }
+                      | { type: 'message'; msg: ConvMsg }
 
+                    // Helpers for diarized speaker entries (transcript_speaker_N)
+                    const isSpeakerEntry = (s: string) => /^transcript_speaker_\d+$/.test(s)
+                    const getSpeakerNum = (s: string) => {
+                      const m = s.match(/^transcript_speaker_(\d+)$/)
+                      return m ? parseInt(m[1], 10) : 0
+                    }
+                    const speakerBubbleClass = [
+                      'bg-slate-100 border border-slate-200 text-foreground',   // Speaker 0 — left
+                      'bg-indigo-50 border border-indigo-200 text-foreground',  // Speaker 1 — right
+                      'bg-amber-50 border border-amber-200 text-foreground',    // Speaker 2 — left
+                    ]
+                    const speakerLabel = (n: number) => `Speaker ${n + 1}`
+
+                    const groups: Group[] = []
+                    for (const msg of call.conversation as ConvMsg[]) {
+                      if (msg.speaker === 'agent_transcript') {
+                        const last = groups[groups.length - 1]
+                        if (last?.type === 'transcript') {
+                          last.messages.push(msg)
+                        } else {
+                          groups.push({ type: 'transcript', messages: [msg] })
+                        }
+                      } else {
+                        groups.push({ type: 'message', msg })
+                      }
+                    }
+
+                    return groups.map((group, groupIdx) => {
+                      if (group.type === 'transcript') {
+                        const allParagraphs = group.messages.flatMap(m =>
+                          splitTranscriptParagraphs(m.message)
+                        )
+                        const firstTimestamp = group.messages[0]?.timestamp
                         return (
-                      <div
-                        key={i}
-                        className={`flex gap-3 ${
-                          msg.speaker === 'agent' ? 'justify-end' : 'justify-start'
-                        }`}
-                      >
-                        <div
-                          className={`rounded-lg px-4 py-2 ${
-                            isAgentTranscript
-                              ? 'max-w-full border bg-sky-50/60'
-                              : 'max-w-[80%]'
-                          } ${
-                            msg.speaker === 'agent'
-                              ? 'bg-primary text-primary-foreground'
-                              : 'bg-muted'
-                          } ${
-                            msg.is_question || msg.is_answer
-                              ? 'ring-2 ring-yellow-400/50'
-                              : ''
-                          }`}
-                        >
-                          <div className="flex items-center gap-2 mb-1 flex-wrap">
-                            <span className="text-xs font-medium opacity-80">
-                              {msg.speaker === 'agent'
-                                ? 'AI Agent'
-                                : msg.speaker === 'ivr'
-                                  ? 'IVR System'
-                                  : msg.speaker === 'agent_transcript'
-                                    ? 'Recorded Agent Call'
-                                    : 'Representative'}
-                            </span>
-                            {msg.timestamp && (
-                              <LocalDateTime
-                                value={msg.timestamp}
-                                fallback=""
-                                className="text-xs opacity-60"
-                              />
-                            )}
-                            {isAgentTranscript && (
+                          <div
+                            key={groupIdx}
+                            className="rounded-lg border bg-sky-50/60 px-4 py-3 max-w-full"
+                          >
+                            <div className="flex items-center gap-2 mb-2 flex-wrap">
+                              <span className="text-xs font-medium opacity-80">
+                                Recorded Agent Call
+                              </span>
+                              {firstTimestamp && (
+                                <LocalDateTime
+                                  value={firstTimestamp}
+                                  fallback=""
+                                  className="text-xs opacity-60"
+                                />
+                              )}
                               <Badge variant="outline" className="text-xs h-5">
                                 Auto Transcript
                               </Badge>
-                            )}
-                            {msg.is_question && (
-                              <Badge variant="outline" className="text-xs h-5">
-                                Q
-                              </Badge>
-                            )}
-                            {msg.is_answer && (
-                              <Badge variant="outline" className="text-xs h-5">
-                                A
-                              </Badge>
-                            )}
-                          </div>
-                          {isAgentTranscript ? (
-                            <div className="space-y-3">
-                              {transcriptParagraphs.map((paragraph, paragraphIndex) => (
+                            </div>
+                            <div className="space-y-2">
+                              {allParagraphs.map((paragraph, pIdx) => (
                                 <p
-                                  key={paragraphIndex}
+                                  key={pIdx}
                                   className="text-sm leading-6 text-foreground whitespace-pre-wrap"
                                 >
                                   {paragraph}
                                 </p>
                               ))}
                             </div>
-                          ) : (
-                            <p className="text-sm">{msg.message}</p>
-                          )}
-                        </div>
-                      </div>
+                          </div>
                         )
-                      })()
-                    )
-                  )}
+                      }
+
+                      const msg = group.msg
+
+                      // Diarized speaker bubble (transcript_speaker_N) — rendered individually
+                      if (isSpeakerEntry(msg.speaker)) {
+                        const n = getSpeakerNum(msg.speaker)
+                        const colorClass = speakerBubbleClass[n % speakerBubbleClass.length]
+                        return (
+                          <div key={groupIdx} className={`flex gap-3 ${n === 1 ? 'justify-end' : 'justify-start'}`}>
+                            <div className={`rounded-lg px-4 py-2 max-w-[80%] ${colorClass}`}>
+                              <div className="flex items-center gap-2 mb-1 flex-wrap">
+                                <span className="text-xs font-medium opacity-80">{speakerLabel(n)}</span>
+                                {msg.timestamp && (
+                                  <LocalDateTime value={msg.timestamp} fallback="" className="text-xs opacity-60" />
+                                )}
+                                <Badge variant="outline" className="text-xs h-5">Auto Transcript</Badge>
+                              </div>
+                              <p className="text-sm">{msg.message}</p>
+                            </div>
+                          </div>
+                        )
+                      }
+
+                      return (
+                        <div
+                          key={groupIdx}
+                          className={`flex gap-3 ${
+                            msg.speaker === 'agent' ? 'justify-end' : 'justify-start'
+                          }`}
+                        >
+                          <div
+                            className={`rounded-lg px-4 py-2 max-w-[80%] ${
+                              msg.speaker === 'agent'
+                                ? 'bg-primary text-primary-foreground'
+                                : 'bg-muted'
+                            } ${
+                              msg.is_question || msg.is_answer
+                                ? 'ring-2 ring-yellow-400/50'
+                                : ''
+                            }`}
+                          >
+                            <div className="flex items-center gap-2 mb-1 flex-wrap">
+                              <span className="text-xs font-medium opacity-80">
+                                {msg.speaker === 'agent'
+                                  ? 'AI Agent'
+                                  : msg.speaker === 'ivr'
+                                    ? 'IVR System'
+                                    : 'Representative'}
+                              </span>
+                              {msg.timestamp && (
+                                <LocalDateTime
+                                  value={msg.timestamp}
+                                  fallback=""
+                                  className="text-xs opacity-60"
+                                />
+                              )}
+                              {msg.is_question && (
+                                <Badge variant="outline" className="text-xs h-5">
+                                  Q
+                                </Badge>
+                              )}
+                              {msg.is_answer && (
+                                <Badge variant="outline" className="text-xs h-5">
+                                  A
+                                </Badge>
+                              )}
+                            </div>
+                            <p className="text-sm">{msg.message}</p>
+                          </div>
+                        </div>
+                      )
+                    })
+                  })()}
                 </div>
               ) : (
                 <div className="flex flex-col items-center justify-center py-8 text-center">

@@ -10,7 +10,6 @@ import {
   BarChart3,
   Settings,
   Users,
-  PhoneCall,
   type LucideIcon,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -29,7 +28,6 @@ const adminNavItems: NavItem[] = [
   { href: '/analytics', label: 'Analytics', icon: BarChart3 },
   { href: '/settings', label: 'Settings', icon: Settings },
   { href: '/settings/users', label: 'Users', icon: Users },
-  { href: '/settings/phone-numbers', label: 'Phone Lines', icon: PhoneCall },
 ]
 
 const superAdminNavItems: NavItem[] = [
@@ -39,7 +37,7 @@ const superAdminNavItems: NavItem[] = [
 
 const agentNavItems: NavItem[] = [
   { href: '/calls', label: 'My Calls', icon: Phone },
-  { href: '/calls/new', label: 'New Call', icon: PhoneCall },
+  { href: '/calls/new', label: 'New Call', icon: Phone },
 ]
 
 export function SidebarNav() {

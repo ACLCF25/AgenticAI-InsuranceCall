@@ -16,7 +16,6 @@ const pageTitles: Record<string, string> = {
   '/analytics': 'Analytics',
   '/settings': 'Settings',
   '/settings/users': 'User Access',
-  '/settings/phone-numbers': 'Phone Lines',
   '/settings/audit': 'Audit Trail',
 }
 

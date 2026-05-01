@@ -1063,7 +1063,6 @@ class TelephonyManager:
             record=True,
             recording_status_callback=recording_status_callback,
             recording_status_callback_event=['completed', 'failed'],
-            machine_detection="Enable"
         )
         return call.sid
     
@@ -1883,6 +1882,10 @@ Keep answers redacted of NPIs/tax IDs/phones; keep 3-5 QA pairs max."""),
     def _route_after_init(self, state: CredentialingState) -> str:
         """Route after initialization"""
         if state.get('error_message'):
+            return "error"
+        # Agent mode: Flask webhooks own the call; exit the graph immediately
+        # so it doesn't spin 25 empty classify loops before Twilio even connects.
+        if state.get('call_mode') == 'agent':
             return "error"
         return "classify"
     

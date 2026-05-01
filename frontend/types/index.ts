@@ -271,17 +271,6 @@ export interface AuditLogEntry {
   timestamp: string;
 }
 
-export interface TwilioNumber {
-  id: string;
-  phone_number: string;
-  friendly_name: string | null;
-  is_active: boolean;
-  current_call_id: string | null;
-  current_call_sid: string | null;
-  in_use_since: string | null;
-  created_at: string;
-  updated_at: string;
-}
 
 export interface LangSmithTrace {
   run_id: string;

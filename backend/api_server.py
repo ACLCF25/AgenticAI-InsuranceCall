@@ -197,9 +197,24 @@ def _seed_twilio_numbers():
                 cur.execute(
                     "INSERT INTO twilio_numbers (phone_number, friendly_name, is_active) "
                     "VALUES (%s, %s, TRUE) "
-                    "ON CONFLICT (phone_number) DO NOTHING",
+                    "ON CONFLICT (phone_number) DO UPDATE SET "
+                    "  is_active = TRUE, "
+                    "  current_call_id = NULL, "
+                    "  current_call_sid = NULL, "
+                    "  in_use_since = NULL, "
+                    "  updated_at = NOW()",
                     (phone, f"ENV: {phone}"),
                 )
+            # Remove ALL numbers not in the current env config
+            placeholders = ",".join(["%s"] * len(numbers))
+            cur.execute(
+                f"DELETE FROM twilio_numbers "
+                f"WHERE phone_number NOT IN ({placeholders})",
+                tuple(numbers),
+            )
+            deleted = cur.rowcount
+            if deleted:
+                logger.info(f"Removed {deleted} stale Twilio number(s) from pool")
         conn.commit()
         logger.info(f"Seeded {len(numbers)} Twilio number(s) from env")
     except Exception as e:
@@ -250,28 +265,29 @@ def _acquire_twilio_number(call_id: str, call_sid: str = None):
 
 
 def _release_twilio_number(call_id: str = None, call_sid: str = None):
-    """Release a Twilio number back to the pool."""
+    """Release a Twilio number back to the pool.
+    Matches by call_id OR call_sid so the row is found even if one was never written.
+    """
     if not call_id and not call_sid:
         return
     conn = _tp_get_conn()
     try:
         with conn.cursor() as cur:
+            conditions, params = [], []
             if call_id:
-                cur.execute(
-                    "UPDATE twilio_numbers "
-                    "SET current_call_id = NULL, current_call_sid = NULL, "
-                    "    in_use_since = NULL, updated_at = NOW() "
-                    "WHERE current_call_id = %s",
-                    (call_id,),
-                )
-            elif call_sid:
-                cur.execute(
-                    "UPDATE twilio_numbers "
-                    "SET current_call_id = NULL, current_call_sid = NULL, "
-                    "    in_use_since = NULL, updated_at = NOW() "
-                    "WHERE current_call_sid = %s",
-                    (call_sid,),
-                )
+                conditions.append("current_call_id = %s")
+                params.append(call_id)
+            if call_sid:
+                conditions.append("current_call_sid = %s")
+                params.append(call_sid)
+            where = " OR ".join(conditions)
+            cur.execute(
+                f"UPDATE twilio_numbers "
+                f"SET current_call_id = NULL, current_call_sid = NULL, "
+                f"    in_use_since = NULL, updated_at = NOW() "
+                f"WHERE {where}",
+                params,
+            )
         conn.commit()
         logger.info(f"Released Twilio number (call_id={call_id}, call_sid={call_sid})")
     except Exception as e:
@@ -1772,6 +1788,11 @@ def start_credentialing_call():
 
                 # Update stored state with final state
                 register_call_state(call_id, final_state)
+                # Persist call_sid into twilio_numbers so the status callback
+                # can release the number by call_sid when the call ends.
+                _call_sid_from_graph = final_state.get('call_sid')
+                if _call_sid_from_graph:
+                    _update_twilio_number_call_sid(call_id, _call_sid_from_graph)
                 print(f"📊 call_mode preserved in state: {final_state.get('call_mode')}")
                 print(f"✅ Call completed: {call_id}")
                 print(f"📊 Final status: {final_state.get('call_state')}")
@@ -1781,8 +1802,8 @@ def start_credentialing_call():
                 traceback.print_exc()
             finally:
                 latest_state = call_states.get(call_id, {})
-                if latest_state.get('transfer_to_agent'):
-                    logger.info(f"[{call_id}] Transfer to agent active; preserving Twilio number until terminal status callback")
+                if latest_state.get('transfer_to_agent') or latest_state.get('call_mode') == 'agent':
+                    logger.info(f"[{call_id}] Preserving Twilio number (agent mode or transfer active); will release via status callback")
                 else:
                     _release_twilio_number(call_id=call_id)
 
@@ -2772,7 +2793,7 @@ def wait_for_human_webhook():
                     response.redirect(f'{callback_base}/webhook/bridge-agent')
                     return Response(str(response), mimetype='text/xml')
 
-                elif ai_type in ('ivr_menu', 'hold_music') and ai_conf >= 0.65:
+                elif ai_type in ('ivr_menu', 'hold_music', 'silence') and ai_conf >= 0.65:
                     print(f"📞 AI confirmed automated system ({ai_type}) — continuing to wait")
                     gather = Gather(
                         input='speech',
@@ -2843,7 +2864,7 @@ def wait_for_human_webhook():
             'speaking',
             'who am i speaking with',
             'may i ask who',
-            'this is',  # Only when NOT part of automated message
+
             'good morning',
             'good afternoon',
             'good evening'
@@ -3512,25 +3533,26 @@ def status_webhook():
             state['call_state'] = CallState.FAILED
             state['error_message'] = request.values.get('ErrorMessage', 'Unknown error')
 
-    # Release Twilio number on terminal statuses (safety net)
+    # Release Twilio number on terminal statuses — pass both identifiers so
+    # the row is found even if current_call_sid was never written to the DB.
     terminal_statuses = {'completed', 'failed', 'busy', 'no-answer', 'canceled'}
     if call_status in terminal_statuses:
-        _release_twilio_number(call_sid=call_sid)
+        _release_call_id = None
+        with call_state_lock:
+            _state_by_sid = call_states_by_sid.get(call_sid)
+            if _state_by_sid:
+                _release_call_id = _state_by_sid.get('call_id')
+        if not _release_call_id:
+            for _cid, _st in list(call_states.items()):
+                if _st.get('call_sid') == call_sid:
+                    _release_call_id = _cid
+                    break
+        _release_twilio_number(call_sid=call_sid, call_id=_release_call_id)
 
     # Flush per-call log buffer on terminal statuses
     if call_status in terminal_statuses:
-        _call_id_for_flush = None
-        with call_state_lock:
-            state_by_sid = call_states_by_sid.get(call_sid)
-            if state_by_sid:
-                _call_id_for_flush = state_by_sid.get('call_id')
-        if not _call_id_for_flush:
-            for _cid, _st in list(call_states.items()):
-                if _st.get('call_sid') == call_sid:
-                    _call_id_for_flush = _cid
-                    break
-        if _call_id_for_flush:
-            _flush_call_logs(_call_id_for_flush, call_sid)
+        if _release_call_id:
+            _flush_call_logs(_release_call_id, call_sid)
 
     return jsonify({'success': True}), 200
 
@@ -3541,6 +3563,13 @@ def voice_status_webhook():
     Alias for status webhook - Twilio may call this URL
     """
     return status_webhook()
+
+
+@app.route('/webhooks/dialpad/call-events', methods=['POST'])
+@app.route('/webhooks/dialpad/agent-status', methods=['POST'])
+def dialpad_stub_webhook():
+    """Stub endpoints to absorb Dialpad app events without 404 noise."""
+    return jsonify({'success': True}), 200
 
 
 @app.route('/webhook/transcription', methods=['POST'])
@@ -5995,138 +6024,6 @@ def send_audio_to_twilio(stream_sid: str, audio_base64: str):
 
 
 # ============================================================================
-# Twilio Number Management Routes (admin only)
-# ============================================================================
-
-@app.route('/api/twilio-numbers', methods=['GET'])
-@admin_required
-def list_twilio_numbers():
-    """List all Twilio numbers with their status."""
-    conn = _tp_get_conn()
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                "SELECT id, phone_number, friendly_name, is_active, "
-                "       current_call_id, current_call_sid, in_use_since, "
-                "       created_at, updated_at "
-                "FROM twilio_numbers ORDER BY created_at ASC"
-            )
-            rows = cur.fetchall()
-        numbers = []
-        for row in rows:
-            d = dict(row)
-            d["id"] = str(d["id"])
-            for ts_field in ("in_use_since", "created_at", "updated_at"):
-                if d.get(ts_field):
-                    d[ts_field] = d[ts_field].isoformat()
-            numbers.append(d)
-        return jsonify({"numbers": numbers}), 200
-    finally:
-        _tp_put_conn(conn)
-
-
-@app.route('/api/twilio-numbers', methods=['POST'])
-@admin_required
-def add_twilio_number():
-    """Add a new Twilio number to the pool."""
-    data = request.get_json(silent=True) or {}
-    phone_number = (data.get("phone_number") or "").strip()
-    friendly_name = (data.get("friendly_name") or "").strip() or None
-
-    if not phone_number:
-        return jsonify({"error": "phone_number is required"}), 400
-
-    # Basic E.164 validation
-    if not re.match(r"^\+\d{10,15}$", phone_number):
-        return jsonify({"error": "Phone number must be in E.164 format (e.g. +13513007215)"}), 400
-
-    conn = _tp_get_conn()
-    try:
-        user_id = get_current_user_id()
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                "INSERT INTO twilio_numbers (phone_number, friendly_name, added_by) "
-                "VALUES (%s, %s, %s) "
-                "RETURNING id, phone_number, friendly_name, is_active, created_at",
-                (phone_number, friendly_name, user_id),
-            )
-            row = cur.fetchone()
-        conn.commit()
-        d = dict(row)
-        d["id"] = str(d["id"])
-        if d.get("created_at"):
-            d["created_at"] = d["created_at"].isoformat()
-        return jsonify({"number": d}), 201
-    except psycopg2.errors.UniqueViolation:
-        conn.rollback()
-        return jsonify({"error": "This phone number already exists"}), 409
-    except Exception as e:
-        conn.rollback()
-        logger.error("add_twilio_number error: %s", e)
-        return jsonify({"error": str(e)}), 500
-    finally:
-        _tp_put_conn(conn)
-
-
-@app.route('/api/twilio-numbers/<number_id>', methods=['PATCH'])
-@admin_required
-def update_twilio_number(number_id):
-    """Toggle is_active for a Twilio number."""
-    data = request.get_json(silent=True) or {}
-
-    if "is_active" not in data:
-        return jsonify({"error": "is_active field is required"}), 400
-
-    conn = _tp_get_conn()
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                "UPDATE twilio_numbers SET is_active = %s, updated_at = NOW() "
-                "WHERE id = %s "
-                "RETURNING id, phone_number, friendly_name, is_active, "
-                "         current_call_id, created_at, updated_at",
-                (bool(data["is_active"]), number_id),
-            )
-            row = cur.fetchone()
-        conn.commit()
-        if not row:
-            return jsonify({"error": "Number not found"}), 404
-        d = dict(row)
-        d["id"] = str(d["id"])
-        for ts_field in ("created_at", "updated_at"):
-            if d.get(ts_field):
-                d[ts_field] = d[ts_field].isoformat()
-        return jsonify({"number": d}), 200
-    finally:
-        _tp_put_conn(conn)
-
-
-@app.route('/api/twilio-numbers/<number_id>', methods=['DELETE'])
-@admin_required
-def delete_twilio_number(number_id):
-    """Delete a Twilio number (only if not currently in use)."""
-    conn = _tp_get_conn()
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # Check if in use
-            cur.execute(
-                "SELECT current_call_id FROM twilio_numbers WHERE id = %s",
-                (number_id,),
-            )
-            row = cur.fetchone()
-            if not row:
-                return jsonify({"error": "Number not found"}), 404
-            if row["current_call_id"]:
-                return jsonify({"error": "Cannot delete a number that is currently in use"}), 409
-
-            cur.execute("DELETE FROM twilio_numbers WHERE id = %s", (number_id,))
-        conn.commit()
-        return jsonify({"message": "Number deleted"}), 200
-    finally:
-        _tp_put_conn(conn)
-
-
-# ============================================================================
 # Main entry point
 # ============================================================================
 
@@ -6138,5 +6035,6 @@ if __name__ == '__main__':
         host='0.0.0.0',
         port=int(os.getenv('PORT', 5000)),
         debug=os.getenv('DEBUG', 'False').lower() == 'true',
-        allow_unsafe_werkzeug=True
+        allow_unsafe_werkzeug=True,
+        use_reloader=False,
     )

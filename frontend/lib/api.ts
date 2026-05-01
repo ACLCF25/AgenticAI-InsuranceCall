@@ -17,7 +17,6 @@ import type {
   DashboardStats,
   AdminUser,
   AuthUser,
-  TwilioNumber,
   HumanDetectionPhrase,
   HumanDetectionFeedbackResponse,
 } from '@/types'
@@ -205,26 +204,6 @@ class APIClient {
 
   async getAuditLogs(): Promise<{ success: boolean; data: AuditLogEntry[] }> {
     const { data } = await this.client.get('/audit-logs?limit=100')
-    return data
-  }
-
-  async getTwilioNumbers(): Promise<{ numbers: TwilioNumber[] }> {
-    const { data } = await this.client.get('/twilio-numbers')
-    return data
-  }
-
-  async addTwilioNumber(number: { phone_number: string; friendly_name?: string }): Promise<{ number: TwilioNumber }> {
-    const { data } = await this.client.post('/twilio-numbers', number)
-    return data
-  }
-
-  async updateTwilioNumber(id: string, updates: { is_active: boolean }): Promise<{ number: TwilioNumber }> {
-    const { data } = await this.client.patch(`/twilio-numbers/${id}`, updates)
-    return data
-  }
-
-  async deleteTwilioNumber(id: string): Promise<{ message: string }> {
-    const { data } = await this.client.delete(`/twilio-numbers/${id}`)
     return data
   }
 
