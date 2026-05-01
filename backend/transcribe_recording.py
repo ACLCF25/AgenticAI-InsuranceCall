@@ -66,7 +66,7 @@ def _has_agent_transcript(db, call_id: str, request_id: str = None) -> bool:
             """
             SELECT 1
             FROM conversation_history
-            WHERE (speaker = 'agent_transcript' OR speaker LIKE 'transcript_speaker_%')
+            WHERE (speaker = 'agent_transcript' OR speaker LIKE 'transcript_speaker_%%')
               AND (call_id = %s OR request_id::text = %s)
             LIMIT 1
             """,

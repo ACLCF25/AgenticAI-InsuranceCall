@@ -526,6 +526,25 @@ def build_conference_twiml(conference_name: str, recording_callback_url: str, en
     )
 
 
+def build_agent_dial_twiml(agent_phone: str, recording_callback_url: str) -> str:
+    """Dial a staff agent from the live insurance leg without an empty conference."""
+    escaped_callback_url = xml_escape(recording_callback_url, {'"': '&quot;'})
+    escaped_agent_phone = xml_escape(agent_phone)
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Response>'
+        '<Dial answerOnBridge="true" timeout="30" record="record-from-answer" '
+        f'recordingStatusCallback="{escaped_callback_url}" '
+        'recordingStatusCallbackMethod="POST" '
+        'recordingStatusCallbackEvent="completed absent">'
+        f'<Number>{escaped_agent_phone}</Number>'
+        '</Dial>'
+        '<Say>We are sorry, we could not connect the agent for this call. Goodbye.</Say>'
+        '<Hangup/>'
+        '</Response>'
+    )
+
+
 ENV_VALIDATION_OK: bool = False
 ENV_VALIDATION_ERRORS = []
 
@@ -1314,8 +1333,8 @@ _DETECTION_DEFAULTS = {
         'how can i help', 'how may i help', 'how may i assist',
         'may i help you', 'who am i speaking with', 'may i ask who',
         'what is your name', 'can i get your name',
-        'good morning', 'good afternoon', 'good evening',
         'my name is', 'may i have your', 'i can help you',
+        'provider relations',
     ],
     'ivr_definitive': [
         'press 1', 'press 2', 'press 3', 'press 4', 'press 5',
@@ -1337,8 +1356,11 @@ _DETECTION_DEFAULTS = {
         'please hold', 'please wait', 'please listen',
         'your call is important', 'your call will be',
         'all representatives', 'all agents',
+        'all representatives are assisting other callers',
+        'please remain on the line',
         'estimated wait time', 'high call volume',
         'thank you for calling', 'you have reached',
+        'thank you for your patience',
     ],
     'simple_greeting': ['hello', 'hi', 'credentialing', 'speaking'],
 }
@@ -1837,23 +1859,25 @@ def start_credentialing_call():
 
 def _bridge_to_agent(call_info, callback_base):
     """
-    Bridge the insurance call into a Twilio Conference and dial the real human agent in.
-    Returns a Flask Response with conference TwiML for the insurance leg.
+    Bridge the insurance call to the configured staff agent only after the staff
+    agent answers.
+
+    Returns a Flask Response with Dial TwiML for the insurance leg.
     Called when call_mode='agent' and a human has been detected (or no IVR to navigate).
     """
     call_state_obj = call_info['state']
-    conf_name = call_info['call_id']
+    call_id = call_info['call_id']
     agent_phone_number = call_state_obj.get('agent_phone')
     recording_callback_url = build_recording_status_callback(
         callback_base,
-        call_id=conf_name,
+        call_id=call_id,
         request_id=call_state_obj.get('db_request_id'),
     )
 
-    logger.info(f"[bridge_to_agent] Bridging call_id={conf_name} to agent_phone={agent_phone_number}")
+    logger.info(f"[bridge_to_agent] Bridging call_id={call_id} to agent_phone={agent_phone_number}")
 
     if not agent_phone_number:
-        logger.error(f"[bridge_to_agent] agent_phone missing for call_id={conf_name}")
+        logger.error(f"[bridge_to_agent] agent_phone missing for call_id={call_id}")
         error_twiml = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<Response>'
@@ -1862,52 +1886,18 @@ def _bridge_to_agent(call_info, callback_base):
         )
         return Response(error_twiml, mimetype='text/xml')
 
-    # TwiML for the insurance leg — enters the conference and closes it when insurance hangs up
-    conference_twiml = build_conference_twiml(
-        conf_name,
-        recording_callback_url=recording_callback_url,
-        end_on_exit=True,
-    )
-
-    # TwiML for the agent leg — enters the same conference
-    agent_conference_twiml = build_conference_twiml(
-        conf_name,
-        recording_callback_url=recording_callback_url,
-        end_on_exit=False,
-    )
-
-    def _dial_agent_into_conference():
-        try:
-            from_number = call_state_obj.get('from_number') or os.getenv("TWILIO_PHONE_NUMBER")
-            agent_call = twilio_client.calls.create(
-                to=agent_phone_number,
-                from_=from_number,
-                twiml=agent_conference_twiml,
-                timeout=30,
-            )
-            call_state_obj['conference_sid'] = agent_call.sid
-            logger.info(f"[bridge_to_agent] Dialed agent {agent_phone_number} into conference {conf_name}, agent call SID={agent_call.sid}")
-        except Exception as dial_err:
-            logger.error(f"[bridge_to_agent] Failed to dial agent into conference: {dial_err}")
-            insurance_call_sid = call_state_obj.get('call_sid')
-            if insurance_call_sid:
-                failure_twiml = (
-                    '<?xml version="1.0" encoding="UTF-8"?>'
-                    '<Response>'
-                    '<Say>We are sorry, we could not connect the agent for this call. Goodbye.</Say>'
-                    '<Hangup/>'
-                    '</Response>'
-                )
-                try:
-                    twilio_client.calls(insurance_call_sid).update(twiml=failure_twiml)
-                except Exception as update_err:
-                    logger.error(f"[bridge_to_agent] Failed to update insurance leg after agent dial failure: {update_err}")
+    # Twilio keeps the insurance leg ringing until the staff agent answers.
+    dial_twiml = build_agent_dial_twiml(agent_phone_number, recording_callback_url)
 
     call_state_obj['call_state'] = CallState.SPEAKING_WITH_HUMAN
     call_state_obj['transfer_to_agent'] = True
-    threading.Thread(target=_dial_agent_into_conference, daemon=True).start()
+    call_state_obj['conference_sid'] = None
+    logger.info(
+        f"[bridge_to_agent] Returning answerOnBridge Dial TwiML for call_id={call_id}; "
+        "insurance leg will not bridge until staff agent answers"
+    )
 
-    return Response(conference_twiml, mimetype='text/xml')
+    return Response(dial_twiml, mimetype='text/xml')
 
 
 @app.route('/webhook/voice', methods=['POST'])
@@ -2492,7 +2482,7 @@ def ivr_navigate_webhook():
                         language='en-US'
                     )
                     response.append(gather)
-                    response.redirect(f'{callback_base}/webhook/voice/human')
+                    response.redirect(f'{callback_base}/webhook/wait-for-human')
             else:
                 # No match - might be IVR announcement, human, or different IVR prompt
                 # Track how many times we've heard unmatched speech
@@ -2516,7 +2506,8 @@ def ivr_navigate_webhook():
 
                 matched_human = [ind for ind in human_indicators if ind in speech_lower]
                 matched_greeting = [g for g in simple_greetings if g in speech_lower and len(speech_result) < 50]
-                is_human = bool(matched_human or matched_greeting)
+                is_live_rep = bool(matched_human)
+                is_human = bool(is_live_rep or matched_greeting)
 
                 is_definitive_ivr = any(ind in speech_lower for ind in definitive_ivr_indicators)
                 is_passive_ivr    = any(ind in speech_lower for ind in passive_ivr_indicators)
@@ -2572,6 +2563,21 @@ def ivr_navigate_webhook():
                     response.append(gather)
                     response.redirect(f'{callback_base}/webhook/ivr-navigate')
                 elif is_human and state['ivr_unmatched_count'] >= 1:
+                    if state.get('call_mode') == 'agent' and not is_live_rep:
+                        print("Generic greeting detected in agent mode - continuing to wait for a live representative")
+                        state['call_state'] = CallState.WAITING_FOR_HUMAN
+                        state['wait_start_time'] = utcnow_iso()
+                        gather = Gather(
+                            input='speech',
+                            action=f'{callback_base}/webhook/wait-for-human',
+                            method='POST',
+                            speech_timeout='2',
+                            timeout=15,
+                            language='en-US'
+                        )
+                        response.append(gather)
+                        response.redirect(f'{callback_base}/webhook/wait-for-human')
+                        return Response(str(response), mimetype='text/xml')
                     # Respond immediately on the first human signal.
                     # IVR counter-indicators already filter out pure IVR speech, so
                     # threshold=1 is safe — waiting longer just causes the agent to hang up.
@@ -2590,6 +2596,21 @@ def ivr_navigate_webhook():
                     else:
                         response.redirect(f'{callback_base}/webhook/voice/human')
                 elif state['ivr_unmatched_count'] >= 8:
+                    if state.get('call_mode') == 'agent':
+                        print("Unmatched IVR speech threshold reached in agent mode; waiting for a stronger live-rep signal")
+                        state['call_state'] = CallState.WAITING_FOR_HUMAN
+                        state['wait_start_time'] = utcnow_iso()
+                        gather = Gather(
+                            input='speech',
+                            action=f'{callback_base}/webhook/wait-for-human',
+                            method='POST',
+                            speech_timeout='2',
+                            timeout=15,
+                            language='en-US'
+                        )
+                        response.append(gather)
+                        response.redirect(f'{callback_base}/webhook/wait-for-human')
+                        return Response(str(response), mimetype='text/xml')
                     # Many unmatched attempts with no IVR counter-signal — assume human or unknown system
                     print(f"👤 Switching to human mode after {state['ivr_unmatched_count']} unmatched attempts")
                     _log_ivr_event(
@@ -2771,6 +2792,31 @@ def wait_for_human_webhook():
         wait_start = datetime.fromisoformat(state['wait_start_time'])
         wait_duration_minutes = (utcnow() - wait_start).total_seconds() / 60
 
+        queue_or_hold_indicators = [
+            'all representatives are busy',
+            'all representatives are assisting other callers',
+            'all agents are busy',
+            'all of our representatives',
+            'currently assisting other callers',
+            'your call will be answered in the order',
+            'please stay on the line',
+            'please remain on the line',
+            'continue to hold',
+            'press 1 to continue holding',
+            'press 2 if you prefer a call back',
+            'press 3 to leave a message',
+            'your position in queue',
+            'estimated wait time',
+            'currently experiencing high call volume',
+            'you have reached out to',
+            'thank you for calling',
+            'this call is being recorded',
+            'for quality assurance purposes',
+            'your call is important',
+            'thank you for your patience',
+        ]
+        speech_has_queue_or_hold = any(ind in speech_lower for ind in queue_or_hold_indicators)
+
         # ── AI-assisted classification (agent mode only) ──────────────────────────
         # Uses gpt-4o-mini to classify each speech chunk as human/IVR/hold/silence.
         # Only runs for agent-transfer calls — adds ~0.5-1s latency per webhook but
@@ -2787,7 +2833,7 @@ def wait_for_human_webhook():
                 ai_conf = float(ai_result.get('confidence', 0.0))
                 print(f"🤖 AI classification: {ai_type} (confidence={ai_conf:.2f}) — {ai_result.get('reasoning', '')}")
 
-                if ai_type == 'human_speech' and ai_conf >= 0.65:
+                if ai_type == 'human_speech' and ai_conf >= 0.65 and not speech_has_queue_or_hold:
                     print(f"✅ AI confirmed human after {wait_duration_minutes:.1f} min — bridging to agent")
                     state['call_state'] = CallState.SPEAKING_WITH_HUMAN
                     response.redirect(f'{callback_base}/webhook/bridge-agent')
@@ -2804,7 +2850,7 @@ def wait_for_human_webhook():
                         language='en-US'
                     )
                     response.append(gather)
-                    response.redirect(f'{callback_base}/webhook/voice/human')
+                    response.redirect(f'{callback_base}/webhook/wait-for-human')
                     return Response(str(response), mimetype='text/xml')
                 # Low confidence or 'silence' → fall through to keyword logic below
         # ── End AI classification ─────────────────────────────────────────────────
@@ -2815,7 +2861,10 @@ def wait_for_human_webhook():
         strong_human_indicators = [
             'my name is',
             'i can help you',
+            'how can i help',
+            'how may i help',
             'how can i assist',
+            'provider relations',
             'may i have your',
             'can i have your',
         ]
@@ -2825,11 +2874,13 @@ def wait_for_human_webhook():
         # These are definitive indicators that it's NOT a human
         queue_system_indicators = [
             'all representatives are busy',
+            'all representatives are assisting other callers',
             'all agents are busy',
             'all of our representatives',
             'currently assisting other callers',
             'your call will be answered in the order',
             'please stay on the line',
+            'please remain on the line',
             'continue to hold',
             'press 1 to continue holding',
             'press 2 if you prefer a call back',
@@ -2840,7 +2891,8 @@ def wait_for_human_webhook():
             'you have reached out to',  # "you have reached out to X department"
             'thank you for calling',
             'this call is being recorded',
-            'for quality assurance purposes'
+            'for quality assurance purposes',
+            'thank you for your patience',
         ]
         is_queue_system = any(indicator in speech_lower for indicator in queue_system_indicators)
 
@@ -2864,18 +2916,15 @@ def wait_for_human_webhook():
             'speaking',
             'who am i speaking with',
             'may i ask who',
-
-            'good morning',
-            'good afternoon',
-            'good evening'
         ]
         # Simple greetings only count as human if message is SHORT (not part of long automated message)
         simple_greetings = ['hello', 'hi', 'credentialing department']
 
-        is_human = (
-            any(indicator in speech_lower for indicator in human_indicators) or
-            (any(greeting in speech_lower for greeting in simple_greetings) and len(speech_result) < 50)
+        has_human_indicator = any(indicator in speech_lower for indicator in human_indicators)
+        has_simple_greeting = (
+            any(greeting in speech_lower for greeting in simple_greetings) and len(speech_result) < 50
         )
+        is_human = has_human_indicator or has_simple_greeting
 
         # DECISION LOGIC - Priority order matters!
 
@@ -2907,7 +2956,7 @@ def wait_for_human_webhook():
                     language='en-US'
                 )
                 response.append(gather)
-                response.redirect(f'{callback_base}/webhook/voice/human')
+                response.redirect(f'{callback_base}/webhook/wait-for-human')
             else:
                 # Waited too long in queue - hang up
                 print(f"⏰ Queue wait time exceeded ({wait_duration_minutes:.1f} minutes) - hanging up")
@@ -2918,6 +2967,19 @@ def wait_for_human_webhook():
 
         # PRIORITY 2: Detected human (and NO queue/transfer indicators)
         elif is_human and not is_very_short:
+            if state.get('call_mode') == 'agent' and not has_human_indicator:
+                print("Generic greeting detected in agent mode - continuing to wait for a live representative")
+                gather = Gather(
+                    input='speech',
+                    action=f'{callback_base}/webhook/wait-for-human',
+                    method='POST',
+                    speech_timeout='2',
+                    timeout=15,
+                    language='en-US'
+                )
+                response.append(gather)
+                response.redirect(f'{callback_base}/webhook/wait-for-human')
+                return Response(str(response), mimetype='text/xml')
             # Confident this is a real human - proceed with disclosure (or bridge agent)
             print(f"✅ Human detected after {wait_duration_minutes:.1f} minutes! Starting conversation")
             print(f"   Heard: {speech_result[:100]}...")
@@ -2960,7 +3022,7 @@ def wait_for_human_webhook():
             )
             response.append(gather)
             # If Gather times out, try speaking anyway
-            response.redirect(f'{callback_base}/webhook/voice/human')
+            response.redirect(f'{callback_base}/webhook/wait-for-human')
 
         return Response(str(response), mimetype='text/xml')
 
