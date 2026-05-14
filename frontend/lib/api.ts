@@ -4,6 +4,7 @@
 import axios, { AxiosInstance, InternalAxiosRequestConfig } from 'axios'
 import type {
   AuditLogEntry,
+  CallLogEntry,
   CredentialingRequest,
   CallStatus,
   CallTranscript,
