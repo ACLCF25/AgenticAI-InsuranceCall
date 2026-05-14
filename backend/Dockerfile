@@ -20,7 +20,7 @@ COPY requirements.txt .
 
 # Install Python dependencies + production server
 RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir gunicorn eventlet
+    && pip install --no-cache-dir gunicorn
 
 # Copy application code
 COPY api_server.py .
@@ -40,9 +40,9 @@ ENV PORT=8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:$PORT/api/health || exit 1
 
-# Run with gunicorn + eventlet for WebSocket (flask-socketio) support
-# -w 1 is required with eventlet/gevent workers
-CMD exec gunicorn --worker-class eventlet -w 1 \
+# Run with gunicorn + sync worker
+# Flask-SocketIO works fine with sync worker
+CMD exec gunicorn --worker-class sync -w 1 \
     --bind 0.0.0.0:$PORT \
     --timeout 120 \
     --keep-alive 5 \
