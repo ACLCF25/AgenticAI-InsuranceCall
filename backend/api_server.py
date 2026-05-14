@@ -1897,6 +1897,15 @@ def _bridge_to_agent(call_info, callback_base):
         "insurance leg will not bridge until staff agent answers"
     )
 
+    # Log agent bridge event
+    _log_ivr_event(
+        call_id=call_id,
+        event_type='agent_transfer',
+        action_taken='transfer_initiated',
+        transcript=f"Automatic bridge to agent: {agent_phone_number}",
+        metadata={'agent_phone': agent_phone_number, 'method': 'auto'}
+    )
+
     return Response(dial_twiml, mimetype='text/xml')
 
 
@@ -4118,6 +4127,88 @@ def get_call_qa(call_id: str):
         }), 500
 
 
+@app.route('/api/call-logs/<call_id>', methods=['GET'])
+@agent_or_above
+def get_call_logs(call_id: str):
+    """
+    Return backend log lines captured during a call.
+
+    The `call_id` path param can be either the runtime call_id (the one
+    `_set_log_context` was called with) or the DB request_id from the
+    credentialing_requests table — the query resolves both.
+
+    Query params:
+      level=INFO|WARNING|ERROR|DEBUG  (optional, exact match)
+      limit=int                       (optional, max 5000, default 1000)
+    """
+    try:
+        from credentialing_agent import DatabaseManager
+        from psycopg2.extras import RealDictCursor
+
+        level_filter = request.args.get('level')
+        try:
+            limit = int(request.args.get('limit', 1000))
+        except ValueError:
+            limit = 1000
+        limit = max(1, min(limit, 5000))
+
+        db = DatabaseManager()
+        try:
+            with db._conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Resolve the input to all runtime call_ids that match —
+                # accepts either a runtime call_id directly or a request_id
+                # (cross-referenced via conversation_history / call_recordings).
+                base_sql = """
+                    WITH resolved_ids AS (
+                        SELECT DISTINCT call_id FROM call_logs
+                            WHERE call_id = %s
+                        UNION
+                        SELECT DISTINCT call_id FROM conversation_history
+                            WHERE request_id::text = %s
+                        UNION
+                        SELECT DISTINCT call_id FROM call_recordings
+                            WHERE request_id::text = %s
+                    )
+                    SELECT id, call_id, call_sid, logged_at, level,
+                           logger_name, function_name, line_number, message
+                    FROM call_logs
+                    WHERE call_id IN (SELECT call_id FROM resolved_ids)
+                """
+                params = [call_id, call_id, call_id]
+                if level_filter:
+                    base_sql += " AND level = %s"
+                    params.append(level_filter.upper())
+                base_sql += " ORDER BY logged_at ASC, id ASC LIMIT %s"
+                params.append(limit)
+
+                cur.execute(base_sql, params)
+                rows = cur.fetchall()
+        finally:
+            db.close()
+
+        return jsonify({
+            'success': True,
+            'call_id': call_id,
+            'count': len(rows),
+            'logs': [
+                {
+                    'id': r['id'],
+                    'call_id': r['call_id'],
+                    'call_sid': r.get('call_sid'),
+                    'logged_at': r['logged_at'].isoformat() if r.get('logged_at') else None,
+                    'level': r['level'],
+                    'logger': r.get('logger_name'),
+                    'function': r.get('function_name'),
+                    'line': r.get('line_number'),
+                    'message': r['message'],
+                } for r in rows
+            ],
+        })
+    except Exception as e:
+        logger.error(f"get_call_logs error: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/call-detail/<call_id>', methods=['GET'])
 @agent_or_above
 def get_call_detail(call_id: str):
@@ -4162,7 +4253,7 @@ def get_call_detail(call_id: str):
                        missing_documents, turnaround_days, notes,
                        created_at, updated_at, completed_at,
                        call_mode, agent_phone, initiated_by::text,
-                       human_detection_correct
+                       human_detection_correct, transfer_started_at
                 FROM credentialing_requests
                 WHERE id = %s
             """, (lookup_id,))
@@ -4198,6 +4289,7 @@ def get_call_detail(call_id: str):
             'agent_phone': row[17],
             'initiated_by': row[18],
             'human_detection_correct': row[19],
+            'transfer_started_at': serialize_timestamp(row[20]) if len(row) > 20 else None,
         }
 
         # Fetch conversation history
@@ -4265,6 +4357,26 @@ def get_call_detail(call_id: str):
                                 break
                     except:
                         pass
+
+        # Fetch call metrics
+        metrics_data = None
+        with db.conn.cursor() as cur:
+            cur.execute("""
+                SELECT duration_seconds, ivr_navigation_time_seconds, hold_time_seconds,
+                       human_interaction_time_seconds, successful
+                FROM call_metrics
+                WHERE call_id = %s OR request_id = %s
+                LIMIT 1
+            """, (lookup_id, lookup_id))
+            metrics_row = cur.fetchone()
+            if metrics_row:
+                metrics_data = {
+                    'duration_seconds': metrics_row[0],
+                    'ivr_navigation_time_seconds': metrics_row[1],
+                    'hold_time_seconds': metrics_row[2],
+                    'human_interaction_time_seconds': metrics_row[3],
+                    'successful': metrics_row[4],
+                }
 
         # Fetch IVR patterns for this insurance
         ivr_patterns = []
@@ -4337,6 +4449,7 @@ def get_call_detail(call_id: str):
                 'ivr_patterns': ivr_patterns,
                 'recording': recording_data,
                 'qa_pairs': qa_pairs_data,
+                'metrics': metrics_data,
             }
         }), 200
 
@@ -5930,6 +6043,7 @@ def transfer_to_agent():
                 from credentialing_agent import DatabaseManager
                 db = DatabaseManager()
                 request_id = call_state.get('db_request_id')
+                call_id = call_state.get('call_id')
                 if request_id:
                     with db.conn.cursor() as cur:
                         cur.execute(
@@ -5938,12 +6052,33 @@ def transfer_to_agent():
                             SET call_mode = 'agent',
                                 agent_phone = %s,
                                 conference_sid = %s,
+                                transfer_started_at = NOW(),
+                                status = 'transferred',
                                 updated_at = NOW()
                             WHERE id = %s
                             """,
                             (agent_phone, conference_sid, request_id)
                         )
                         db.conn.commit()
+
+                    # Log transfer event
+                    _log_ivr_event(
+                        call_id=call_id or request_id,
+                        event_type='agent_transfer',
+                        action_taken='transfer_initiated',
+                        transcript=f"Transfer to agent: {agent_phone}",
+                        metadata={'agent_phone': agent_phone, 'conference_sid': conference_sid, 'method': 'manual'}
+                    )
+
+                    # Flush call logs immediately so they're visible before call ends
+                    try:
+                        call_log_buffer = call_log_buffers.get(call_id or request_id, [])
+                        if call_log_buffer:
+                            db.save_call_logs(call_id or request_id, call_log_buffer)
+                            call_log_buffers[call_id or request_id] = []
+                    except Exception as log_err:
+                        logger.debug(f"[transfer-to-agent] Could not flush logs: {log_err}")
+
                 db.close()
             except Exception as db_err:
                 logger.warning(f"[transfer-to-agent] Could not persist transfer to DB: {db_err}")

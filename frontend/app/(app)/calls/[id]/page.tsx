@@ -25,12 +25,17 @@ import {
   ThumbsDown,
   Brain,
   Sparkles,
+  Terminal,
+  ChevronDown,
+  ChevronRight,
+  Download,
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { LocalDateTime } from '@/components/ui/local-date-time'
 import { api } from '@/lib/api'
+import type { CallLogEntry } from '@/types'
 import { getStatusColor, formatStatus, formatPhoneNumber } from '@/lib/utils'
 import Link from 'next/link'
 
@@ -74,6 +79,67 @@ export default function CallDetailPage() {
   })
 
   const call = data?.data
+
+  // Backend log viewer — only fetches once the call has finished, to avoid
+  // hammering the DB during an active call (the buffer is flushed on completion).
+  const callFinished = ['completed', 'failed', 'transferred'].includes(
+    String(call?.status ?? '').toLowerCase()
+  )
+
+  const [logsOpen, setLogsOpen] = useState(false)
+  const [logLevelFilter, setLogLevelFilter] = useState<string>('')
+
+  const {
+    data: logsResponse,
+    isLoading: logsLoading,
+    refetch: refetchLogs,
+  } = useQuery({
+    queryKey: ['call-logs', callId, logLevelFilter],
+    queryFn: () =>
+      api.getCallLogs(callId, {
+        level: logLevelFilter || undefined,
+        limit: 2000,
+      }),
+    enabled: logsOpen && callFinished,
+    staleTime: 60_000,
+  })
+
+  const logs: CallLogEntry[] = logsResponse?.data ?? []
+
+  const downloadLogs = () => {
+    if (!logs.length) return
+    const text = logs
+      .map(
+        (l) =>
+          `${l.logged_at ?? ''} [${l.level}] ${l.logger ?? ''}${
+            l.function ? `.${l.function}` : ''
+          }${l.line ? `:${l.line}` : ''} - ${l.message}`
+      )
+      .join('\n')
+    const blob = new Blob([text], { type: 'text/plain' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `call-${callId}-logs.txt`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const levelColor = (level: string): string => {
+    switch (level.toUpperCase()) {
+      case 'ERROR':
+      case 'CRITICAL':
+        return 'text-red-500'
+      case 'WARNING':
+        return 'text-yellow-500'
+      case 'INFO':
+        return 'text-blue-400'
+      case 'DEBUG':
+        return 'text-muted-foreground'
+      default:
+        return 'text-foreground'
+    }
+  }
 
   // Fetch the recording as a blob so the Authorization header is sent.
   // A plain <audio src="..."> cannot attach JWT tokens, causing a 401 on the
@@ -278,6 +344,11 @@ export default function CallDetailPage() {
                     Created: <LocalDateTime value={call.created_at} fallback="" />
                   </p>
                 )}
+                {call.transfer_started_at && (
+                  <p className="text-xs text-muted-foreground">
+                    Transfer Time: <LocalDateTime value={call.transfer_started_at} fallback="" />
+                  </p>
+                )}
                 {call.completed_at && (
                   <p className="text-xs text-muted-foreground">
                     Completed: <LocalDateTime value={call.completed_at} fallback="" />
@@ -311,6 +382,55 @@ export default function CallDetailPage() {
               )}
             </CardContent>
           </Card>
+
+          {call.metrics && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-lg flex items-center gap-2">
+                  <Activity className="h-4 w-4" />
+                  Call Metrics
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {call.metrics.duration_seconds !== undefined && (
+                  <div className="flex items-start gap-2">
+                    <Clock className="h-4 w-4 mt-0.5 text-muted-foreground" />
+                    <div>
+                      <p className="text-xs text-muted-foreground">Total Duration</p>
+                      <p className="text-sm">{Math.round(call.metrics.duration_seconds)} seconds</p>
+                    </div>
+                  </div>
+                )}
+                {call.metrics.ivr_navigation_time_seconds !== undefined && (
+                  <div className="flex items-start gap-2">
+                    <Clock className="h-4 w-4 mt-0.5 text-muted-foreground" />
+                    <div>
+                      <p className="text-xs text-muted-foreground">IVR Navigation Time</p>
+                      <p className="text-sm">{Math.round(call.metrics.ivr_navigation_time_seconds)} seconds</p>
+                    </div>
+                  </div>
+                )}
+                {call.metrics.hold_time_seconds !== undefined && (
+                  <div className="flex items-start gap-2">
+                    <Clock className="h-4 w-4 mt-0.5 text-muted-foreground" />
+                    <div>
+                      <p className="text-xs text-muted-foreground">Hold Time</p>
+                      <p className="text-sm">{Math.round(call.metrics.hold_time_seconds)} seconds</p>
+                    </div>
+                  </div>
+                )}
+                {call.metrics.human_interaction_time_seconds !== undefined && (
+                  <div className="flex items-start gap-2">
+                    <Clock className="h-4 w-4 mt-0.5 text-muted-foreground" />
+                    <div>
+                      <p className="text-xs text-muted-foreground">Human Interaction Time</p>
+                      <p className="text-sm">{Math.round(call.metrics.human_interaction_time_seconds)} seconds</p>
+                    </div>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          )}
 
           {call.recording && (
             <Card>
@@ -793,6 +913,108 @@ export default function CallDetailPage() {
               )}
             </CardContent>
           </Card>
+
+          {/* Backend logs — visible once the call is finished */}
+          {callFinished && (
+            <Card>
+              <CardHeader>
+                <button
+                  type="button"
+                  onClick={() => setLogsOpen((v) => !v)}
+                  className="flex w-full items-center justify-between text-left"
+                >
+                  <CardTitle className="flex items-center gap-2">
+                    <Terminal className="h-4 w-4" />
+                    Backend logs
+                    {logsResponse?.count !== undefined && (
+                      <Badge variant="outline" className="ml-2 font-mono">
+                        {logsResponse.count}
+                      </Badge>
+                    )}
+                  </CardTitle>
+                  {logsOpen ? (
+                    <ChevronDown className="h-4 w-4 text-muted-foreground" />
+                  ) : (
+                    <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                  )}
+                </button>
+              </CardHeader>
+              {logsOpen && (
+                <CardContent>
+                  <div className="mb-3 flex flex-wrap items-center gap-2">
+                    {['', 'INFO', 'WARNING', 'ERROR'].map((lvl) => (
+                      <Button
+                        key={lvl || 'ALL'}
+                        size="sm"
+                        variant={logLevelFilter === lvl ? 'default' : 'outline'}
+                        onClick={() => setLogLevelFilter(lvl)}
+                      >
+                        {lvl || 'All'}
+                      </Button>
+                    ))}
+                    <div className="flex-1" />
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => refetchLogs()}
+                      disabled={logsLoading}
+                    >
+                      {logsLoading ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        'Refresh'
+                      )}
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={downloadLogs}
+                      disabled={!logs.length}
+                      className="gap-1.5"
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                      Download .txt
+                    </Button>
+                  </div>
+
+                  {logsLoading ? (
+                    <div className="flex items-center justify-center py-8 text-muted-foreground">
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Loading logs…
+                    </div>
+                  ) : logs.length === 0 ? (
+                    <p className="py-6 text-center text-sm text-muted-foreground">
+                      No logs captured for this call. Make sure the
+                      <code className="mx-1">call_logs</code>
+                      table exists in Supabase and the backend was running
+                      when the call was placed.
+                    </p>
+                  ) : (
+                    <div className="max-h-[420px] overflow-y-auto rounded-md border bg-black/70 p-3 font-mono text-xs leading-relaxed text-foreground">
+                      {logs.map((l) => (
+                        <div key={l.id} className="whitespace-pre-wrap">
+                          <span className="text-muted-foreground">
+                            {l.logged_at?.replace('T', ' ').replace(/\..+$/, '') ?? '—'}
+                          </span>{' '}
+                          <span className={`font-semibold ${levelColor(l.level)}`}>
+                            {l.level}
+                          </span>{' '}
+                          {(l.logger || l.function) && (
+                            <span className="text-muted-foreground">
+                              {l.logger}
+                              {l.function ? `.${l.function}` : ''}
+                              {l.line ? `:${l.line}` : ''}{' '}
+                            </span>
+                          )}
+                          <span>{l.message}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </CardContent>
+              )}
+            </Card>
+          )}
         </div>
       </div>
     </motion.div>

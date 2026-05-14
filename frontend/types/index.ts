@@ -17,7 +17,8 @@ export type CredentialingStatus =
   | 'missing_documents'
   | 'denied'
   | 'office_closed'
-  | 'failed';
+  | 'failed'
+  | 'transferred';
 
 export type UserRole = 'super_admin' | 'admin' | 'agent';
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
@@ -132,6 +133,18 @@ export interface APIResponse<T = any> {
   message?: string;
 }
 
+export interface CallLogEntry {
+  id: number;
+  call_id: string;
+  call_sid?: string | null;
+  logged_at: string | null;
+  level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR' | 'CRITICAL' | string;
+  logger?: string | null;
+  function?: string | null;
+  line?: number | null;
+  message: string;
+}
+
 export interface StartCallResponse extends APIResponse {
   call_id?: string;
   request_id?: string | null;
@@ -193,6 +206,7 @@ export interface CallDetail {
   created_at?: string;
   updated_at?: string;
   completed_at?: string;
+  transfer_started_at?: string | null;
   call_mode?: string;
   agent_phone?: string;
   initiated_by?: string | null;
@@ -214,6 +228,13 @@ export interface CallDetail {
   };
   qa_pairs?: QAPair[];
   human_detection_correct?: boolean | null;
+  metrics?: {
+    duration_seconds?: number;
+    ivr_navigation_time_seconds?: number;
+    hold_time_seconds?: number;
+    human_interaction_time_seconds?: number;
+    successful?: boolean;
+  };
 }
 
 export interface HumanDetectionPhrase {

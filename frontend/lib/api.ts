@@ -101,6 +101,21 @@ class APIClient {
     return data
   }
 
+  async getCallLogs(
+    callId: string,
+    opts: { level?: string; limit?: number } = {}
+  ): Promise<APIResponse<CallLogEntry[]> & { count?: number }> {
+    const params = new URLSearchParams()
+    if (opts.level) params.set('level', opts.level)
+    if (opts.limit) params.set('limit', String(opts.limit))
+    const qs = params.toString()
+    const url = `/call-logs/${callId}${qs ? `?${qs}` : ''}`
+    const { data } = await this.client.get(url)
+    // Backend returns { success, call_id, count, logs: [...] }.
+    // Normalize to APIResponse shape so callers can use `data` like other endpoints.
+    return { ...data, data: data.logs }
+  }
+
   async getMetrics(): Promise<SystemMetrics> {
     const { data } = await this.client.get('/metrics')
     return data
